@@ -19,6 +19,13 @@ under the License.
 
 # Gemmini integration organization
 
+The `gemmini/tensorir` migration changes the default `prepare_gemmini_graph`
+route to mathematical legalization/fusion followed by structural TensorIR
+scheduling. [TENSORIR.md](TENSORIR.md) records that architecture, its current
+verification and the outstanding operator audit. The original template path is
+preserved as `route="legacy"` and `prepare_gemmini_graph_legacy`; the template
+scheduling/search recipes below describe that preserved route.
+
 Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
 
 | Location | Integration responsibility |
