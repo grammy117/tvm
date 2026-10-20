@@ -116,7 +116,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Biased matrix | `addmm` | Standard fused INT32 bias/ReLU CPU epilogue tested with accelerator matmul; bias preload not yet implemented |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
 | Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 tensor addition uses accumulator overwrite/add loads and full readout. Ordinary signed TIR has a no-overflow domain; explicit widen/add/narrow TIR also maps natively and defines modulo-2^32 output. Other mappings remain under audit; generic CPU fallback retained |
-| Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Native reduction mappings and dtype/rounding audit still required |
+| Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
 | Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32 copies, indexed repeats/slices, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
@@ -136,7 +136,7 @@ complete acceptance of every ATen overload or frontend graph.
 | `add.Scalar`, `sub.Scalar` | A zero load stride repeats a scalar down a one-column DMA rectangle. Runtime INT32 scalar-tensor addition is now supported on either side, including an explicit wrapping variant. Immediate constants and native subtraction remain separate admission work; there is no full-width negative load scaler. |
 | `mul.Scalar`, `div.Scalar`, `neg` | The available scaled small readout narrows to INT8. It is not an arbitrary FP32 or full-INT32 multiply/divide unit. Any narrower integer recipe must specify its rounding, saturation and value range before admission. |
 | `relu` | Full-width INT32 readout bypasses the activation/scaling result. CPU INT32/FP ReLU therefore remains explicit. An INT8 input/output ReLU mapping is feasible but still needs a dedicated native rule. |
-| `mean.dim`, `mean.default`, `sum.dim_IntList` | A ones-vector contraction can implement a bounded signed-INT8-to-INT32 sum, but that is not the default INT64 or floating reduction contract. A native bounded sum rule remains implementation work. Mean additionally needs a specified divisor, output dtype and rounding; a narrowing readout scale cannot stand in for arbitrary floating mean. |
+| `mean.dim`, `mean.default`, `sum.dim_IntList` | A registered sum intrinsic uses a ones-vector contraction for signed INT8-to-INT32 sums with K <= 16,777,216. This is not the default INT64 or floating reduction contract. Mean retains its specified CPU conversion/division; a narrowing readout scale cannot stand in for arbitrary floating mean. |
 | `avg_pool1d/2d/3d`, adaptive average pooling | Ordinary floating inputs do not fit the integer arithmetic unit. An integer recipe must specify windows, divisors, exclude-padding/ceil behavior and rounding. The max-pool readout feature does not implement average pooling. |
 | Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. No generic backward mapping is claimed. |
 | Generic data movement | Primitive DMA handles rectangular regions with contiguous columns and one row stride. Copies preserving bits and signed widening are admitted. Index remapping, multiple sources, fill broadcasting and overlapping updates need appropriate schedules or remain CPU work. They must not be described as absent silicon features merely because the current schedule does not handle them. |
@@ -188,6 +188,35 @@ offset to INT64. The bridge binds an INT32 zero-offset variable and casts its
 pointer use back, preserving address, dtype and external ABI. It accepts only
 zero-offset scalar sources and access-pointer uses; it is not a core C++ patch
 or an arithmetic rewrite. Non-buffer primitive scalar ABIs retain CPU fallback.
+
+`gemmini_reduction.py` leaves zero-initialized sums as mathematics and matches
+direct signed INT8 casts or a fused pointwise widening producer. Every prefix
+is bounded by `[-128*K,127*K]`; K <= 2^24 therefore fits INT32 exactly. Array
+chunks contain at most 16 values. Standard block/index maps, reindex caches,
+placement, splitting and reduction decomposition construct the schedule. A
+sum intrinsic broadcasts a CPU-created scalar one into a scoped scratchpad
+vector, then calls the same array primitive as matmul. There is no C reduction
+kernel, hidden CPU reduction or hardware-loop command. Owned implementation
+temporaries live in a nested TIR block, which standard Tensorize preserves.
+
+Scalar, multiple-axis and keep-dimension sums restore the original output
+layout with ordinary CPU copies. Input reindexing currently stages each DMA
+tile on the CPU; even contiguous input can incur that copy. Divisor tile choices
+avoid padded DMA but prime extents can require scalar chunks. MetaSchedule
+exposes both divisor and scalar candidates. These are functional capabilities,
+not measured performance wins. The original CPU cast/divide can consume a
+native INT32 sum without changing its specified floating division. General
+floating inputs and INT64 accumulation still retain CPU fallback.
+Converting a proven bounded INT32 sum to INT64 output is feasible; direct
+admission of the equivalent INT64 sum remains an implementation gap. Likewise,
+known INT8 values widened to floating point may admit additional range proofs.
+Neither case is evidence that arbitrary INT64 or floating reductions fit this
+integer array.
+
+The shared finalizer retains a TensorIR root block around admission and device
+ownership. This lets stock Relax reshape analysis inspect prepared single-input
+functions during normal `relax.build`, instead of requiring a special pipeline
+to avoid that analysis. No core compiler modification is needed.
 
 ## Verification tools
 
@@ -245,6 +274,21 @@ positions, vectors/batches/tails, standard MetaSchedule processing, the named
 Relax preparation/build pipelines and preservation of CPU fallback for a hidden
 primitive scalar ABI. `unit-scalar-structural-v1.log` retains 11 contraction
 regressions after scalar support.
+
+`device-sum-v4` adds five array-reduction fixtures: a prime reduction extent,
+two full 16-value chunks, scalar output, multiple reduction axes and retained
+dimensions. Positive and wrong-oracle checks pass on Spike and the selected
+RTL; instruction audits reject hardware-loop commands. `adapter-sum-v1`
+rebuilds the source-pinned receipt after documenting the sum-specific bound in
+the header; its adapter object is byte-identical to `adapter-native-v1`.
+`unit-reduction-v9.log` covers four host checks with independent INT64 oracles,
+extremes, trace replay, standard MetaSchedule postprocessing/features on a fused
+widen/sum, non-integral CPU FP32 mean readout and numeric/index-width refusal.
+`unit-default-vm-v1.log` covers prepared single-input permutation and widening
+through the default VM pipeline. Contraction, DMA, exporter and classifier
+regressions are in `unit-reduction-structural-v1.log`,
+`unit-reduction-elementwise-v1.log`, `unit-reduction-export-v1.log` and
+`unit-reduction-classifier-v1.log`. These are functional checks, not timings.
 
 The migration remains incomplete until the inventory's remaining native
 admission, CPU/frontend explanations and final regression/target checks are

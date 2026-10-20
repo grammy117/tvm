@@ -243,6 +243,26 @@ def fixtures():
             else np.full((3, 4), int(scalar), "int8" if kind == "fill_i8" else "int32")
         )
         result.append((kind, builder.get(), arrays, expected))
+    for name, shape, axes, keepdims in (
+        ("sum", (3, 17), (1,), False),
+        ("sum_full", (2, 32), (1,), False),
+        ("sum_scalar", (17,), None, False),
+        ("sum_axes", (2, 3, 4), (0, 2), False),
+        ("sum_keepdims", (2, 3, 4), (1, 2), True),
+    ):
+        a = (np.arange(np.prod(shape)).reshape(shape) % 256 - 128).astype("int8")
+        if name in ("sum", "sum_scalar"):
+            a.fill(-128)
+        av = relax.Var("a", relax.TensorStructInfo(shape, "int8"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [av]):
+            with builder.dataflow():
+                output = builder.emit_output(
+                    relax.op.sum(relax.op.astype(av, "int32"), axis=axes, keepdims=keepdims)
+                )
+            builder.emit_func_output(output)
+        expected = a.astype("int64").sum(axis=axes, keepdims=keepdims).astype("int32")
+        result.append((name, builder.get(), [a], expected))
     return result
 
 
@@ -317,7 +337,7 @@ def prepare(args):
         )
         primitive_check = (
             f"if(dmas==dma_before_{index})return 21;"
-            if operation
+            if operation and operation != "sum_i8_i32"
             else f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
         )
         if operation is not None and operation.startswith("add_i32"):
@@ -423,6 +443,7 @@ def prepare(args):
                 "gemmini_target",
                 "gemmini_meta_schedule",
                 "gemmini_elementwise",
+                "gemmini_reduction",
             )
         ],
     ):
@@ -581,6 +602,11 @@ def main():
             "fill_i32",
             "fill_widen",
             "add_scalar",
+            "sum",
+            "sum_full",
+            "sum_scalar",
+            "sum_axes",
+            "sum_keepdims",
         ],
     )
     execute = sub.add_parser("run")

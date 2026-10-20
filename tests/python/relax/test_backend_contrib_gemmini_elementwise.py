@@ -351,6 +351,37 @@ class GemminiElementwiseTests(unittest.TestCase):
         self.assertEqual(report[0]["placement"], "cpu")
         self.assertIn("buffer parameters", report[0]["reason"])
 
+    def test_default_vm_pipeline_accepts_prepared_single_input_functions(self):
+        for kind in ("permute", "widen"):
+            a = relax.Var("a", relax.TensorStructInfo((3, 4), "int8"))
+            builder = relax.BlockBuilder()
+            with builder.function("main", [a]):
+                with builder.dataflow():
+                    output = builder.emit_output(
+                        relax.op.permute_dims(a, [1, 0])
+                        if kind == "permute"
+                        else relax.op.astype(a, "int32")
+                    )
+                builder.emit_func_output(output)
+            report = []
+            prepared = prepare_gemmini_graph(builder.get(), report=report)
+            self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 1, report)
+            executable = relax.build(prepared, "llvm")
+            path = self.root / (kind + "-default.so")
+            executable.export_library(
+                str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11"]
+            )
+            control = ctypes.CDLL(str(path))
+            control.emulator_reset()
+            vm = relax.VirtualMachine(tvm.runtime.load_module(str(path)), tvm.cpu())
+            values = (np.arange(12).reshape(3, 4) - 8).astype("int8")
+            actual = vm["main"](tvm.nd.array(values)).numpy()
+            np.testing.assert_array_equal(
+                actual, values.T if kind == "permute" else values.astype("int32")
+            )
+            self.assertGreater(control.emulator_commands(), 0)
+            self.assertEqual(control.emulator_faults(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

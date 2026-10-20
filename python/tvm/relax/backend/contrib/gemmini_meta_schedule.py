@@ -31,6 +31,7 @@ from .gemmini_memory import lower_memory
 from .gemmini_target import GemminiCapabilities
 from .gemmini_tensorir import _normalizable_contractions, contraction_block, schedule_contraction
 from .gemmini_elementwise import elementwise_blocks, schedule_elementwise
+from .gemmini_reduction import reduction_blocks, schedule_reduction
 
 
 @derived_object
@@ -67,6 +68,23 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         func = sch.mod["main"]
         matches = contraction_block(func) or _normalizable_contractions(func)
         if not matches:
+            reductions = reduction_blocks(func)
+            if reductions and (
+                len(reductions) != 1 or not sch.get(block).same_as(reductions[0][0])
+            ):
+                return [sch]
+            if len(reductions) == 1 and sch.get(block).same_as(reductions[0][0]):
+                candidates, traces = [], set()
+                for scalar in (False, True):
+                    transformed, _, _ = schedule_reduction(
+                        func, tensorize=False, mark_tensorize=True, scalar=scalar
+                    )
+                    if str(transformed.trace) not in traces:
+                        traces.add(str(transformed.trace))
+                        candidate = sch.copy()
+                        transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
+                        candidates.append(candidate)
+                return candidates
             pointwise = elementwise_blocks(func)
             if len(pointwise) == 1 and sch.get(block).same_as(pointwise[0][0]):
                 candidates, traces = [], set()

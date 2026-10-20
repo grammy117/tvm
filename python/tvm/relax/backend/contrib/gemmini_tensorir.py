@@ -479,12 +479,16 @@ def lower_tensorir_schedule(
             tir.Evaluate(tir.tvm_throw_last_error()),
         ]
     )
+    if not isinstance(device.body, tir.BlockRealize):
+        raise ValueError("Gemmini lowering requires a TensorIR root block")
+    realization = device.body
+    root = realization.block
     body = tir.SeqStmt(
         [
             tir.Evaluate(
                 tir.call_extern("void", "tvm_gemmini_begin", *[tir.IntImm("int64", 1)] * 3)
             ),
-            device.body,
+            root.body,
             tir.Evaluate(tir.call_extern("void", "tvm_gemmini_end")),
         ]
     )
@@ -501,7 +505,23 @@ def lower_tensorir_schedule(
             ]
             admission = tir.call_extern("int32", "tvm_gemmini_validate_tensor_buffers", *arguments)
             body = tir.LetStmt(status, admission, tir.IfThenElse(status != 0, failure, body))
-    device = device.with_body(body)
+    # Keep the ordinary TensorIR root for stock Relax analyses, including
+    # RewriteDataflowReshape on single-input/single-output functions. Admission
+    # and ownership still precede every device command within that root.
+    root = tir.Block(
+        root.iter_vars,
+        root.reads,
+        root.writes,
+        root.name_hint,
+        body,
+        root.init,
+        root.alloc_buffers,
+        root.match_buffers,
+        root.annotations,
+    )
+    device = device.with_body(
+        tir.BlockRealize(realization.iter_values, realization.predicate, root)
+    )
     if workload_metadata is None:
         matches = contraction_block(func) or _normalizable_contractions(func)
         shape = matches[0][1]
@@ -556,6 +576,7 @@ class ScheduleGemminiTensorIR:
 
     def transform_module(self, mod, _ctx):
         from .gemmini_elementwise import elementwise_blocks, make_elementwise_schedule
+        from .gemmini_reduction import reduction_blocks, make_reduction_schedule
 
         for gv, func in list(mod.functions_items()):
             if not isinstance(func, tir.PrimFunc) or (
@@ -563,13 +584,14 @@ class ScheduleGemminiTensorIR:
             ):
                 continue
             matches = contraction_block(func) or _normalizable_contractions(func)
-            pointwise = elementwise_blocks(func) if not matches else []
-            if not matches and not pointwise:
+            reductions = reduction_blocks(func) if not matches else []
+            pointwise = elementwise_blocks(func) if not matches and not reductions else []
+            if not matches and not pointwise and not reductions:
                 self.report.append(
                     {
                         "function": gv.name_hint,
                         "placement": "cpu",
-                        "reason": "No supported exact integer contraction, copy, widening or addition",
+                        "reason": "No supported exact integer contraction, bounded sum, copy, widening or addition",
                     }
                 )
                 continue
@@ -600,9 +622,22 @@ class ScheduleGemminiTensorIR:
                         func,
                         selected,
                         capabilities=self.capabilities,
-                        workload_metadata={"operation": pointwise[0][1]} if pointwise else None,
+                        workload_metadata=(
+                            {"operation": pointwise[0][1]}
+                            if pointwise
+                            else {
+                                "operation": "sum_i8_i32",
+                                "rows": reductions[0][1][0],
+                                "depth": reductions[0][1][1],
+                            }
+                            if reductions
+                            else None
+                        ),
                     )
                     origin = "TVM MetaSchedule database"
+                elif reductions:
+                    result = make_reduction_schedule(func, capabilities=self.capabilities)
+                    origin = "deterministic TensorIR reduction rule"
                 elif pointwise:
                     result = make_elementwise_schedule(func, capabilities=self.capabilities)
                     origin = "deterministic TensorIR DMA rule"

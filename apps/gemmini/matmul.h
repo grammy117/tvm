@@ -48,7 +48,10 @@ int32_t tvm_gemmini_validate_matmul_i8_i32(const int8_t* a, const int8_t* b, int
  * may pack shorter tiles at other integral row addresses.
  * A/B tile slots are disjoint. Every tile dimension is in [1,16], and accumulate
  * is exactly 0 (overwrite) or 1 (add to initialized int32 accumulator SRAM).
- * Each compute starts a fresh <=16-product PE reduction; global K <=131071.
+ * Each compute starts a fresh <=16-product PE reduction. The compiler proves
+ * the whole INT32 accumulator range: general INT8 matmul has K <=131071;
+ * signed INT8 sums against ones can use K <=16777216. Primitive dimensions
+ * remain <=16 in both cases; the larger bound does not widen the hardware.
  * A/B and any DMA source staging buffers remain immutable until end. Store is
  * asynchronous: read C only after end. These functions do no runtime admission.
  * The runtime must supply DMA mapping, completion, and platform coherence.
