@@ -822,5 +822,33 @@ def test_unsupported_target_scalable_split(capfd):
     assert warning_msg in captured
 
 
+@pytest.mark.parametrize("operation", ["split", "reorder"])
+def test_inner_loop_transform_preserves_shared_sequence_input(operation):
+    @T.prim_func
+    def before(A: T.Buffer((2, 8), "int32"), C: T.Buffer((2, 8), "int32")):
+        B = T.alloc_buffer((2, 8), "int32")
+        for i, j in T.grid(2, 8):
+            with T.block("first"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                B[vi, vj] = A[vi, vj] + 1
+        for i, j in T.grid(2, 8):
+            with T.block("second"):
+                vi, vj = T.axis.remap("SS", [i, j])
+                C[vi, vj] = B[vi, vj] * 2
+
+    original_hash = tvm.ir.structural_hash(before)
+    sch = tir.Schedule(before, debug_mask="all")
+    # Copying just the root block leaves its SeqStmt shared with the input.
+    # The enclosing loop can appear unique despite that shared container.
+    sch.annotate(sch.get_block("root"), "test.annotation", 1)
+    i, j = sch.get_loops("first")
+    if operation == "split":
+        sch.split(j, factors=[2, 4])
+    else:
+        sch.reorder(j, i)
+    assert tvm.ir.structural_hash(before) == original_hash
+    verify_trace_roundtrip(sch, mod=before)
+
+
 if __name__ == "__main__":
     tvm.testing.main()

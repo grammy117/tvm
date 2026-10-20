@@ -54,12 +54,16 @@ arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy
 guard described in README.md. That guard rejects unsupported automatic-copy
 annotations and is not a DMA optimization.
 
-The migration fixes one generic C++ scheduler
-issue in `decompose_reduction`: initialization reads were omitted and retained
+The migration fixes two generic C++ scheduler issues.
+In `decompose_reduction`, initialization reads were omitted and retained
 on the update block instead. Separate read-region analysis preserves an
 input-dependent initialization and lets subsequent cache placement see its
 producer. The regression tests cover read dependencies, cache placement, trace
 replay and CPU execution, independently of Gemmini.
+In schedule-state replacement, shared statement containers such as `SeqStmt`
+must trigger copy-on-write even when their child loop appears uniquely owned.
+Otherwise splitting an inner loop can mutate the original workload and break
+trace replay. General split/reorder tests retain and check the original input.
 The handwritten static deployment packaging is retained, with standard USMP
 used for operator pools; this is not a claim of stock microTVM/AOT deployment.
 
