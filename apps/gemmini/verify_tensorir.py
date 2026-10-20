@@ -51,7 +51,7 @@ void* memset(void* p,int c,size_t n) { volatile unsigned char* d=p;for(size_t i=
 void* memcpy(void* d,const void* s,size_t n) { volatile unsigned char* o=d;const volatile unsigned char* p=s;for(size_t i=0;i<n;++i)o[i]=p[i];return d; }
 int printf(const char* format,...) { (void)format;puts_htif("VENDOR_DIAGNOSTIC\n");return 0; }
 __attribute__((noreturn)) void exit(int code) { tohost=((uint64_t)(code?code:99)<<1)|1;for(;;){} }
-static unsigned computes,zeros,dmas,accumulates;
+static unsigned computes,zeros,dmas,accumulates,acc_writes;
 void __real_tvm_gemmini_compute(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
 void __real_tvm_gemmini_zero_acc(uint32_t,uint32_t,uint32_t);
 void __wrap_tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
@@ -63,7 +63,7 @@ void __real_tvm_gemmini_dma_acc_add(const int32_t*,uint32_t,uint32_t,uint32_t,in
 void __real_tvm_gemmini_dma_widen(const int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
 void __real_tvm_gemmini_dma_spad_out(int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
 void __wrap_tvm_gemmini_dma_acc_write(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
-  ++dmas;__real_tvm_gemmini_dma_acc_write(p,c,m,n,s,w);
+  ++dmas;++acc_writes;__real_tvm_gemmini_dma_acc_write(p,c,m,n,s,w);
 }
 void __wrap_tvm_gemmini_dma_acc_add(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
   ++dmas;++accumulates;__real_tvm_gemmini_dma_acc_add(p,c,m,n,s,w);
@@ -263,6 +263,63 @@ def fixtures():
             builder.emit_func_output(output)
         expected = a.astype("int64").sum(axis=axes, keepdims=keepdims).astype("int32")
         result.append((name, builder.get(), [a], expected))
+    for name, bias_shape, wrapping in (
+        ("bias_prefix", (4,), False),
+        ("bias_matrix", (3, 4), False),
+        ("bias_column", (3, 1), False),
+        ("bias_scalar", (), False),
+        ("bias_wrap", (4,), True),
+    ):
+        a = np.full((3, 32), 127, "int8")
+        if not wrapping:
+            a[:, 16:] = -127
+            a[1] = -a[1]
+        b = np.full((32, 4), 127, "int8")
+        bias = np.resize(np.array([2147483644, -2147483645, 17, -23], "int32"), bias_shape)
+        left = te.placeholder(a.shape, "int8", "left")
+        right = te.placeholder(b.shape, "int8", "right")
+        initial = te.placeholder(bias_shape, "int32", "bias")
+        reduction = te.reduce_axis((0, 32), "reduction")
+        product = te.compute(
+            (3, 4),
+            lambda i, j: te.sum(
+                left[i, reduction].astype("int32") * right[reduction, j].astype("int32"),
+                axis=reduction,
+            ),
+            name="unbiased_product",
+        )
+
+        def bias_value(i, j):
+            if bias_shape == ():
+                return initial[()]
+            if len(bias_shape) == 1:
+                return initial[j]
+            return initial[i, 0 if bias_shape[1] == 1 else j]
+
+        def biased_value(i, j):
+            value, seed = product[i, j], bias_value(i, j)
+            return (
+                (value.astype("int64") + seed.astype("int64")).astype("int32")
+                if wrapping
+                else value + seed
+            )
+
+        output = te.compute((3, 4), biased_value, name="biased_output")
+        builder = relax.BlockBuilder()
+        gv = builder.add_func(te.create_prim_func([left, right, initial, output]), "biased_matmul")
+        arrays = [a, b, bias]
+        parameters = [
+            relax.Var(label, relax.TensorStructInfo(array.shape, str(array.dtype)))
+            for label, array in zip(("a", "b", "bias"), arrays)
+        ]
+        with builder.function("main", parameters):
+            with builder.dataflow():
+                result_var = builder.emit_output(
+                    relax.call_tir(gv, parameters, relax.TensorStructInfo((3, 4), "int32"))
+                )
+            builder.emit_func_output(result_var)
+        expected = (a.astype("int64") @ b.astype("int64") + bias).astype("int32")
+        result.append((name, builder.get(), arrays, expected))
     return result
 
 
@@ -324,6 +381,7 @@ def prepare(args):
                 f"memset(&out_{index},0x6d,sizeof(out_{index}));",
                 f"unsigned before_{index}=computes, zero_before_{index}=zeros;",
                 f"unsigned dma_before_{index}=dmas, add_before_{index}=accumulates;",
+                f"unsigned write_before_{index}=acc_writes;",
             ]
         )
         for arg in range(len(arrays)):
@@ -335,11 +393,17 @@ def prepare(args):
             for row in reports[name]
             if row["placement"] == "gemmini"
         )
-        primitive_check = (
-            f"if(dmas==dma_before_{index})return 21;"
-            if operation and operation != "sum_i8_i32"
-            else f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
-        )
+        if operation == "matmul_bias":
+            primitive_check = (
+                f"if(computes==before_{index} || acc_writes==write_before_{index}"
+                f" || zeros!=zero_before_{index})return 21;"
+            )
+        elif operation and operation != "sum_i8_i32":
+            primitive_check = f"if(dmas==dma_before_{index})return 21;"
+        else:
+            primitive_check = (
+                f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
+            )
         if operation is not None and operation.startswith("add_i32"):
             primitive_check += f"if(accumulates==add_before_{index})return 21;"
         checks.extend(
@@ -433,6 +497,8 @@ def prepare(args):
         "apps/gemmini/baremetal.py",
         "apps/gemmini/matmul.c",
         "apps/gemmini/matmul.h",
+        "src/tir/schedule/primitive/reduction.cc",
+        "src/tir/schedule/state.cc",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -444,6 +510,7 @@ def prepare(args):
                 "gemmini_meta_schedule",
                 "gemmini_elementwise",
                 "gemmini_reduction",
+                "gemmini_bias",
             )
         ],
     ):
@@ -607,6 +674,11 @@ def main():
             "sum_scalar",
             "sum_axes",
             "sum_keepdims",
+            "bias_prefix",
+            "bias_matrix",
+            "bias_column",
+            "bias_scalar",
+            "bias_wrap",
         ],
     )
     execute = sub.add_parser("run")

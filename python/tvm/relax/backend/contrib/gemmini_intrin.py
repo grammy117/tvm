@@ -30,8 +30,15 @@ SPAD = "local.gemmini_spad"
 ACC = "local.gemmini_acc"
 
 
+def _update_reference(current, a, b, wrapping):
+    product = a.astype("int32") * b.astype("int32")
+    if wrapping:
+        return (current.astype("int64") + product.astype("int64")).astype("int32")
+    return current + product
+
+
 @lru_cache(None)
-def register_intrinsics(rows=16, cols=16, depth=16):
+def register_intrinsics(rows=16, cols=16, depth=16, wrapping=False):
     """Register a shape family; dimensions describe hardware rectangles."""
     if any(type(x) is not int or not 1 <= x <= 16 for x in (rows, cols, depth)):
         raise ValueError("Gemmini primitive rectangles require dimensions in [1,16]")
@@ -151,7 +158,7 @@ def register_intrinsics(rows=16, cols=16, depth=16):
             for i, j, k in T.grid(rows, cols, depth):
                 with T.block("update"):
                     vi, vj, vk = T.axis.remap("SSR", [i, j, k])
-                    C[vi, vj] = C[vi, vj] + T.Cast("int32", A[vi, vk]) * T.Cast("int32", B[vk, vj])
+                    C[vi, vj] = _update_reference(C[vi, vj], A[vi, vk], B[vk, vj], wrapping)
 
     @T.prim_func
     def update_impl(a: T.handle, b: T.handle, c: T.handle):
@@ -190,8 +197,10 @@ def register_intrinsics(rows=16, cols=16, depth=16):
         "store": copy_intrin(rows, cols, ACC, "global", "int32", "tvm_gemmini_dma_out"),
     }
     result = {}
+    from .gemmini_elementwise import _canonical_description
+
     for kind, (desc, impl) in pairs.items():
-        name = f"gemmini.tir.{kind}.{rows}x{cols}x{depth}"
-        tir.TensorIntrin.register(name, desc, impl)
+        name = f"gemmini.tir.{kind}.{rows}x{cols}x{depth}" + (".wrapping" if wrapping else "")
+        tir.TensorIntrin.register(name, _canonical_description(desc), impl)
         result[kind] = name
     return result

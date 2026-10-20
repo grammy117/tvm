@@ -29,6 +29,35 @@ from tvm import tir
 from .gemmini_intrin import ACC, SPAD, register_intrinsics
 
 
+def _contraction_update(node):
+    """Read an ordinary or explicitly modulo-32 product update structurally."""
+    value = node.body.value
+    wrapped = False
+    if isinstance(value, tir.Cast) and value.dtype == "int32":
+        add = value.value
+        if (
+            not isinstance(add, tir.Add)
+            or add.dtype != "int64"
+            or not all(isinstance(x, tir.Cast) and x.dtype == "int64" for x in (add.a, add.b))
+        ):
+            return None
+        current, product, wrapped = add.a.value, add.b.value, True
+    elif isinstance(value, tir.Add):
+        current, product = value.a, value.b
+    else:
+        return None
+    if not isinstance(current, tir.BufferLoad) or not isinstance(product, tir.Mul):
+        return None
+    return current, product, wrapped
+
+
+def _supported_contraction_init(node):
+    value = node.init.value
+    return (isinstance(value, tir.IntImm) and int(value) == 0) or (
+        isinstance(value, tir.BufferLoad) and value.dtype == "int32"
+    )
+
+
 def _normalizable_contractions(func):
     """Identify exact contractions whose access maps can form matrix caches.
 
@@ -52,26 +81,21 @@ def _normalizable_contractions(func):
             return
         if not isinstance(node.body, tir.BufferStore) or not isinstance(node.init, tir.BufferStore):
             return
-        output, value = node.body.buffer, node.body.value
-        if (
-            output.dtype != "int32"
-            or not isinstance(node.init.value, tir.IntImm)
-            or int(node.init.value) != 0
-            or not isinstance(value, tir.Add)
-            or not isinstance(value.a, tir.BufferLoad)
-            or not isinstance(value.b, tir.Mul)
-        ):
+        output = node.body.buffer
+        update = _contraction_update(node)
+        if output.dtype != "int32" or not _supported_contraction_init(node) or update is None:
             return
+        current, product, _ = update
         equal = tvm.ir.structural_equal
         if (
-            not value.a.buffer.same_as(output)
+            not current.buffer.same_as(output)
             or not node.init.buffer.same_as(output)
-            or not equal(value.a.indices, node.body.indices)
+            or not equal(current.indices, node.body.indices)
             or not equal(node.init.indices, node.body.indices)
         ):
             return
         loads = []
-        for expr in (value.b.a, value.b.b):
+        for expr in (product.a, product.b):
             if (
                 not isinstance(expr, tir.Cast)
                 or expr.dtype != "int32"
@@ -145,7 +169,7 @@ def _normalize_contraction(sch):
     )
     sch.transform_block_layout(block, index_map)
     sch.reindex(block, ("write", 0))
-    product = sch.get(block).body.value.b
+    product = _contraction_update(sch.get(block))[1]
     a_buffer, b_buffer = product.a.value.buffer, product.b.value.buffer
     a_copy = sch.reindex(block, a_buffer)
     b_copy = sch.reindex(block, b_buffer)
@@ -186,21 +210,22 @@ def contraction_block(func):
         output = node.body.buffer
         if output.dtype != "int32" or len(output.shape) != len(node.iter_vars) - 1:
             return
-        if not isinstance(node.init.value, tir.IntImm) or int(node.init.value) != 0:
+        if not _supported_contraction_init(node):
             return
-        value = node.body.value
-        if not isinstance(value, tir.Add) or not isinstance(value.a, tir.BufferLoad):
+        update = _contraction_update(node)
+        if update is None:
             return
-        if not value.a.buffer.same_as(output) or not isinstance(value.b, tir.Mul):
+        current, product, _ = update
+        if not current.buffer.same_as(output):
             return
         if (
             not node.init.buffer.same_as(output)
-            or not tvm.ir.structural_equal(value.a.indices, node.body.indices)
+            or not tvm.ir.structural_equal(current.indices, node.body.indices)
             or not tvm.ir.structural_equal(node.init.indices, node.body.indices)
         ):
             return
         operands = []
-        for expr in (value.b.a, value.b.b):
+        for expr in (product.a, product.b):
             if (
                 not isinstance(expr, tir.Cast)
                 or expr.dtype != "int32"
@@ -259,6 +284,8 @@ def schedule_contraction(
     """
     sch = tir.Schedule(func, debug_mask="all")
     node, (m, n, depth) = _normalize_contraction(sch)
+    biased = isinstance(node.init.value, tir.BufferLoad)
+    wrapping = _contraction_update(node)[2]
     if order not in ("ij", "ji"):
         raise ValueError("Gemmini traversal order must be ij or ji")
     if load_order not in ("ab", "ba"):
@@ -269,24 +296,33 @@ def schedule_contraction(
         raise ValueError("Gemmini matrix cache groups require 1, 2 or 4 tiles")
     if tensorize and mark_tensorize:
         raise ValueError("Choose immediate tensorization or MetaSchedule annotations")
+    if biased:
+        choices = lambda extent, groups: [x for x in range(1, 17) if extent % (x * groups) == 0]
+        if not choices(m, row_tiles) or not choices(n, col_tiles):
+            raise ValueError("Bias cache groups must divide the mathematical output")
+        rows, cols = max(choices(m, row_tiles)), max(choices(n, col_tiles))
+        chunk = max(x for x in range(1, reduction_chunk + 1) if depth % x == 0)
+    else:
+        rows, cols = (max(2, min(16, value)) for value in (m, n))
+        chunk = max(2, min(reduction_chunk, depth))
     for key, value in {
         "order": order,
         "load_order": load_order,
-        "reduction_chunk": reduction_chunk,
+        "reduction_chunk": chunk,
         "row_tiles": row_tiles,
         "col_tiles": col_tiles,
     }.items():
         sch.annotate(sch.get_block("root"), "gemmini." + key, value)
     # Preserve nontrivial block axes through the pinned tensorization matcher.
     # Unit axes use standard mathematical zero-padding, never out-of-range DMA.
-    rows, cols = (max(2, min(16, value)) for value in (m, n))
-    chunk = max(2, min(reduction_chunk, depth))
     block = sch.get_block(node.name_hint)
     padded = any(
         value % factor
         for value, factor in zip((m, n, depth), (rows * row_tiles, cols * col_tiles, chunk))
     )
     if padded:
+        if wrapping:
+            raise ValueError("Explicit modular contractions require divisor tiles")
         sch.pad_einsum(
             block, [1] * (len(node.iter_vars) - 3) + [rows * row_tiles, cols * col_tiles, chunk]
         )
@@ -298,7 +334,19 @@ def schedule_contraction(
     outer = jo if order == "ij" else io
     write = sch.cache_write(block, 0, ACC)
     sch.reverse_compute_at(write, outer, preserve_unit_loops=True)
-    product = sch.get(block).body.value.b
+    if biased:
+        # The normalization's output copy can fold into the complete DMA
+        # writeback block. The reduction itself remains a reduction block.
+        for consumer in list(sch.get_consumers(write)):
+            copy = sch.get(consumer)
+            if (
+                isinstance(copy.body, tir.BufferStore)
+                and isinstance(copy.body.value, tir.BufferLoad)
+                and tvm.ir.structural_equal(copy.body.indices, copy.body.value.indices)
+                and tvm.ir.structural_equal(copy.body.buffer.shape, copy.body.value.buffer.shape)
+            ):
+                sch.reverse_compute_inline(consumer)
+    product = _contraction_update(sch.get(block))[1]
     a_buffer, b_buffer = product.a.value.buffer, product.b.value.buffer
     read_index = lambda buffer: next(
         index for index, region in enumerate(sch.get(block).reads) if region.buffer.same_as(buffer)
@@ -370,9 +418,16 @@ def schedule_contraction(
         for downstream in sch.get_consumers(consumer):
             sch.reverse_compute_at(downstream, outer, preserve_unit_loops=True)
     init = sch.decompose_reduction(block, ko)
+    bias_intrinsic = None
+    if biased:
+        from .gemmini_bias import schedule_bias_init
+
+        sch, bias_intrinsic = schedule_bias_init(sch, init, outer, rows, cols)
     mathematical = sch.mod
     if tensorize or mark_tensorize:
-        intrin = register_intrinsics(rows, cols, chunk)
+        intrin = register_intrinsics(rows, cols, chunk, wrapping=wrapping)
+        if bias_intrinsic is not None:
+            intrin = dict(intrin, init=bias_intrinsic)
         for target, axes, kind in (
             (init, 2, "init"),
             (load_a, 2, "load_a"),
@@ -381,10 +436,15 @@ def schedule_contraction(
             (write, 2, "store"),
         ):
             loop = sch.get_loops(target)[-axes]
+            outer = sch.blockize(loop)
+            if kind != "store":
+                # Blockization changes the buffer rank seen by the outer
+                # block. Keep physical row alignment on that block, where
+                # Tensorize and allocation compaction consume the annotation.
+                sch.storage_align(outer, 0, axis=-2, factor=16, offset=0)
             if tensorize:
-                sch.tensorize(loop, intrin[kind])
+                sch.tensorize(outer, intrin[kind])
             else:
-                outer = sch.blockize(loop)
                 sch.annotate(outer, "meta_schedule.auto_tensorize", intrin[kind])
     return sch, mathematical
 
@@ -526,6 +586,8 @@ def lower_tensorir_schedule(
         matches = contraction_block(func) or _normalizable_contractions(func)
         shape = matches[0][1]
         workload_metadata = dict(zip(("m", "n", "k"), shape))
+        if isinstance(matches[0][0].init.value, tir.BufferLoad):
+            workload_metadata.update(operation="matmul_bias", bias_preloaded=True)
     device = device.with_attr("gemmini.tensorir", 1)
     device = device.with_attr("gemmini.capability_id", capabilities.fingerprint)
     device = device.with_attr("op_pattern", 8)
@@ -564,7 +626,16 @@ class ScheduleGemminiTensorIR:
     compiler failures propagate instead of silently changing placement.
     """
 
-    def __init__(self, *, capabilities=None, order="ij", schedule_options=None, report=None):
+    def __init__(
+        self,
+        *,
+        capabilities=None,
+        order="ij",
+        schedule_options=None,
+        report=None,
+        references=None,
+        normalizations=None,
+    ):
         from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
 
         self.capabilities = capabilities or GemminiCapabilities()
@@ -573,6 +644,8 @@ class ScheduleGemminiTensorIR:
         if set(self.schedule_options) - {"load_order", "reduction_chunk", "row_tiles", "col_tiles"}:
             raise ValueError("Unknown Gemmini TensorIR schedule option")
         self.report = report if report is not None else []
+        self.references = references if references is not None else {}
+        self.normalizations = normalizations if normalizations is not None else {}
 
     def transform_module(self, mod, _ctx):
         from .gemmini_elementwise import elementwise_blocks, make_elementwise_schedule
@@ -650,20 +723,23 @@ class ScheduleGemminiTensorIR:
                     )
                     origin = "deterministic TensorIR rule"
             except (ValueError, tir.schedule.ScheduleError) as error:
+                if gv.name_hint in self.references:
+                    mod.update_func(gv, self.references[gv.name_hint])
                 self.report.append(
                     {"function": gv.name_hint, "placement": "cpu", "reason": str(error)}
                 )
                 continue
             mod.update_func(gv, result.scheduled_mod["main"])
-            self.report.append(
-                {
-                    "function": gv.name_hint,
-                    "placement": "gemmini",
-                    "metadata": result.metadata,
-                    "trace": result.trace.as_json(),
-                    "origin": origin,
-                }
-            )
+            record = {
+                "function": gv.name_hint,
+                "placement": "gemmini",
+                "metadata": result.metadata,
+                "trace": result.trace.as_json(),
+                "origin": origin,
+            }
+            if gv.name_hint in self.normalizations:
+                record["mathematical_normalization"] = self.normalizations[gv.name_hint]
+            self.report.append(record)
         return mod
 
 
@@ -685,7 +761,16 @@ def prepare_gemmini_tensorir_graph(
             ]
         )
     mod = tvm.transform.Sequential(passes)(mod)
+    from .gemmini_bias import CanonicalizeGemminiBias
+
+    references, normalizations = {}, {}
+    mod = CanonicalizeGemminiBias(references=references, report=normalizations)(mod)
     mod = ScheduleGemminiTensorIR(
-        capabilities=capabilities, order=order, schedule_options=schedule_options, report=report
+        capabilities=capabilities,
+        order=order,
+        schedule_options=schedule_options,
+        report=report,
+        references=references,
+        normalizations=normalizations,
     )(mod)
     return _inline_cpu_producers(mod)

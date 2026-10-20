@@ -66,9 +66,8 @@ static void flush(void) {
         int64_t part=0;
         for(unsigned k=0;k<x.k;++k) { check(loaded[x.a+i][k] && loaded[x.b+k][j]); part+=(int32_t)sp[x.a+i][k]*sp[x.b+k][j]; }
         check(part>=-524288 && part<=524287 && initialized[x.c+i][j]);
-        int64_t value=acc[x.c+i][j]+part;
-        check(value>=INT32_MIN && value<=INT32_MAX);
-        acc[x.c+i][j]=(int32_t)value+wrong;
+        uint32_t bits=(uint32_t)acc[x.c+i][j]+(uint32_t)part+(uint32_t)wrong;
+        memcpy(&acc[x.c+i][j],&bits,sizeof(bits));
       }
     } else if(x.op==3) {
       check(x.c+x.m<=1024 && x.stride>=x.n);
@@ -212,7 +211,7 @@ class GemminiTensorIRTests(unittest.TestCase):
         self.assertNotEqual(str(result.trace), str(other.trace))
 
     def test_matrix_cache_groups_reuse_dma_and_preserve_tails(self):
-        for m, n, k in ((64, 64, 32), (17, 19, 33)):
+        for m, n, k in ((64, 64, 32), (17, 19, 33), (3, 4, 5)):
             a = ((np.arange(m * k).reshape(m, k) * 13) % 256 - 128).astype("int8")
             b = ((np.arange(k * n).reshape(k, n) * 7) % 256 - 128).astype("int8")
             for row_tiles, col_tiles in ((1, 1), (2, 1), (1, 2), (2, 2), (4, 4)):
@@ -234,6 +233,37 @@ class GemminiTensorIRTests(unittest.TestCase):
                             control.emulator_commands(), a_loads + b_loads + 32 + 16 + 16
                         )
                         self.assertEqual(result.metadata["acc_rows"], 16 * row_tiles * col_tiles)
+
+    def test_missing_physical_sram_row_alignment_is_rejected(self):
+        from tvm.relax.backend.contrib.gemmini_memory import lower_memory
+
+        schedule, _ = schedule_contraction(workload(3, 4, 5))
+
+        def erase_alignment(node):
+            if isinstance(node, tir.Block) and "buffer_dim_align" in node.annotations:
+                return tir.Block(
+                    node.iter_vars,
+                    node.reads,
+                    node.writes,
+                    node.name_hint,
+                    node.body,
+                    node.init,
+                    node.alloc_buffers,
+                    node.match_buffers,
+                    {
+                        key: value
+                        for key, value in node.annotations.items()
+                        if key != "buffer_dim_align"
+                    },
+                )
+            return None
+
+        original = schedule.mod["main"]
+        broken = original.with_body(
+            tir.stmt_functor.ir_transform(original.body, None, erase_alignment)
+        )
+        with self.assertRaisesRegex(ValueError, "physical row stride"):
+            lower_memory(tvm.IRModule({"main": broken}))
 
     def test_convolution_layout_scheduling_replay_and_independent_oracle(self):
         # Ordinary LegalizeOps supplies the sliding-window reduction. There is

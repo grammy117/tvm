@@ -173,7 +173,9 @@ def register_reduction_intrinsics(rows, depth):
             with T.block("ones_product"):
                 T.reads(C[0:rows, 0:1], A[0:rows, 0:depth])
                 T.writes(C[0:rows, 0:1])
-                B = T.alloc_buffer((depth, 1), "int8", scope=SPAD, strides=[16, 1])
+                # Describe the full physical row: only column zero is loaded
+                # and consumed, but each hardware row occupies sixteen bytes.
+                B = T.alloc_buffer((depth, 16), "int8", scope=SPAD)
                 one = T.alloc_buffer((), "int8")
                 one[()] = T.int8(1)
                 T.evaluate(
@@ -298,10 +300,13 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
         (write, 2, "store"),
     ):
         loop = sch.get_loops(target)[-axes]
-        if tensorize:
-            sch.tensorize(loop, intrinsics[kind])
-        elif mark_tensorize:
+        if tensorize or mark_tensorize:
             tiled = sch.blockize(loop)
+            if kind != "store":
+                sch.storage_align(tiled, 0, axis=-2, factor=16, offset=0)
+        if tensorize:
+            sch.tensorize(tiled, intrinsics[kind])
+        elif mark_tensorize:
             sch.annotate(tiled, "meta_schedule.auto_tensorize", intrinsics[kind])
     return sch, mathematical, {"operation": "sum_i8_i32", "rows": rows, "depth": depth}
 

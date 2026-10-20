@@ -17,6 +17,8 @@ selected hardware and numerical contract.
 
 1. Ordinary Relax `LegalizeOps`, pattern annotation, constant folding and
    supported `FuseOps`/`FuseTIR` retain mathematical computations.
+   `CanonicalizeGemminiBias` can then expose a proven bias-initialized integer
+   reduction, separately from scheduling, retaining both mathematical forms.
 2. `ScheduleGemminiTensorIR` recognizes contractions by their buffer accesses,
    arithmetic and reduction axes. Names do not select implementations. Unmatched
    functions retain CPU lowering; schedule refusals retain a reason.
@@ -69,11 +71,17 @@ used for operator pools; this is not a claim of stock microTVM/AOT deployment.
 
 `gemmini_space_generator()` is a standard MetaSchedule `PostOrderApply` space
 generator with a target-specific `PyScheduleRule`, standard `RewriteTensorize`
-and a memory legality postprocessor. Its 72 choices combine matrix traversal,
+and a memory legality postprocessor. Up to 72 choices combine matrix traversal,
 A/B issue order, PE-safe K chunks of 8/16 and row/column tile groups of 1/2/4.
 Blocked B and accumulator layouts let one DMA load serve multiple tile products.
 Independent command-count checks confirm reuse while preserving full and tail
 results. This does not implement DMA software pipelining or double buffering.
+Alignment is attached to the explicit blockized region consumed by Tensorize.
+This matters for short grouped tiles: aligning only the original inner block
+can lose the physical row pitch when that block is replaced. Memory lowering
+also checks the sixteen-element row pitch (unless the row axis has extent one)
+and contiguous columns. The sum intrinsic's private ones matrix explicitly
+includes all sixteen physical columns, even though only column zero is used.
 
 `ScheduleGemminiTensorIR` uses a matching current MetaSchedule database record
 when present, otherwise a deterministic untuned schedule. The v0.19 default
@@ -90,6 +98,24 @@ semantics until scheduling. CPU window gathering remains necessary for layouts
 that primitive rectangular DMA cannot express, but the placed staging regions
 replace the old full im2col graph tensor. Quantization and pooling semantics
 are not changed by this layout schedule.
+
+Bias preload applies to a bounded, private, unshared INT8/INT32 product followed
+by a bijective pointwise addition of a read-only INT32 tensor. The post-fusion
+mathematical pass exposes bias initialization and explicit modulo-32 reduction
+updates. This preserves the original defined results even when moving bias
+earlier makes an intermediate prefix wrap; it also preserves explicitly wrapping
+source additions. It does not make ordinary TVM integer arithmetic globally
+wrapping. Reports retain the original/normalized IR and proof conditions; a
+scheduling refusal restores the original CPU function.
+
+Standard schedules inline vector/matrix bias or place a necessary scalar/column
+broadcast gather near initialization, then tensorize full-width accumulator DMA.
+The final product copy can inline into device writeback. CPU INT32/FP ReLU and
+quantization remain separate. The wrapped reduction currently uses divisor
+tiles because v0.19 `pad_einsum` does not recognize that expression; prime
+extents may therefore require many tiny commands. Cache groups that do not
+divide those extents are rejected. Bias fusion is currently a fixed policy,
+not a measured profitability decision, and no speedup is claimed.
 
 ## Hardware evidence and numerical boundaries
 
@@ -124,7 +150,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Family | Requested operations | Current migration state |
 | --- | --- | --- |
 | Matrix | `mm`, `bmm` | Structural scheduling, queued-DMA checks and bounded Spike/RTL checks implemented; full operator inventory remains pending |
-| Biased matrix | `addmm` | Standard fused INT32 bias/ReLU CPU epilogue tested with accelerator matmul; bias preload not yet implemented |
+| Biased matrix | `addmm` | Exact integer matmul with eligible INT32 tensor bias uses accumulator preload; shared products and unsupported epilogues retain their original mathematics. CPU activation/scaling and complete ATen/frontend admission remain separate |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
 | Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 tensor addition uses accumulator overwrite/add loads and full readout. Ordinary signed TIR has a no-overflow domain; explicit widen/add/narrow TIR also maps natively and defines modulo-2^32 output. Other mappings remain under audit; generic CPU fallback retained |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
@@ -300,6 +326,25 @@ through the default VM pipeline. Contraction, DMA, exporter and classifier
 regressions are in `unit-reduction-structural-v1.log`,
 `unit-reduction-elementwise-v1.log`, `unit-reduction-export-v1.log` and
 `unit-reduction-classifier-v1.log`. These are functional checks, not timings.
+
+`device-bias-v2` adds five native bias-preload fixtures: vector, matrix, column
+and scalar broadcasts, plus explicit modulo-32 final output. The ordinary
+addition fixtures deliberately cross INT32 limits after preload and return to
+an in-range final result. Positive and wrong-oracle runs pass on Spike and RTL,
+with 60-second / 300,000-cycle RTL bounds. The guest requires array compute and
+accumulator overwrite DMA, and refuses a zero-initialized substitute. Source,
+library, adapter, ELF and simulator bindings are retained with each run.
+
+The generic core checks in `core-sequence-after-v1.log` pass 80 tests, with one
+existing affine-analysis skip. `unit-bias-full-v1.log` passes 125 backend/app
+checks; its one failure and one skip are missing optional XGBoost. Both pass in
+`unit-bias-xgb-v1.log` with isolated `xgboost-cpu==2.1.4`, completing all 127
+Gemmini checks without changing the legacy search. That learned-search test
+uses explicitly synthetic diagnostic labels, not Gemmini performance data.
+The exact rebuilt libraries are preserved in `compiler-core-v1`, independently
+of the mutable CMake build directory. The new tests include original-input
+preservation, full bias trace replay, grouped short tiles and rejection of a
+deliberately misaligned SRAM program. The 51-operator audit remains pending.
 
 The migration remains incomplete until the inventory's remaining native
 admission, CPU/frontend explanations and final regression/target checks are

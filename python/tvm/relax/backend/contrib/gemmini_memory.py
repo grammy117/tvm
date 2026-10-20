@@ -120,6 +120,17 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
             if not all(isinstance(value, tir.IntImm) for value in buffer.shape):
                 raise ValueError("Gemmini SRAM allocations must be statically bounded")
             strides = list(buffer.strides)
+            if len(buffer.shape) >= 2:
+                row_stride = strides[-2] if strides else buffer.shape[-1]
+                column_stride = strides[-1] if strides else tir.IntImm("int32", 1)
+                if (
+                    not analyzer.can_prove(buffer.shape[-2] == 1)
+                    and not analyzer.can_prove(row_stride == 16)
+                ) or not analyzer.can_prove(column_stride == 1):
+                    raise ValueError(
+                        f"Gemmini SRAM buffer {buffer.name} requires a 16-element physical row stride "
+                        f"(row={row_stride}, column={column_stride})"
+                    )
             span = (
                 sum((int(size) - 1) * int(stride) for size, stride in zip(buffer.shape, strides))
                 + 1

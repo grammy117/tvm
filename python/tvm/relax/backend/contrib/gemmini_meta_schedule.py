@@ -24,7 +24,7 @@ target memory and measure on the explicitly selected target.
 
 import itertools
 
-from tvm import meta_schedule as ms
+from tvm import meta_schedule as ms, tir
 from tvm.meta_schedule.utils import derived_object
 
 from .gemmini_memory import lower_memory
@@ -106,16 +106,19 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             self.orders, self.load_orders, self.chunks, self.row_tiles, self.col_tiles
         ):
             candidate = sch.copy()
-            transformed, _ = schedule_contraction(
-                func,
-                order=order,
-                load_order=load_order,
-                reduction_chunk=chunk,
-                tensorize=False,
-                mark_tensorize=True,
-                row_tiles=rows,
-                col_tiles=cols,
-            )
+            try:
+                transformed, _ = schedule_contraction(
+                    func,
+                    order=order,
+                    load_order=load_order,
+                    reduction_chunk=chunk,
+                    tensorize=False,
+                    mark_tensorize=True,
+                    row_tiles=rows,
+                    col_tiles=cols,
+                )
+            except (ValueError, tir.schedule.ScheduleError):
+                continue
             transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
             results.append(candidate)
         return results

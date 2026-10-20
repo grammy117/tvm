@@ -465,10 +465,13 @@ def _schedule_elementwise_candidate(func, node, kind, rank, factors, tensorize, 
     mathematical = sch.mod
     for target, key in ((block, "op"), (write, "store")):
         loop = sch.get_loops(target)[-rank]
-        if tensorize:
-            sch.tensorize(loop, intrinsics[key])
-        elif mark_tensorize:
+        if tensorize or mark_tensorize:
             tiled = sch.blockize(loop)
+            if key == "op" and rank == 2:
+                sch.storage_align(tiled, 0, axis=-2, factor=16, offset=0)
+        if tensorize:
+            sch.tensorize(tiled, intrinsics[key])
+        elif mark_tensorize:
             sch.annotate(tiled, "meta_schedule.auto_tensorize", intrinsics[key])
     return sch, mathematical, {"operation": kind, "tile_rows": rows, "tile_cols": cols}
 
