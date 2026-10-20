@@ -51,13 +51,29 @@ void* memset(void* p,int c,size_t n) { volatile unsigned char* d=p;for(size_t i=
 void* memcpy(void* d,const void* s,size_t n) { volatile unsigned char* o=d;const volatile unsigned char* p=s;for(size_t i=0;i<n;++i)o[i]=p[i];return d; }
 int printf(const char* format,...) { (void)format;puts_htif("VENDOR_DIAGNOSTIC\n");return 0; }
 __attribute__((noreturn)) void exit(int code) { tohost=((uint64_t)(code?code:99)<<1)|1;for(;;){} }
-static unsigned computes,zeros;
+static unsigned computes,zeros,dmas,accumulates;
 void __real_tvm_gemmini_compute(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
 void __real_tvm_gemmini_zero_acc(uint32_t,uint32_t,uint32_t);
 void __wrap_tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
   ++computes;__real_tvm_gemmini_compute(a,b,c,m,n,k,add);
 }
 void __wrap_tvm_gemmini_zero_acc(uint32_t c,uint32_t m,uint32_t n) { ++zeros;__real_tvm_gemmini_zero_acc(c,m,n); }
+void __real_tvm_gemmini_dma_acc_write(const int32_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __real_tvm_gemmini_dma_acc_add(const int32_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __real_tvm_gemmini_dma_widen(const int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __real_tvm_gemmini_dma_spad_out(int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __wrap_tvm_gemmini_dma_acc_write(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;__real_tvm_gemmini_dma_acc_write(p,c,m,n,s,w);
+}
+void __wrap_tvm_gemmini_dma_acc_add(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;++accumulates;__real_tvm_gemmini_dma_acc_add(p,c,m,n,s,w);
+}
+void __wrap_tvm_gemmini_dma_widen(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;__real_tvm_gemmini_dma_widen(p,c,m,n,s,w);
+}
+void __wrap_tvm_gemmini_dma_spad_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;__real_tvm_gemmini_dma_spad_out(p,c,m,n,s,w);
+}
 static uint64_t hash(const void* p,size_t n) {
   const volatile unsigned char* b=p;uint64_t h=1469598103934665603ULL;
   for(size_t i=0;i<n;++i)h=(h^b[i])*1099511628211ULL;return h;
@@ -67,7 +83,7 @@ static uint64_t hash(const void* p,size_t n) {
 
 def fixtures():
     import numpy as np
-    from tvm import relax
+    from tvm import relax, te
 
     result = []
     for name, m, n, k, batches, fused in (
@@ -121,6 +137,76 @@ def fixtures():
             for kx in range(2)
         )
     result.append(("conv", builder.get(), [a, b], expected.astype("int32")))
+    extremes = np.array([0, 1, 2147483647, -2147483648, -1, 305419896], "int32")
+    for kind in ("add_i32", "copy_i8", "copy_i32", "widen"):
+        if kind in ("copy_i8", "widen"):
+            a = (
+                (np.arange(256).reshape(16, 16) - 128).astype("int8")
+                if kind == "widen"
+                else (np.arange(15).reshape(3, 5) * 17 - 128).astype("int8")
+            )
+        else:
+            a = np.resize(extremes, (3, 4))
+        av = relax.Var("a", relax.TensorStructInfo(a.shape, str(a.dtype)))
+        parameters, arrays = [av], [a]
+        builder = relax.BlockBuilder()
+        copy_gv = None
+        if kind.startswith("copy"):
+            source = te.placeholder(a.shape, str(a.dtype))
+            copied = te.compute(a.shape, lambda *i: source[i], name="copied")
+            copy_gv = builder.add_func(te.create_prim_func([source, copied]), "copy")
+        if kind == "add_i32":
+            b = np.resize(
+                np.array([-1, 2147483647, 1, -1, -2147483648, 2147483647], "int32"), a.shape
+            )
+            bv = relax.Var("b", relax.TensorStructInfo(b.shape, "int32"))
+            parameters.append(bv)
+            arrays.append(b)
+            left = te.placeholder(a.shape, "int32", "left")
+            right = te.placeholder(b.shape, "int32", "right")
+            wrapped = te.compute(
+                a.shape,
+                lambda *i: (left[i].astype("int64") + right[i].astype("int64")).astype("int32"),
+                name="wrapping_sum",
+            )
+            add_gv = builder.add_func(te.create_prim_func([left, right, wrapped]), "wrapping_add")
+        with builder.function("main", parameters):
+            with builder.dataflow():
+                if kind == "add_i32":
+                    value = relax.call_tir(
+                        add_gv, (av, bv), relax.TensorStructInfo(a.shape, "int32")
+                    )
+                elif kind == "widen":
+                    value = relax.op.astype(av, "int32")
+                else:
+                    value = relax.call_tir(
+                        copy_gv, (av,), relax.TensorStructInfo(a.shape, str(a.dtype))
+                    )
+                output = builder.emit_output(value)
+            builder.emit_func_output(output)
+        expected = (
+            (a.astype("int64") + b.astype("int64")).astype("int32")
+            if kind == "add_i32"
+            else a.astype("int32")
+            if kind == "widen"
+            else a
+        )
+        result.append((kind, builder.get(), arrays, expected))
+    for kind in ("permute", "repeat"):
+        a = (np.arange(6).reshape(2, 3) * 17 - 128).astype("int8")
+        av = relax.Var("a", relax.TensorStructInfo(a.shape, "int8"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [av]):
+            with builder.dataflow():
+                value = (
+                    relax.op.permute_dims(av, [1, 0])
+                    if kind == "permute"
+                    else relax.op.tile(av, [2, 2])
+                )
+                output = builder.emit_output(value)
+            builder.emit_func_output(output)
+        expected = a.T if kind == "permute" else np.tile(a, (2, 2))
+        result.append((kind, builder.get(), [a], expected))
     return result
 
 
@@ -157,6 +243,7 @@ def prepare(args):
     guest = [GUEST, '#include "package/model.h"']
     checks = []
     for index, (name, _, arrays, expected) in enumerate(cases):
+        output_ctype = "int8_t" if expected.dtype == np.int8 else "int32_t"
         for arg, array in enumerate(arrays):
             ctype = "int8_t" if array.dtype == np.int8 else "int32_t"
             values = ",".join(str(int(x)) for x in array.flat)
@@ -164,11 +251,11 @@ def prepare(args):
                 f"static const {ctype} in_{index}_{arg}[] __attribute__((aligned(64)))={{{values}}};"
             )
         values = ",".join(str(int(x)) for x in expected.flat)
-        guest.append(f"static const int32_t expected_{index}[]={{{values}}};")
+        guest.append(f"static const {output_ctype} expected_{index}[]={{{values}}};")
         size = expected.size
         workspace = manifest["stages"][name]["workspace_bytes"]
         guest.append(
-            f"static struct {{ uint8_t head[64]; int32_t data[{size}]; uint8_t tail[64]; }} out_{index} __attribute__((aligned(64)));"
+            f"static struct {{ uint8_t head[64]; {output_ctype} data[{size}]; uint8_t tail[64]; }} out_{index} __attribute__((aligned(64)));"
         )
         guest.append(
             f"static uint8_t work_{index}[{max(workspace, 1)}] __attribute__((aligned(64)));"
@@ -180,17 +267,30 @@ def prepare(args):
                 f"const void* inputs_{index}[]={{{pointers}}}; void* outputs_{index}[]={{out_{index}.data}};",
                 f"memset(&out_{index},0x6d,sizeof(out_{index}));",
                 f"unsigned before_{index}=computes, zero_before_{index}=zeros;",
+                f"unsigned dma_before_{index}=dmas, add_before_{index}=accumulates;",
             ]
         )
         for arg in range(len(arrays)):
             checks.append(
                 f"uint64_t hash_{index}_{arg}=hash(in_{index}_{arg},sizeof(in_{index}_{arg}));"
             )
+        operation = next(
+            row["metadata"].get("operation")
+            for row in reports[name]
+            if row["placement"] == "gemmini"
+        )
+        primitive_check = (
+            f"if(dmas==dma_before_{index})return 21;"
+            if operation
+            else f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
+        )
+        if operation in ("add_i32", "add_i32_wrapping"):
+            primitive_check += f"if(accumulates==add_before_{index})return 21;"
         checks.extend(
             [
                 f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index},{workspace})) return 20;",
-                f"if(computes==before_{index} || zeros==zero_before_{index})return 21;",
-                f'for(unsigned i=0;i<{size};++i)if(out_{index}.data[i]!=expected_{index}[i]+BAD_ORACLE){{puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}',
+                primitive_check,
+                f'for(unsigned i=0;i<{size};++i)if((int64_t)out_{index}.data[i]!=(int64_t)expected_{index}[i]+BAD_ORACLE){{puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}',
                 f"for(unsigned i=0;i<64;++i)if(out_{index}.head[i]!=0x6d || out_{index}.tail[i]!=0x6d)return 23;",
             ]
         )
@@ -225,6 +325,10 @@ def prepare(args):
         "-Wl,-T," + str(out / "link.ld"),
         "-Wl,--wrap=tvm_gemmini_compute",
         "-Wl,--wrap=tvm_gemmini_zero_acc",
+        "-Wl,--wrap=tvm_gemmini_dma_acc_write",
+        "-Wl,--wrap=tvm_gemmini_dma_acc_add",
+        "-Wl,--wrap=tvm_gemmini_dma_widen",
+        "-Wl,--wrap=tvm_gemmini_dma_spad_out",
         "-I" + str(out),
     ]
     sources = [out / "start.S", out / "runner.c", package / "runtime.c", package / "constants.S"]
@@ -282,6 +386,7 @@ def prepare(args):
                 "gemmini_memory",
                 "gemmini_target",
                 "gemmini_meta_schedule",
+                "gemmini_elementwise",
             )
         ],
     ):
@@ -423,7 +528,20 @@ def main():
         "--cases",
         nargs="+",
         default=["small", "full", "tail", "batched"],
-        choices=["small", "full", "tail", "batched", "conv", "reuse"],
+        choices=[
+            "small",
+            "full",
+            "tail",
+            "batched",
+            "conv",
+            "reuse",
+            "add_i32",
+            "copy_i8",
+            "copy_i32",
+            "widen",
+            "permute",
+            "repeat",
+        ],
     )
     execute = sub.add_parser("run")
     execute.add_argument("--bundle", type=Path, required=True)

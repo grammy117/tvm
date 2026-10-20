@@ -70,10 +70,26 @@ static void flush(void) {
         check(value>=INT32_MIN && value<=INT32_MAX);
         acc[x.c+i][j]=(int32_t)value+wrong;
       }
-    } else {
+    } else if(x.op==3) {
       check(x.c+x.m<=1024 && x.stride>=x.n);
       int32_t* p=x.dst;
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { check(initialized[x.c+i][j]); p[i*x.stride+j]=acc[x.c+i][j]; }
+    } else if(x.op==4 || x.op==5) {
+      check(x.c+x.m<=1024 && (x.stride==0 || x.stride>=x.n));
+      const int32_t* p=x.src;
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
+        if(x.op==5)check(initialized[x.c+i][j]);
+        uint32_t bits=(uint32_t)p[i*x.stride+j]+(x.op==5?(uint32_t)acc[x.c+i][j]:0);
+        memcpy(&acc[x.c+i][j],&bits,sizeof(bits));initialized[x.c+i][j]=1;
+      }
+    } else if(x.op==6) {
+      check(x.c+x.m<=1024 && (x.stride==0 || x.stride>=x.n));
+      const int8_t* p=x.src;
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { acc[x.c+i][j]=p[i*x.stride+j];initialized[x.c+i][j]=1; }
+    } else if(x.op==7) {
+      check(x.a+x.m<=16384 && x.stride>=x.n);
+      int8_t* p=x.dst;
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { check(loaded[x.a+i][j]);p[i*x.stride+j]=sp[x.a+i][j]; }
     }
   }
   count=0;
@@ -102,6 +118,18 @@ void tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,
 }
 void tvm_gemmini_dma_out(int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
   push((struct command){.op=3,.dst=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
+}
+void tvm_gemmini_dma_acc_write(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
+  push((struct command){.op=4,.src=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
+}
+void tvm_gemmini_dma_acc_add(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
+  push((struct command){.op=5,.src=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
+}
+void tvm_gemmini_dma_widen(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
+  push((struct command){.op=6,.src=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
+}
+void tvm_gemmini_dma_spad_out(int8_t* p,uint32_t a,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
+  push((struct command){.op=7,.dst=p,.a=a,.m=m,.n=n,.stride=stride});if(wait)flush();
 }
 """
 

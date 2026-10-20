@@ -30,6 +30,7 @@ from tvm.meta_schedule.utils import derived_object
 from .gemmini_memory import lower_memory
 from .gemmini_target import GemminiCapabilities
 from .gemmini_tensorir import _normalizable_contractions, contraction_block, schedule_contraction
+from .gemmini_elementwise import elementwise_blocks, schedule_elementwise
 
 
 @derived_object
@@ -65,6 +66,21 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
     def apply(self, sch, block):
         func = sch.mod["main"]
         matches = contraction_block(func) or _normalizable_contractions(func)
+        if not matches:
+            pointwise = elementwise_blocks(func)
+            if len(pointwise) == 1 and sch.get(block).same_as(pointwise[0][0]):
+                candidates, traces = [], set()
+                for scalar in (False, True):
+                    candidate = sch.copy()
+                    transformed, _, _ = schedule_elementwise(
+                        func, tensorize=False, mark_tensorize=True, scalar=scalar
+                    )
+                    if str(transformed.trace) not in traces:
+                        traces.add(str(transformed.trace))
+                        transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
+                        candidates.append(candidate)
+                return candidates
+            return [sch]
         if len(matches) != 1 or not sch.get(block).same_as(matches[0][0]):
             return [sch]
         results = []

@@ -66,6 +66,13 @@ void tvm_gemmini_zero_acc(uint32_t row, uint32_t rows, uint32_t cols);
 void tvm_gemmini_dma_a(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 void tvm_gemmini_dma_b(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+/* Full-width overwrite/add preserve INT32 bit patterns; addition wraps modulo
+ * 2^32, as the accumulator SRAM adder does. No scaler is applied. Widen uses
+ * signed INT8 input and full INT32 destination rows with identity input scale. */
+void tvm_gemmini_dma_acc_write(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+void tvm_gemmini_dma_acc_add(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+void tvm_gemmini_dma_widen(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+void tvm_gemmini_dma_spad_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 int32_t tvm_gemmini_validate_tensor_buffers(const void* a, int64_t a_bytes, const void* b, int64_t b_bytes,
                                           void* c, int64_t c_bytes);
 

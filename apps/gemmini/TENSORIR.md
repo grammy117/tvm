@@ -107,12 +107,63 @@ Statuses here are development state, not a completed hardware-support table.
 | Matrix | `mm`, `bmm` | Structural scheduling, queued-DMA checks and bounded Spike/RTL checks implemented; full operator inventory remains pending |
 | Biased matrix | `addmm` | Standard fused INT32 bias/ReLU CPU epilogue tested with accelerator matmul; bias preload not yet implemented |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
-| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | Native mappings and exact admission boundaries still required; generic CPU fallback retained |
+| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 tensor addition uses accumulator overwrite/add loads and full readout. Ordinary signed TIR has a no-overflow domain; explicit widen/add/narrow TIR also maps natively and defines modulo-2^32 output. Other mappings remain under audit; generic CPU fallback retained |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Native reduction mappings and dtype/rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | DMA-native mapping and exact fallback explanations still required |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32 copies, indexed repeats/slices and signed INT8-to-INT32 widening use native DMA where Tensorize proves the access map. Multiple-source selection, broadcast/fill and overlapping updates remain under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
+
+### Corrections to the proposed native-unit mappings
+
+An operator name alone is not a numerical contract. The native array here has
+signed INT8 operands and INT32 accumulation; ordinary FP32 `mm`, training
+convolutions and gradients cannot be silently quantized. The native statuses
+above describe admitted mathematical TIR after an explicit integer recipe, not
+complete acceptance of every ATen overload or frontend graph.
+
+| Requested mapping | Evidence-backed boundary |
+| --- | --- |
+| `add.Tensor` / `sub.Tensor` through load scaling | Full-width accumulator loads have no configured scaler. Unscaled INT32 addition is supported and the RTL SRAM adder wraps to 32 bits. General alpha scaling or subtraction does not follow from that. INT8 scaled loads round/saturate; `-(-128)` demonstrates why they cannot replace arbitrary wrapping negation or widened subtraction. |
+| `add.Scalar`, `sub.Scalar` | Broadcasting a resident row through zero load stride is a real hardware capability. The appropriate scalar/row layout and its TensorIR rule remain implementation work; this is not an absent-hardware excuse. |
+| `mul.Scalar`, `div.Scalar`, `neg` | The available scaled small readout narrows to INT8. It is not an arbitrary FP32 or full-INT32 multiply/divide unit. Any narrower integer recipe must specify its rounding, saturation and value range before admission. |
+| `relu` | Full-width INT32 readout bypasses the activation/scaling result. CPU INT32/FP ReLU therefore remains explicit. An INT8 input/output ReLU mapping is feasible but still needs a dedicated native rule. |
+| `mean.dim`, `mean.default`, `sum.dim_IntList` | A ones-vector contraction can implement a bounded signed-INT8-to-INT32 sum, but that is not the default INT64 or floating reduction contract. A native bounded sum rule remains implementation work. Mean additionally needs a specified divisor, output dtype and rounding; a narrowing readout scale cannot stand in for arbitrary floating mean. |
+| `avg_pool1d/2d/3d`, adaptive average pooling | Ordinary floating inputs do not fit the integer arithmetic unit. An integer recipe must specify windows, divisors, exclude-padding/ceil behavior and rounding. The max-pool readout feature does not implement average pooling. |
+| Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. No generic backward mapping is claimed. |
+| Generic data movement | Primitive DMA handles rectangular regions with contiguous columns and one row stride. Copies preserving bits and signed widening are admitted. Index remapping, multiple sources, fill broadcasting and overlapping updates need appropriate schedules or remain CPU work. They must not be described as absent silicon features merely because the current schedule does not handle them. |
+| Views and metadata | Reshape-like operations may disappear or become host metadata when consumers can accept the layout. Permute, diagonal, slicing and `as_strided` are not automatically free under the static exporter's compact-buffer ABI. Materialization and alias semantics must be audited; host metadata is not accelerator arithmetic. |
+
+The existing v0.19 Torch exported-program translator also has an incomplete
+direct ATen conversion table. Prior frontend decompositions may remove an
+unsupported spelling, but a missing conversion is not a Gemmini CPU-fallback
+success. This backend accepts ordinary Relax/mathematical TIR; frontend gaps
+must be reported independently of native-unit legality.
+
+`gemmini_elementwise.py` registers typed copy, widening and INT32 add intrinsics
+and uses standard `split`, `reorder`, `cache_write`, placement and `tensorize`.
+Prime extents can require small divisor tiles; they do not imply padded DMA or
+an unmeasured speedup. Extent-one descriptor axes are canonicalized with typed
+TIR construction to match v0.19's blockize behavior. Standard MetaSchedule
+postprocessing and feature extraction also cover this DMA rule.
+
+The LLVM code generator's `DEFINE_CODEGEN_BINARY_OP` macro marks ordinary
+signed >=32-bit arithmetic `nsw` and unsigned >=32-bit arithmetic `nuw`.
+Consequently a hardware overflow result alone cannot prove full ATen wrapping
+semantics for arbitrary ordinary TVM integer expressions. The wrapping-add
+intrinsic has a separate reference: widen both INT32 inputs to INT64, add within
+its proven range, then narrow to INT32. Target overflow/underflow fixtures use
+that explicit mathematical reference. The plain-add intrinsic preserves the
+defined no-overflow domain; it does not silently change the global TVM policy.
+
+Indexed INT8/INT32 copies are also matched by the framework: rectangular tiles
+are tried first, then single-element DMA when Tensorize cannot prove a larger
+access map. This covers materialized slices, diagonals, permutations and repeats
+without CPU value copying. Such schedules can issue many commands and are not
+performance winners without measurements. Both options are visible to standard
+MetaSchedule, whose tensorization postprocessor rejects illegal candidates.
+In-place copies remain refused. DMA completion also protects external output
+buffers when CPU code in the same function subsequently accesses them.
 
 ## Verification tools
 
@@ -150,6 +201,17 @@ export checks) and `unit-classifier-v2.log` (two result-decoding checks).
 Subsequent cleanup checks are `unit-migration-v4.log` (30 checks),
 `unit-scalar-bool-v1.log` (scalar-input/boolean-output epilogue) and
 `unit-export-v3.log` (including byte-sized boolean operator workspace).
+
+Native DMA evidence is recorded in `device-native-v4`: INT32 wrapping addition
+uses explicit INT64-add/INT32-narrow reference mathematics, INT8/INT32 copies
+preserve bits, widening covers all 256 signed-INT8 values, and materialized
+permutation/repeat fixtures exercise scalar-DMA fallback. Fixtures verify actual
+DMA/accumulate calls, every output, unchanged inputs and surrounding guards.
+`unit-elementwise-v6.log` covers mathematical CPU/device equivalence, standard
+MetaSchedule postprocessing, indexed layouts, tails and delayed DMA. The
+CPU-consumer test deliberately removes a required output wait and fails its
+oracle. `unit-structural-native-v2.log` retains 11 contraction regressions and
+`unit-export-native-v1.log` retains 21 exporter/classifier checks.
 
 The migration remains incomplete until the inventory's remaining native
 admission, CPU/frontend explanations and final regression/target checks are

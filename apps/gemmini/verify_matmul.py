@@ -38,6 +38,8 @@ HARDWARE_REVISION = "6ad65b90b1eb270c20ce4f04109e3dde0180b36f"
 PARAMS_SHA256 = "3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924"
 OPERATOR_SHA256 = "18801f4eab0cd2e81e25a6c2aa97c7ed644b693e8d2c24cdeb41ab3a7208336d"
 PUBLIC_SYMBOLS = (
+    "tvm_gemmini_dma_acc_write", "tvm_gemmini_dma_acc_add",
+    "tvm_gemmini_dma_widen", "tvm_gemmini_dma_spad_out",
     "tvm_gemmini_matmul_i8_i32", "tvm_gemmini_validate_matmul_i8_i32", "tvm_gemmini_begin",
     "tvm_gemmini_load_a", "tvm_gemmini_load_b", "tvm_gemmini_compute", "tvm_gemmini_store", "tvm_gemmini_end",
     "tvm_gemmini_zero_acc", "tvm_gemmini_dma_a", "tvm_gemmini_dma_b", "tvm_gemmini_dma_out",

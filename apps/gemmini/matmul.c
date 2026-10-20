@@ -199,6 +199,38 @@ void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t col
   if (wait) tvm_gemmini_end();
 }
 
+void tvm_gemmini_dma_acc_write(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_extended3_config_ld((uint64_t)stride * sizeof(acc_t), MVIN_SCALE_IDENTITY, false, 2);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin3(src, accumulator_address(row, 0), cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_acc_add(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_extended3_config_ld((uint64_t)stride * sizeof(acc_t), MVIN_SCALE_IDENTITY, false, 2);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin3(src, accumulator_address(row, 1), cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_widen(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_extended3_config_ld((uint64_t)stride, MVIN_SCALE_IDENTITY, true, 2);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin3(src, accumulator_address(row, 0), cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_spad_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_config_st((uint64_t)stride);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvout(dst, row, cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
 int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k,
                                 int64_t a_stride, int64_t b_stride, int64_t c_stride) {
   int32_t admission = tvm_gemmini_validate_matmul_i8_i32(a, b, c, m, n, k, a_stride, b_stride, c_stride);

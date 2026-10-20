@@ -424,7 +424,9 @@ def make_tensorir_schedule(
     )
 
 
-def lower_tensorir_schedule(func, sch, *, mathematical=None, order="database", capabilities=None):
+def lower_tensorir_schedule(
+    func, sch, *, mathematical=None, order="database", capabilities=None, workload_metadata=None
+):
     """Finalize a TVM-selected schedule without replacing its scheduling choices."""
     from .gemmini_memory import lower_memory  # pylint: disable=import-outside-toplevel
     from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
@@ -498,18 +500,19 @@ def lower_tensorir_schedule(func, sch, *, mathematical=None, order="database", c
             admission = tir.call_extern("int32", "tvm_gemmini_validate_tensor_buffers", *arguments)
             body = tir.LetStmt(status, admission, tir.IfThenElse(status != 0, failure, body))
     device = device.with_body(body)
-    matches = contraction_block(func) or _normalizable_contractions(func)
-    shape = matches[0][1]
+    if workload_metadata is None:
+        matches = contraction_block(func) or _normalizable_contractions(func)
+        shape = matches[0][1]
+        workload_metadata = dict(zip(("m", "n", "k"), shape))
     device = device.with_attr("gemmini.tensorir", 1)
     device = device.with_attr("gemmini.capability_id", capabilities.fingerprint)
     device = device.with_attr("op_pattern", 8)
-    for key, value in zip(("m", "n", "k"), shape):
-        device = device.with_attr("gemmini." + key, value)
+    for key in ("m", "n", "k"):
+        if key in workload_metadata:
+            device = device.with_attr("gemmini." + key, workload_metadata[key])
     metadata = dict(
         resources,
-        m=shape[0],
-        n=shape[1],
-        k=shape[2],
+        **workload_metadata,
         order=order,
         instruction_policy="primitive_no_fsm",
         performance_measured=False,
@@ -550,18 +553,21 @@ class ScheduleGemminiTensorIR:
         self.report = report if report is not None else []
 
     def transform_module(self, mod, _ctx):
+        from .gemmini_elementwise import elementwise_blocks, make_elementwise_schedule
+
         for gv, func in list(mod.functions_items()):
             if not isinstance(func, tir.PrimFunc) or (
                 func.attrs and "gemmini.tensorir" in func.attrs
             ):
                 continue
             matches = contraction_block(func) or _normalizable_contractions(func)
-            if not matches:
+            pointwise = elementwise_blocks(func) if not matches else []
+            if not matches and not pointwise:
                 self.report.append(
                     {
                         "function": gv.name_hint,
                         "placement": "cpu",
-                        "reason": "No supported exact INT8/INT32 contraction",
+                        "reason": "No supported exact integer contraction, copy, widening or addition",
                     }
                 )
                 continue
@@ -588,8 +594,16 @@ class ScheduleGemminiTensorIR:
                     else None
                 )
                 if selected is not None:
-                    result = lower_tensorir_schedule(func, selected, capabilities=self.capabilities)
+                    result = lower_tensorir_schedule(
+                        func,
+                        selected,
+                        capabilities=self.capabilities,
+                        workload_metadata={"operation": pointwise[0][1]} if pointwise else None,
+                    )
                     origin = "TVM MetaSchedule database"
+                elif pointwise:
+                    result = make_elementwise_schedule(func, capabilities=self.capabilities)
+                    origin = "deterministic TensorIR DMA rule"
                 else:
                     result = make_tensorir_schedule(
                         func,

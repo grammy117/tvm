@@ -70,11 +70,25 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
     if next_row[SPAD] > spad_rows or next_row[ACC] > acc_rows:
         raise ValueError("TVM's scheduled buffers exceed Gemmini SRAM capacity")
 
-    def private_pointer(expr):
+    host_reads, host_writes = set(), set()
+
+    def cpu_access(node):
+        if isinstance(node, tir.BufferLoad) and node.buffer.data not in allocations:
+            host_reads.add(node.buffer.data)
+        if isinstance(node, tir.BufferStore) and node.buffer.data not in allocations:
+            host_writes.add(node.buffer.data)
+
+    tir.stmt_functor.post_order_visit(func.body, cpu_access)
+
+    def host_wait(expr, *, output=False):
         return (
             isinstance(expr, tir.Call)
             and expr.op == tvm.ir.Op.get("tir.tvm_access_ptr")
-            and expr.args[1] in host_private
+            and (
+                expr.args[1] in host_private
+                or expr.args[1] in host_writes
+                or (output and expr.args[1] in host_reads)
+            )
         )
 
     def rewrite(node):
@@ -89,7 +103,13 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
         if isinstance(node, tir.Call) and node.op == tvm.ir.Op.get("tir.call_extern"):
             symbol = node.args[0].value
             args = list(node.args[1:])
-            if symbol in ("tvm_gemmini_dma_a", "tvm_gemmini_dma_b"):
+            if symbol in (
+                "tvm_gemmini_dma_a",
+                "tvm_gemmini_dma_b",
+                "tvm_gemmini_dma_acc_write",
+                "tvm_gemmini_dma_acc_add",
+                "tvm_gemmini_dma_widen",
+            ):
                 src, row, height, width, stride, _ = args
                 return tir.call_extern(
                     "void",
@@ -99,9 +119,9 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
                     height,
                     width,
                     stride,
-                    tir.IntImm("int32", int(private_pointer(src))),
+                    tir.IntImm("int32", int(host_wait(src))),
                 )
-            if symbol == "tvm_gemmini_dma_out":
+            if symbol in ("tvm_gemmini_dma_out", "tvm_gemmini_dma_spad_out"):
                 row, dst, height, width, _, stride = args
                 return tir.call_extern(
                     "void",
@@ -111,7 +131,7 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
                     height,
                     width,
                     stride,
-                    tir.IntImm("int32", int(private_pointer(dst))),
+                    tir.IntImm("int32", int(host_wait(dst, output=True))),
                 )
         if isinstance(node, tir.Block):
             reads = [region for region in node.reads if region.buffer.data not in allocations]
