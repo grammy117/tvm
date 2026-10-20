@@ -162,6 +162,43 @@ void tvm_gemmini_end(void) {
   asm volatile("fence rw,rw" ::: "memory");
 }
 
+int32_t tvm_gemmini_validate_tensor_buffers(const void* a, int64_t a_bytes, const void* b, int64_t b_bytes,
+                                          void* c, int64_t c_bytes) {
+  if (!a || !b || !c || a_bytes <= 0 || b_bytes <= 0 || c_bytes <= 0 ||
+      (uintptr_t)c % _Alignof(acc_t)) return -1;
+  uintptr_t aa = (uintptr_t)a, bb = (uintptr_t)b, cc = (uintptr_t)c;
+  if ((uint64_t)a_bytes > UINTPTR_MAX-aa || (uint64_t)b_bytes > UINTPTR_MAX-bb ||
+      (uint64_t)c_bytes > UINTPTR_MAX-cc) return -2;
+  if ((cc < aa + a_bytes && aa < cc + c_bytes) ||
+      (cc < bb + b_bytes && bb < cc + c_bytes)) return -3;
+  return 0;
+}
+
+void tvm_gemmini_zero_acc(uint32_t row, uint32_t rows, uint32_t cols) {
+  /* LoadController marks vaddr=0 as all_zeros: no host zero buffer is read.
+   * Channel 2 uses full-width accumulator DMA, independently of A/B loads. */
+  gemmini_extended3_config_ld(DIM * sizeof(acc_t), MVIN_SCALE_IDENTITY, false, 2);
+  gemmini_extended_mvin3(NULL, (1U << (ADDR_LEN - 1)) | row, cols, rows);
+}
+
+void tvm_gemmini_dma_a(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_extended3_config_ld((uint64_t)stride, MVIN_SCALE_IDENTITY, false, 0);
+  tvm_gemmini_load_a(src, row, rows, cols);
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_b(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_extended3_config_ld((uint64_t)stride, MVIN_SCALE_IDENTITY, false, 1);
+  tvm_gemmini_load_b(src, row, rows, cols);
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  gemmini_config_st((uint64_t)stride * sizeof(acc_t));
+  tvm_gemmini_store(dst, row, rows, cols);
+  if (wait) tvm_gemmini_end();
+}
+
 int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k,
                                 int64_t a_stride, int64_t b_stride, int64_t c_stride) {
   int32_t admission = tvm_gemmini_validate_matmul_i8_i32(a, b, c, m, n, k, a_stride, b_stride, c_stride);

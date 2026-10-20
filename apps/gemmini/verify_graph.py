@@ -248,7 +248,7 @@ def main():
         import tvm
         from tvm import relax
         from tvm._ffi.base import _LIB
-        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
         from tvm.relax.backend.contrib.gemmini_schedule import make_gemmini_matmul
         from baremetal import export_graph
         if checked_path(tvm.__file__).parent != source / "python/tvm" or checked_path(_LIB._name).parent != build:

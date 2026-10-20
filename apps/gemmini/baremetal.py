@@ -247,12 +247,14 @@ def _memory_preflight(plan, memory_limit_bytes):
     for index, (symbol, _, _) in enumerate(plan["calls"]):
         live = [t for t in tensors if t.birth <= index <= t.last_use]
         workspace = [t for t in live if t.origin == "workspace"]
+        private = plan.get("operator_workspaces", {}).get(symbol, {}).get("bytes", 0)
         per_call.append({
             "index": index, "symbol": symbol,
             "live_tensors": [t.name for t in live],
-            "live_tensor_bytes": sum(t.nbytes for t in live),
-            "live_workspace_bytes": sum(t.nbytes for t in workspace),
-            "live_workspace_aligned_bytes": sum(_aligned(t.nbytes) for t in workspace),
+            "live_tensor_bytes": sum(t.nbytes for t in live) + private,
+            "live_workspace_bytes": sum(t.nbytes for t in workspace) + private,
+            "live_workspace_aligned_bytes": sum(_aligned(t.nbytes) for t in workspace) + _aligned(private),
+            "operator_workspace_bytes": private,
         })
     completion = list(dict.fromkeys(plan["outputs"]))
     return {
@@ -271,9 +273,11 @@ def _memory_preflight(plan, memory_limit_bytes):
     }
 
 
-def preflight_graph(mod, *, memory_limit_bytes=1 << 30):
-    """Check tensor-only capacity and report static liveness without code generation."""
-    return _memory_preflight(plan_graph(mod), memory_limit_bytes)
+def preflight_graph(mod, *, memory_limit_bytes=1 << 30, target=RV64_TARGET):
+    """Plan graph/operator storage and check capacity without machine-code emission."""
+    plan = plan_graph(mod)
+    _plan_operator_workspaces(plan, target)
+    return _memory_preflight(plan, memory_limit_bytes)
 
 
 def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 << 30):
@@ -285,7 +289,78 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     Emitted TVM runtime workspace allocation/free dependencies are rejected;
     this static exporter provides no guest allocator or callback initialization.
     """
-    return _export_plan(mod, plan_graph(mod), output_dir, target, memory_limit_bytes)
+    plan = plan_graph(mod)
+    _plan_operator_workspaces(plan, target)
+    return _export_plan(mod, plan, output_dir, target, memory_limit_bytes)
+
+
+def _plan_operator_workspaces(plan, target):
+    """Use TVM USMP for static private allocations requiring runtime workspace.
+
+    This is a deployment ABI transform after graph scheduling. The original
+    call_tir buffer ABI is checked by plan_graph first. Only a planner-created,
+    typed UINT8 pool parameter may be added; arbitrary hidden ABIs stay refused.
+    Serial synchronous graph calls share one pool after the graph tensor region.
+    """
+    from tvm.tir.usmp import analysis, transform, utils  # pylint: disable=import-outside-toplevel
+
+    target = tvm.target.Target(target)
+    workspaces = {}
+    for gv, function in list(plan["functions"].items()):
+        symbol = gv.name_hint
+        lowered = tvm.lower(function)["main"]
+        allocations = []
+        tir.stmt_functor.post_order_visit(lowered.body, lambda node: allocations.append(node)
+                                        if isinstance(node, tir.Allocate) else None)
+        # LowerTVMBuiltin keeps CPU global allocations strictly below 1024 bytes
+        # on the stack. The remaining static allocations need an explicit pool.
+        sizes = []
+        for allocation in allocations:
+            if not all(isinstance(extent, tir.IntImm) and int(extent) > 0 for extent in allocation.extents):
+                raise ValueError("Static export refuses dynamically sized private workspace")
+            dtype = tvm.DataType(allocation.dtype)
+            sizes.append(math.prod(int(extent) for extent in allocation.extents) *
+                         max(1, (dtype.bits * dtype.lanes + 7) // 8))
+        if not sizes or max(sizes) < 1024:
+            continue
+        pool = tvm.WorkspacePoolInfo("operator_workspace", [target])
+
+        def annotate(node):
+            if isinstance(node, tir.Allocate):
+                return tir.Allocate(node.buffer_var, node.dtype, node.extents, node.condition,
+                                    node.body, {**node.annotations, utils.CANDIDATE_MEMORY_POOL_ATTR: [pool]})
+            return None
+
+        lowered = lowered.with_body(tir.stmt_functor.ir_transform(lowered.body, None, annotate))
+        lowered = lowered.with_attr("target", target).with_attr("global_symbol", "__tvm_main__")
+        module = tvm.IRModule({"__tvm_main__": lowered})
+        info = analysis.extract_buffer_info(lowered, module)
+        buffers = tvm.get_global_func("tir.usmp.CreateArrayBufferInfo")(info.buffer_info_stmts)
+        placements = tvm.get_global_func("tir.usmp.algo.greedy_by_size")(buffers, info.memory_pressure)
+        statements = tvm.get_global_func("tir.usmp.AssignStmtPoolAllocations")(info.buffer_info_stmts, placements)
+        planned = transform.convert_pool_allocations_to_offsets(statements, emit_tvmscript_printable=True)(module)["__tvm_main__"]
+        if len(planned.params) != len(function.params) + 1:
+            raise ValueError("USMP produced an unsupported multi-pool operator ABI")
+        buffer = planned.buffer_map[planned.params[-1]]
+        if buffer.dtype != "uint8" or len(buffer.shape) != 1 or not isinstance(buffer.shape[0], tir.IntImm):
+            raise ValueError("USMP did not produce a bounded UINT8 workspace parameter")
+        remaining = []
+        tir.stmt_functor.post_order_visit(planned.body, lambda node: remaining.append(node)
+                                        if isinstance(node, tir.Allocate) else None)
+        if remaining:
+            raise ValueError("USMP left private allocations outside the explicit workspace pool")
+        for key, value in function.attrs.items() if function.attrs else []:
+            if key != "target":
+                planned = planned.with_attr(key, value)
+        planned = planned.with_attr("global_symbol", symbol)
+        plan["functions"][gv] = planned
+        workspaces[symbol] = {"bytes": int(buffer.shape[0]), "algorithm": "TVM USMP greedy_by_size",
+                              "planned_allocations": len(buffers), "memory_pressure": int(info.memory_pressure)}
+    offset = _aligned(plan["workspace_bytes"])
+    size = max((record["bytes"] for record in workspaces.values()), default=0)
+    plan["operator_workspaces"] = workspaces
+    plan["operator_workspace_offset"] = offset
+    plan["workspace_bytes"] = offset + _aligned(size)
 
 
 def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix="", shared_constants=None):
@@ -314,6 +389,8 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
     lines.append(f"const char *{prefix}model_get_last_error(void) {{ return model_last_error; }}")
     for symbol, args, results in plan["calls"]:
         ctypes = [DTYPES[tensor.dtype] + "*" for tensor in [*args, *results]]
+        if symbol in plan.get("operator_workspaces", {}):
+            ctypes.append("uint8_t*")
         declaration = "extern int32_t " + symbol + "(" + ", ".join(ctypes) + ");"
         if declaration not in lines:
             lines.append(declaration)
@@ -340,6 +417,8 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
                 lines.append(f"  if (model_overlap({pointer}, {size}, {other}, {other_size})) return -2;")
     for symbol, args, results in plan["calls"]:
         arguments = ["(" + DTYPES[tensor.dtype] + "*)" + address(tensor) for tensor in [*args, *results]]
+        if symbol in plan.get("operator_workspaces", {}):
+            arguments.append(f"(workspace + {plan['operator_workspace_offset']})")
         lines.append(f"  if ({symbol}({', '.join(arguments)})) return -3;")
     for index, tensor in enumerate(plan["outputs"]):
         if tensor.origin != "output" or tensor.offset != index:
@@ -363,8 +442,10 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         "entrypoint": prefix + "model_run", "constants_file": str(constant_path),
         "target": str(target), "alignment_bytes": ALIGNMENT, "heap_required_by_orchestration": False, "runtime_workspace_allocator_required": False,
         "workspace_bytes": plan["workspace_bytes"], "constants_bytes": plan["constants_bytes"], "explicit_tensor_bytes": tensors_bytes,
-        "memory_limit_bytes": memory_limit_bytes, "memory_scope": "tensor storage only; add ELF sections, operator stack/workspace, startup and platform reservations",
+        "memory_limit_bytes": memory_limit_bytes, "memory_scope": "graph tensor storage and explicit USMP operator pools; add ELF sections, operator stack, startup and platform reservations",
         "memory_preflight": preflight,
+        "operator_workspaces": plan.get("operator_workspaces", {}),
+        "operator_workspace_offset": plan.get("operator_workspace_offset", 0),
         "inputs": [tensor.metadata() for tensor in plan["inputs"]], "outputs": [tensor.metadata() for tensor in plan["outputs"]],
         "constants": [tensor.metadata() for tensor in plan["constants"]], "intermediates": [tensor.metadata() for tensor in plan["tensors"]],
         "calls": [{"symbol": name, "inputs": [t.name for t in args], "outputs": [t.name for t in results]} for name, args, results in plan["calls"]],
@@ -411,6 +492,7 @@ def export_graphs(modules, output_dir, *, target=RV64_TARGET, memory_limit_bytes
     for index, (name, mod) in enumerate(modules.items()):
         renamed = mod.replace_global_vars({gv: f"stage_{index}_operator_" + gv.name_hint for gv in mod.get_global_vars() if isinstance(mod[gv], tir.PrimFunc)})
         plan = plan_graph(renamed)
+        _plan_operator_workspaces(plan, target)
         duplicated += plan["constants_bytes"]
         for tensor in plan["constants"]:
             key = (tensor.dtype, tensor.shape, hashlib.sha256(tensor.value.tobytes()).hexdigest())

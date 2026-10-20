@@ -15,11 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Opt-in Relax matmul lowering to the proposed Gemmini external C ABI.
+"""Gemmini graph preparation and preserved legacy external-call lowering.
 
-This pass establishes a compiler boundary, not accelerator execution. Supply and
-link an implementation of apps/gemmini/matmul.h when exporting the executable.
-Run before LegalizeOps. Unsupported calls remain ordinary Relax operations.
+The default graph entry point retains ordinary mathematical legalization and
+fusion before TensorIR scheduling. Legacy Relax replacement passes run before
+LegalizeOps and remain available explicitly. Link apps/gemmini/matmul.h's
+primitive implementation when exporting accelerator code. Unsupported calls
+retain CPU lowering.
 """
 
 from math import prod
@@ -211,7 +213,7 @@ class LowerGemminiScheduledMatmul:
         return lowerer.builder_.get()
 
 
-def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None):
+def prepare_gemmini_graph_legacy(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None):
     """Prepare a semantic Relax graph while keeping device calls opaque.
 
     Eligible integer convolutions first become explicit CPU packing/restoration
@@ -256,6 +258,31 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
     if optimize:
         mod = tvm.transform.Sequential([relax.transform.AnnotateTIROpPattern(), relax.transform.FuseOps(fuse_opt_level=2), relax.transform.FuseTIR()])(mod)
     return _inline_cpu_producers(mod)
+
+
+def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None,
+                          *, route="tensorir", capabilities=None, order="ij", schedule_options=None,
+                          report=None):
+    """Prepare Gemmini through mathematical TensorIR; retain explicit legacy mode.
+
+    The default route legalizes/fuses ordinary computations before structural
+    scheduling. Legacy template tile parameters are accepted only with the
+    explicitly selected regression route, never silently ignored.
+    """
+    if route == "legacy":
+        if schedule_options:
+            raise ValueError("TensorIR schedule options require route='tensorir'")
+        return prepare_gemmini_graph_legacy(mod, tile_i, tile_j, optimize, tile_choices)
+    if route != "tensorir":
+        raise ValueError("Gemmini route must be tensorir or legacy")
+    if (tile_i, tile_j) != (1, 1) or tile_choices:
+        raise ValueError("Legacy macro tile parameters require route='legacy'; use TensorIR schedule rules")
+    if type(optimize) is not bool:
+        raise ValueError("optimize must be a boolean")
+    from .gemmini_tensorir import prepare_gemmini_tensorir_graph  # pylint: disable=import-outside-toplevel
+
+    return prepare_gemmini_tensorir_graph(mod, optimize=optimize, capabilities=capabilities,
+                                         order=order, schedule_options=schedule_options, report=report)
 
 
 def _inline_cpu_producers(mod):

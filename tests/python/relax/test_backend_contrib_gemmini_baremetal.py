@@ -215,7 +215,7 @@ class StaticGraphTests(unittest.TestCase):
 
     def test_bfloat16_fusion_preserves_intermediate_store_rounding(self):
         import ml_dtypes
-        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
 
         values = np.array([1, 1.0078125, -1, -1.0078125], dtype=ml_dtypes.bfloat16)
         delta = np.full((4,), 2. ** -8, dtype=ml_dtypes.bfloat16)
@@ -257,7 +257,7 @@ class StaticGraphTests(unittest.TestCase):
                         np.testing.assert_array_equal(value.view("uint16"), saved)
 
     def test_fp32_pointwise_inline_keeps_declared_precision(self):
-        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
 
         params = [relax.Var(name, relax.TensorStructInfo((4,), "float32")) for name in ("x", "delta", "factor")]
         builder = relax.BlockBuilder()
@@ -324,18 +324,27 @@ class StaticGraphTests(unittest.TestCase):
         np.testing.assert_array_equal(outputs[0], expected)
         self.assertLess(len(report["calls"]), 4)
 
-    def test_large_unscheduled_fused_buffer_requires_rejected_runtime_allocator(self):
-        # Large internal buffers lower to indirect runtime callbacks; never load
-        # or execute this object without the TVM runtime initializing them.
+    def test_large_fused_buffers_use_usmp_with_explicit_guarded_workspace(self):
         optimized = relax.get_pipeline("zero")(graph(dtype="float32", shape=(128, 3)))
-        with self.assertRaisesRegex(ValueError, "runtime workspace allocator"):
-            export_graph(optimized, self.root, target="llvm")
-        self.assertIn("@__TVMBackendAllocWorkspace", (self.root / "operators.ll").read_text())
-        self.assertFalse((self.root / "operators.o").exists())
-        self.assertFalse((self.root / "graph.json").exists())
+        report, loaded, inputs, outputs, workspace = self.compile(optimized)
+        self.assertTrue(report["operator_workspaces"])
+        preflight = preflight_graph(optimized, target="llvm")
+        self.assertEqual(preflight["allocated"], report["memory_preflight"]["allocated"])
+        self.assertGreater(preflight["peak_live_workspace_bytes"], 0)
+        self.assertGreaterEqual(report["workspace_bytes"], 128 * 4 * 4)
+        llvm = (self.root / "operators.ll").read_text()
+        self.assertNotIn("TVMBackendAllocWorkspace", llvm)
+        self.assertNotIn("TVMBackendFreeWorkspace", llvm)
+        inputs[0][:] = np.arange(128 * 3, dtype="float32").reshape(128, 3) - 13
+        outputs[0].fill(17)
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace, size=workspace.nbytes-1), -1)
+        self.assertTrue(np.all(outputs[0] == 17))
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        expected = (inputs[0] @ (np.arange(12, dtype="float32").reshape(3, 4) - 5) + 3) * 2 - 1
+        np.testing.assert_array_equal(outputs[0], expected)
 
     def test_baseline_maxpool_padding_does_not_require_a_guest_heap(self):
-        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
         value = relax.Var("x", relax.TensorStructInfo((1, 1, 64, 64), "int8"))
         builder = relax.BlockBuilder()
         with builder.function("main", [value]):
@@ -354,6 +363,28 @@ class StaticGraphTests(unittest.TestCase):
             expected = np.lib.stride_tricks.sliding_window_view(padded, (3, 3), axis=(2, 3))[:, :, ::2, ::2].max(axis=(-1, -2))
             np.testing.assert_array_equal(outputs[0], expected)
             np.testing.assert_array_equal(inputs[0], image)
+
+    def test_boolean_private_buffers_use_byte_sized_usmp_storage(self):
+        from tvm import te
+        source = te.placeholder((1024,), "int32", "source")
+        mask = te.compute((1024,), lambda i: source[i] > 0, name="mask")
+        axis = te.reduce_axis((0, 1024), "r")
+        count = te.compute((1,), lambda _: te.sum(mask[axis].astype("int32"), axis=axis), name="count")
+        function = te.create_prim_func([source, count])
+        value = relax.Var("x", relax.TensorStructInfo((1024,), "int32"))
+        builder = relax.BlockBuilder()
+        gv = builder.add_func(function, "count")
+        with builder.function("main", [value]):
+            with builder.dataflow():
+                output = builder.emit_output(relax.call_tir(gv, (value,), relax.TensorStructInfo((1,), "int32")))
+            builder.emit_func_output(output)
+        report, loaded, inputs, outputs, workspace = self.compile(builder.get())
+        self.assertGreaterEqual(report["workspace_bytes"], 1024)
+        self.assertTrue(report["operator_workspaces"])
+        inputs[0][:] = np.arange(1024, dtype="int32") - 500
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        np.testing.assert_array_equal(outputs[0], [523])
+        self.assertNotIn("TVMBackendAllocWorkspace", (self.root / "operators.ll").read_text())
 
     def test_unused_multi_output_sibling_cannot_alias_live_result(self):
         report, loaded, inputs, outputs, workspace = self.compile(custom_graph(multi_output=True))

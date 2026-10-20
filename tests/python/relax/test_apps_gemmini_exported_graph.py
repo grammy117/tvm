@@ -258,7 +258,7 @@ class SequenceAdmission(unittest.TestCase):
 
     def test_real_exported_sequence_with_independent_frozen_fixture(self):
         from tvm import relax
-        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+        from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
         from baremetal import export_graphs
         with tempfile.TemporaryDirectory() as directory:
             selected = os.environ.get("TVM_EXPORTED_SEQUENCE_FIXTURE")

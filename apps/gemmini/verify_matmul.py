@@ -40,6 +40,8 @@ OPERATOR_SHA256 = "18801f4eab0cd2e81e25a6c2aa97c7ed644b693e8d2c24cdeb41ab3a72083
 PUBLIC_SYMBOLS = (
     "tvm_gemmini_matmul_i8_i32", "tvm_gemmini_validate_matmul_i8_i32", "tvm_gemmini_begin",
     "tvm_gemmini_load_a", "tvm_gemmini_load_b", "tvm_gemmini_compute", "tvm_gemmini_store", "tvm_gemmini_end",
+    "tvm_gemmini_zero_acc", "tvm_gemmini_dma_a", "tvm_gemmini_dma_b", "tvm_gemmini_dma_out",
+    "tvm_gemmini_validate_tensor_buffers",
 )
 
 

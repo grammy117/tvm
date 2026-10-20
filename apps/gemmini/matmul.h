@@ -42,8 +42,10 @@ int32_t tvm_gemmini_validate_matmul_i8_i32(const int8_t* a, const int8_t* b, int
  * caller owns the accelerator exclusively from begin through end. TVM owns all
  * tile loops, pointer offsets, local allocation, reuse, and reduction ordering.
  * Begin uses the validated strides; every DMA pointer is a proven subview of
- * the validated A/B/C envelopes. Strides count elements. Local addresses are plain DIM-aligned row indices;
- * reserve 16 rows per tile within 16384 scratchpad / 1024 accumulator rows.
+ * the validated A/B/C envelopes. Strides count elements. Local addresses count
+ * DIM-element rows within 16384 scratchpad / 1024 accumulator rows. Rows of each
+ * tile are consecutive. The legacy generator reserves 16-row slots; TensorIR
+ * may pack shorter tiles at other integral row addresses.
  * A/B tile slots are disjoint. Every tile dimension is in [1,16], and accumulate
  * is exactly 0 (overwrite) or 1 (add to initialized int32 accumulator SRAM).
  * Each compute starts a fresh <=16-product PE reduction; global K <=131071.
@@ -57,6 +59,15 @@ void tvm_gemmini_load_b(const int8_t* src, uint32_t spadrow, uint32_t rows, uint
 void tvm_gemmini_compute(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate);
 void tvm_gemmini_store(int32_t* dst, uint32_t crow, uint32_t rows, uint32_t cols);
 void tvm_gemmini_end(void);
+
+/* TensorIR memory-scope lowering. Strides count host elements. A nonzero wait
+ * protects CPU-private staging buffers whose next use can precede end(). */
+void tvm_gemmini_zero_acc(uint32_t row, uint32_t rows, uint32_t cols);
+void tvm_gemmini_dma_a(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+void tvm_gemmini_dma_b(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+int32_t tvm_gemmini_validate_tensor_buffers(const void* a, int64_t a_bytes, const void* b, int64_t b_bytes,
+                                          void* c, int64_t c_bytes);
 
 #ifdef __cplusplus
 }

@@ -26,7 +26,7 @@ import unittest
 import numpy as np
 import tvm
 from tvm import relax, tir
-from tvm.relax.backend.contrib.gemmini import DecomposeGemminiLinear, LowerGemminiMatmul, LowerGemminiScheduledMatmul, prepare_gemmini_graph
+from tvm.relax.backend.contrib.gemmini import DecomposeGemminiLinear, LowerGemminiMatmul, LowerGemminiScheduledMatmul, prepare_gemmini_graph_legacy as prepare_gemmini_graph
 from tvm.relax.backend.contrib.gemmini_schedule import make_gemmini_matmul, make_semantic_matmul, tensorize_gemmini_matmul
 
 # This emulator interprets row-addressed primitive calls independently of TVM

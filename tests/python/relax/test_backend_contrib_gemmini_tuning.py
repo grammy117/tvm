@@ -133,7 +133,7 @@ def test_actual_xgb_update_and_reproducible_ranking(monkeypatch):
     # This structural check does not turn toy labels into qualified timings.
     import tvm
     from tvm import relax, tir
-    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
 
     proposal = ranked[0]
     selected = search.schedule_for(proposal.candidate.candidate_id)
@@ -335,7 +335,7 @@ def test_model_search_budget_identity_ingestion_and_atomic_failure():
 def test_model_proposals_apply_per_shape_without_changing_semantics():
     import tvm
     from tvm import relax, tir
-    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph_legacy as prepare_gemmini_graph
     from tvm.relax.backend.contrib.gemmini_tuning import GemminiModelSearch, collect_gemmini_workloads
     a = relax.Var("a", relax.TensorStructInfo((3, 7), "int8"))
     b = relax.Var("b", relax.TensorStructInfo((1, 7), "int8"))
