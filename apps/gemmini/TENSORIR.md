@@ -51,8 +51,15 @@ replace VM lowering or change the default pipeline for other targets.
 This remains a TVM v0.19 fork rather than an unmodified upstream baseline. The
 base commit already contains ONNX fidelity changes, FP/BF16 storage and strict
 arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy`
-guard described in README.md. The migration adds no C++ core patch. The guard
-rejects unsupported automatic-copy annotations and is not a DMA optimization.
+guard described in README.md. That guard rejects unsupported automatic-copy
+annotations and is not a DMA optimization.
+
+The migration fixes one generic C++ scheduler
+issue in `decompose_reduction`: initialization reads were omitted and retained
+on the update block instead. Separate read-region analysis preserves an
+input-dependent initialization and lets subsequent cache placement see its
+producer. The regression tests cover read dependencies, cache placement, trace
+replay and CPU execution, independently of Gemmini.
 The handwritten static deployment packaging is retained, with standard USMP
 used for operator pools; this is not a claim of stock microTVM/AOT deployment.
 

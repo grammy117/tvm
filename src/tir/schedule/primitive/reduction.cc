@@ -21,6 +21,18 @@
 namespace tvm {
 namespace tir {
 
+/*! \brief Collect the external buffers needed to analyze a decomposed reduction. */
+static Map<Var, Buffer> ReductionBufferMap(const BlockNode* block) {
+  Map<Var, Buffer> buffers;
+  for (const BufferRegion& region : block->reads) {
+    buffers.Set(region->buffer->data, region->buffer);
+  }
+  for (const BufferRegion& region : block->writes) {
+    buffers.Set(region->buffer->data, region->buffer);
+  }
+  return buffers;
+}
+
 /*!
  * \brief A helper class to create a new scope that contains decomposed init body
  * and replaced old reduction block.
@@ -64,21 +76,29 @@ class DecomposeReductionBlockReplacer : public StmtMutator {
       ObjectPtr<BlockNode> p_new_block = CopyOnWrite(block);
       p_new_block->name_hint = p_new_block->name_hint + "_update";
       p_new_block->init = NullOpt;
-      // Add write regions back to read regions in update block.
-      Array<BufferRegion> new_reads;
-      std::unordered_set<const BufferNode*> read_bufs;
-      for (const BufferRegion& read_access : block->reads) {
-        read_bufs.insert(read_access->buffer.get());
+      // The update reads its accumulator, but not buffers used only by init.
+      // Inspect its body instead of retaining the combined reduction reads.
+      Array<BufferRegion> detected =
+          GetBlockReadWriteRegion(Block(p_new_block), ReductionBufferMap(block))[0];
+      // Retain the existing access order, because later schedule instructions
+      // can select a read buffer by index rather than by name.
+      Array<BufferRegion> ordered;
+      std::unordered_set<const BufferNode*> original_reads, emitted;
+      for (const BufferRegion& region : block->reads) {
+        original_reads.insert(region->buffer.get());
       }
-      for (const BufferRegion& write_access : block->writes) {
-        if (read_bufs.find(write_access->buffer.get()) == read_bufs.end()) {
-          new_reads.push_back(write_access);
+      auto append = [&](const BufferRegion& access) {
+        for (const BufferRegion& region : detected) {
+          if (region->buffer.same_as(access->buffer) && emitted.insert(region->buffer.get()).second) {
+            ordered.push_back(region);
+          }
         }
+      };
+      for (const BufferRegion& region : block->writes) {
+        if (!original_reads.count(region->buffer.get())) append(region);
       }
-      for (const BufferRegion& read_access : block->reads) {
-        new_reads.push_back(read_access);
-      }
-      p_new_block->reads = new_reads;
+      for (const BufferRegion& region : block->reads) append(region);
+      p_new_block->reads = ordered;
       new_reduction_block_ = Block(p_new_block);
       return new_reduction_block_;
     } else {
@@ -236,6 +256,10 @@ StmtSRef DecomposeReduction(ScheduleState self, const StmtSRef& block_sref,
     init_block->writes.push_back(
         BufferRegion(write->buffer, Substitute(write->region, block_var_map)));
   }
+  // Initialization may read an input buffer (for example, a bias). These
+  // dependencies must remain visible to subsequent scheduling primitives.
+  init_block->reads =
+      GetBlockReadWriteRegion(Block(init_block), ReductionBufferMap(block))[0];
   // Step 3. Scan loops not higher than the specified loop above the reduction block.
   //         If the loop is used in the init block binding, then it is chosen.
   //         Otherwise, it is discarded.

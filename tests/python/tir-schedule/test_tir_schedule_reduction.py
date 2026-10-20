@@ -15,8 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 # pylint: disable=missing-function-docstring,missing-module-docstring
-import sys
-
+import numpy as np
 import pytest
 import tvm
 import tvm.testing
@@ -351,6 +350,56 @@ def test_decompose_reduction_nested_block():
 
     assert_structural_equal_ignore_global_symbol(decomposed_nested_block, sch.mod["main"])
     verify_trace_roundtrip(sch, mod=nested_block)
+
+
+@T.prim_func
+def reduction_with_input_init(
+    A: T.Buffer((3, 5), "int32"),
+    Bias: T.Buffer((3,), "int32"),
+    C: T.Buffer((3,), "int32"),
+):
+    T.func_attr({"tir.noalias": True})
+    Seed = T.alloc_buffer((3,), "int32")
+    for i in range(3):
+        with T.block("seed"):
+            vi = T.axis.spatial(3, i)
+            Seed[vi] = Bias[vi] + 1
+    for i, k in T.grid(3, 5):
+        with T.block("sum"):
+            vi, vk = T.axis.remap("SR", [i, k])
+            with T.init():
+                C[vi] = Seed[vi]
+            C[vi] = C[vi] + A[vi, vk]
+
+
+@pytest.mark.parametrize("loop_index", [0, 1])
+def test_decompose_reduction_input_init_reads(loop_index):
+    sch = tir.Schedule(reduction_with_input_init, debug_mask="all")
+    block = sch.get_block("sum")
+    init = sch.decompose_reduction(block, sch.get_loops(block)[loop_index])
+    assert [region.buffer.name for region in sch.get(init).reads] == ["Seed"]
+    assert [region.buffer.name for region in sch.get(block).reads] == ["C", "A"]
+    assert [sch.get(producer).name_hint for producer in sch.get_producers(init)] == ["seed"]
+    assert "seed" not in [sch.get(producer).name_hint for producer in sch.get_producers(block)]
+    # A subsequent scheduling operation must see the initialization dependency.
+    sch.cache_read(init, 0, "local")
+    verify_trace_roundtrip(sch, mod=reduction_with_input_init)
+
+
+@tvm.testing.requires_llvm
+@pytest.mark.parametrize("loop_index", [0, 1])
+def test_decompose_reduction_input_init_execution(loop_index):
+    sch = tir.Schedule(reduction_with_input_init, debug_mask="all")
+    block = sch.get_block("sum")
+    init = sch.decompose_reduction(block, sch.get_loops(block)[loop_index])
+    sch.cache_read(init, 0, "local")
+    sch.compute_inline(sch.get_block("seed"))
+    executable = tvm.build(sch.mod, target="llvm")
+    values = np.arange(-7, 8, dtype="int32").reshape(3, 5)
+    bias = np.array([19, -23, 101], dtype="int32")
+    output = tvm.nd.empty((3,), "int32")
+    executable(tvm.nd.array(values), tvm.nd.array(bias), output)
+    np.testing.assert_array_equal(output.numpy(), bias + 1 + values.sum(axis=1))
 
 
 class TestDecomposeReductionWithThreadBinding(tvm.testing.CompareBeforeAfter):
