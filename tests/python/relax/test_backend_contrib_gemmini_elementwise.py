@@ -17,6 +17,7 @@
 """Native DMA arithmetic/movement against independent bit-exact references."""
 
 import unittest
+import ctypes
 
 import numpy as np
 import tvm
@@ -230,6 +231,125 @@ class GemminiElementwiseTests(unittest.TestCase):
                         self.assertEqual(check.emulator_faults(), 0)
                         legal += 1
                 self.assertGreaterEqual(legal, 1)
+
+    def test_scalar_fill_and_add_preserve_dtype_broadcast_and_wrap_contracts(self):
+        for shape in ((1,), (7,), (3, 4), (17, 19), (2, 3, 4)):
+            for source_dtype, output_dtype in (
+                ("int8", "int8"),
+                ("int32", "int32"),
+                ("int8", "int32"),
+            ):
+                a = te.placeholder((), source_dtype, "scalar")
+                c = te.compute(shape, lambda *i: a[()].astype(output_dtype), name="fill")
+                func = te.create_prim_func([a, c])
+                scheduled = make_elementwise_schedule(func)
+                runtime, control = self.build(scheduled.scheduled_mod)
+                scalar = np.array(-128 if source_dtype == "int8" else -2147483648, source_dtype)
+                output = tvm.nd.empty(shape, output_dtype)
+                runtime(tvm.nd.array(scalar), output)
+                np.testing.assert_array_equal(
+                    output.numpy(), np.full(shape, int(scalar), output_dtype)
+                )
+                self.assertEqual(control.emulator_faults(), 0)
+                self.assertEqual(control.emulator_pending(), 0)
+            for wrapping in (False, True):
+                for scalar_left in (False, True):
+                    x = te.placeholder(shape, "int32", "x")
+                    a = te.placeholder((), "int32", "scalar")
+
+                    def value(*indices):
+                        left, right = (a[()], x[indices]) if scalar_left else (x[indices], a[()])
+                        return (
+                            (left.astype("int64") + right.astype("int64")).astype("int32")
+                            if wrapping
+                            else left + right
+                        )
+
+                    c = te.compute(shape, value, name="add_scalar")
+                    result = make_elementwise_schedule(te.create_prim_func([x, a, c]))
+                    runtime, control = self.build(result.scheduled_mod)
+                    av = np.array(1 if wrapping else 7, "int32")
+                    xv = (
+                        np.full(shape, 2147483647, "int32")
+                        if wrapping
+                        else np.arange(np.prod(shape), dtype="int32").reshape(shape) - 10
+                    )
+                    output = tvm.nd.empty(shape, "int32")
+                    runtime(tvm.nd.array(xv), tvm.nd.array(av), output)
+                    np.testing.assert_array_equal(
+                        output.numpy(), (xv.astype("int64") + int(av)).astype("int32")
+                    )
+                    self.assertEqual(control.emulator_faults(), 0)
+                    self.assertEqual(control.emulator_pending(), 0)
+
+    def test_registered_pipeline_preserves_graph_and_executes_dynamic_full(self):
+        from tvm import meta_schedule as ms
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator
+        from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
+
+        scalar = relax.Var("scalar", relax.TensorStructInfo((), "int32"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [scalar]):
+            with builder.dataflow():
+                output = builder.emit_output(relax.op.full((3, 4), scalar, "int32"))
+            builder.emit_func_output(output)
+        graph = builder.get()
+        report = []
+        actual = relax.get_pipeline("gemmini", report=report)(graph)
+        expected = prepare_gemmini_graph(graph)
+        tvm.ir.assert_structural_equal(actual, expected)
+        self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 1, report)
+        executable = relax.build(graph, "llvm", pipeline="gemmini_build")
+        path = self.root / "registered-pipeline.so"
+        executable.export_library(
+            str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11"]
+        )
+        control = ctypes.CDLL(str(path))
+        control.emulator_reset()
+        vm = relax.VirtualMachine(tvm.runtime.load_module(str(path)), tvm.cpu())
+        result = vm["main"](tvm.nd.array(np.array(-2147483648, "int32")))
+        np.testing.assert_array_equal(result.numpy(), np.full((3, 4), -2147483648, "int32"))
+        self.assertEqual(control.emulator_faults(), 0)
+        legalized = relax.transform.LegalizeOps()(graph)
+        func = next(
+            f for f in legalized.functions.values() if isinstance(f, tir.PrimFunc)
+        ).with_attr("global_symbol", "main")
+        context = ms.TuneContext(
+            mod=func,
+            target=GemminiCapabilities().target(),
+            space_generator=gemmini_space_generator(),
+            num_threads=1,
+        )
+        for design in context.generate_design_space():
+            design.enter_postproc()
+            self.assertTrue(all(p.apply(design) for p in context.space_generator.postprocs))
+            lowered = lower_tensorir_schedule(
+                func, design, workload_metadata={"operation": "fill_i32"}
+            )
+            native, check = self.build(lowered.scheduled_mod)
+            output = tvm.nd.empty((3, 4), "int32")
+            native(tvm.nd.array(np.array(-2147483648, "int32")), output)
+            np.testing.assert_array_equal(output.numpy(), np.full((3, 4), -2147483648, "int32"))
+            self.assertEqual(check.emulator_faults(), 0)
+
+    def test_hidden_primitive_scalar_abi_preserves_cpu_fallback(self):
+        from tvm.relax.backend.contrib.gemmini_tensorir import ScheduleGemminiTensorIR
+
+        original = workload((3, 4), "copy_i32")
+        parameter = tir.Var("unused_scalar", "int32")
+        function = tir.PrimFunc(
+            [*original.params, parameter],
+            original.body,
+            buffer_map=original.buffer_map,
+            attrs=original.attrs,
+        )
+        with self.assertRaisesRegex(ValueError, "buffer parameters"):
+            make_elementwise_schedule(function)
+        report = []
+        result = ScheduleGemminiTensorIR(report=report)(tvm.IRModule({"main": function}))
+        tvm.ir.assert_structural_equal(result["main"], function)
+        self.assertEqual(report[0]["placement"], "cpu")
+        self.assertIn("buffer parameters", report[0]["reason"])
 
 
 if __name__ == "__main__":

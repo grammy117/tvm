@@ -432,6 +432,8 @@ def lower_tensorir_schedule(
     from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
 
     capabilities = capabilities or GemminiCapabilities()
+    if any(param not in func.buffer_map for param in func.params):
+        raise ValueError("Gemmini runtime ABI requires buffer parameters")
     mathematical = mathematical if mathematical is not None else tvm.IRModule({"main": func})
     mod, resources = lower_memory(
         sch.mod, spad_rows=capabilities.spad_rows, acc_rows=capabilities.acc_rows

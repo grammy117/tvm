@@ -207,6 +207,42 @@ def fixtures():
             builder.emit_func_output(output)
         expected = a.T if kind == "permute" else np.tile(a, (2, 2))
         result.append((kind, builder.get(), [a], expected))
+    for kind in ("fill_i8", "fill_i32", "fill_widen", "add_scalar"):
+        source_dtype = "int8" if kind in ("fill_i8", "fill_widen") else "int32"
+        scalar = np.array(
+            1 if kind == "add_scalar" else -128 if source_dtype == "int8" else -2147483648,
+            source_dtype,
+        )
+        sv = relax.Var("scalar", relax.TensorStructInfo((), source_dtype))
+        parameters, arrays = [sv], [scalar]
+        builder = relax.BlockBuilder()
+        if kind == "add_scalar":
+            x = np.resize(np.array([2147483647, -2147483648, -1, 0, 17, 1234], "int32"), (3, 4))
+            xv = relax.Var("x", relax.TensorStructInfo(x.shape, "int32"))
+            parameters, arrays = [xv, sv], [x, scalar]
+            a = te.placeholder(x.shape, "int32", "x")
+            b = te.placeholder((), "int32", "scalar")
+            c = te.compute(
+                x.shape,
+                lambda *i: (a[i].astype("int64") + b[()].astype("int64")).astype("int32"),
+                name="scalar_sum",
+            )
+            gv = builder.add_func(te.create_prim_func([a, b, c]), "scalar_add")
+        with builder.function("main", parameters):
+            with builder.dataflow():
+                value = (
+                    relax.call_tir(gv, (xv, sv), relax.TensorStructInfo(x.shape, "int32"))
+                    if kind == "add_scalar"
+                    else relax.op.full((3, 4), sv, "int32" if kind != "fill_i8" else "int8")
+                )
+                output = builder.emit_output(value)
+            builder.emit_func_output(output)
+        expected = (
+            (x.astype("int64") + int(scalar)).astype("int32")
+            if kind == "add_scalar"
+            else np.full((3, 4), int(scalar), "int8" if kind == "fill_i8" else "int32")
+        )
+        result.append((kind, builder.get(), arrays, expected))
     return result
 
 
@@ -284,7 +320,7 @@ def prepare(args):
             if operation
             else f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
         )
-        if operation in ("add_i32", "add_i32_wrapping"):
+        if operation is not None and operation.startswith("add_i32"):
             primitive_check += f"if(accumulates==add_before_{index})return 21;"
         checks.extend(
             [
@@ -541,6 +577,10 @@ def main():
             "widen",
             "permute",
             "repeat",
+            "fill_i8",
+            "fill_i32",
+            "fill_widen",
+            "add_scalar",
         ],
     )
     execute = sub.add_parser("run")

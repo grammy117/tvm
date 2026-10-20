@@ -29,6 +29,69 @@ from tvm import tir
 from .gemmini_intrin import ACC, SPAD
 
 
+@tir.transform.prim_func_pass(opt_level=0)
+def _normalize_scalar_match_offsets(func, _mod, _ctx):
+    """Use v0.19's INT32 zero offset for scalar intrinsic pointer bindings.
+
+    Buffer.ElemOffset([]) returns INT32 zero even in an INT64-indexed graph.
+    Tensorize can promote a scalar match-buffer offset to INT64 instead. Bind
+    an INT32 offset and cast its pointer use, preserving both ABI and address.
+    This bridge only accepts zero-offset scalar sources and pointer-only uses.
+    """
+
+    def rewrite(node):
+        if not isinstance(node, tir.Block):
+            return None
+        matches, substitutions, scalar_data = [], {}, set()
+        for match in node.match_buffers:
+            source, target = match.source.buffer, match.buffer
+            if not source.shape and not target.shape and target.elem_offset.dtype != "int32":
+                if not isinstance(source.elem_offset, tir.IntImm) or int(source.elem_offset) != 0:
+                    raise ValueError("Scalar intrinsic source must have zero element offset")
+                offset = tir.Var("scalar_elem_offset", "int32")
+                if not isinstance(target.elem_offset, tir.Var):
+                    raise ValueError("Scalar intrinsic offset must be a bindable variable")
+                substitutions[target.elem_offset] = tir.Cast(target.elem_offset.dtype, offset)
+                scalar_data.add(target.data)
+                view = tir.decl_buffer(
+                    (),
+                    target.dtype,
+                    name=target.name,
+                    data=target.data,
+                    elem_offset=offset,
+                    scope=target.scope(),
+                    data_alignment=target.data_alignment,
+                    offset_factor=target.offset_factor,
+                )
+                match = tir.MatchBufferRegion(view, match.source)
+            matches.append(match)
+        if substitutions:
+
+            def check_pointer_use(expr):
+                if (
+                    isinstance(expr, (tir.BufferLoad, tir.BufferStore))
+                    and expr.buffer.data in scalar_data
+                ):
+                    raise ValueError("Scalar intrinsic view must be used through an access pointer")
+
+            tir.stmt_functor.post_order_visit(node.body, check_pointer_use)
+            body = tir.stmt_functor.substitute(node.body, substitutions)
+            return tir.Block(
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
+                body,
+                node.init,
+                node.alloc_buffers,
+                matches,
+                node.annotations,
+            )
+        return None
+
+    return func.with_body(tir.stmt_functor.ir_transform(func.body, None, rewrite))
+
+
 def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
     """Assign bounded physical rows; reject remaining CPU accesses to SRAM."""
     mod = tvm.transform.Sequential(
@@ -36,6 +99,7 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
             tir.transform.PlanAndUpdateBufferAllocationLocation(),
             tir.transform.ConvertBlocksToOpaque(),
             tir.transform.CompactBufferAllocation(),
+            _normalize_scalar_match_offsets,
             tir.transform.LowerMatchBuffer(),
             tir.transform.Simplify(),
         ]

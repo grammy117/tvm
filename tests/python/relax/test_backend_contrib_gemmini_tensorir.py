@@ -57,7 +57,7 @@ static void flush(void) {
       check(x.c+x.m<=1024);
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { acc[x.c+i][j]=0; initialized[x.c+i][j]=1; }
     } else if(x.op==1) {
-      check(x.a+x.m<=16384 && x.stride>=x.n);
+      check(x.a+x.m<=16384 && (x.stride==0 || x.stride>=x.n));
       const int8_t* p=x.src;
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { sp[x.a+i][j]=p[i*x.stride+j]; loaded[x.a+i][j]=1; }
     } else if(x.op==2) {

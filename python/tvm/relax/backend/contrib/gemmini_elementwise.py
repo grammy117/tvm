@@ -31,6 +31,8 @@ from .gemmini_intrin import ACC, SPAD
 
 
 def _strides(rank):
+    if rank == 0:
+        return None
     return [tir.Var("row_stride", "int64"), tir.IntImm("int64", 1)][-rank:]
 
 
@@ -44,6 +46,14 @@ def _add_reference(left, right, wrapping):
     if wrapping:
         return tir.Cast("int32", tir.Cast("int64", left) + tir.Cast("int64", right))
     return left + right
+
+
+def _read(buffer, indices):
+    return tir.BufferLoad(buffer, list(indices) if len(buffer.shape) else [])
+
+
+def _dma_stride(buffer, factor):
+    return buffer.strides[0] * factor if len(buffer.shape) else tir.IntImm("int64", 0)
 
 
 def _canonical_description(func):
@@ -78,8 +88,19 @@ def _canonical_description(func):
     return func.with_body(tir.stmt_functor.ir_transform(func.body, None, rewrite))
 
 
-def _copy_pair(rows, cols, rank, source_dtype, output_dtype, source_scope, output_scope, symbol):
+def _copy_pair(
+    rows,
+    cols,
+    rank,
+    source_dtype,
+    output_dtype,
+    source_scope,
+    output_scope,
+    symbol,
+    source_scalar=False,
+):
     shape = (cols,) if rank == 1 else (rows, cols)
+    source_shape = () if source_scalar else shape
     factor = cols if rank == 1 else 1
     alignment = (
         {"buffer_dim_align": [[0, rank - 2, 16, 0]]}
@@ -91,40 +112,55 @@ def _copy_pair(rows, cols, rank, source_dtype, output_dtype, source_scope, outpu
         @T.prim_func
         def desc(a: T.handle, b: T.handle):
             A = T.match_buffer(
-                a, shape, source_dtype, scope=source_scope, strides=_strides(rank), offset_factor=1
+                a,
+                source_shape,
+                source_dtype,
+                scope=source_scope,
+                strides=_strides(len(source_shape)),
+                offset_factor=1,
             )
             B = T.match_buffer(
                 b, shape, output_dtype, scope=output_scope, strides=_strides(rank), offset_factor=1
             )
             with T.block("root"):
-                T.reads(A[0:cols])
+                T.reads(_region(A))
                 T.writes(B[0:cols])
                 for j in T.serial(cols):
                     with T.block("copy"):
                         vj = T.axis.spatial(cols, j)
-                        B[vj] = T.Cast(output_dtype, A[vj])
+                        B[vj] = T.Cast(output_dtype, _read(A, (vj,)))
     else:
 
         @T.prim_func
         def desc(a: T.handle, b: T.handle):
             A = T.match_buffer(
-                a, shape, source_dtype, scope=source_scope, strides=_strides(rank), offset_factor=1
+                a,
+                source_shape,
+                source_dtype,
+                scope=source_scope,
+                strides=_strides(len(source_shape)),
+                offset_factor=1,
             )
             B = T.match_buffer(
                 b, shape, output_dtype, scope=output_scope, strides=_strides(rank), offset_factor=1
             )
             with T.block("root"):
-                T.reads(A[0:rows, 0:cols])
+                T.reads(_region(A))
                 T.writes(B[0:rows, 0:cols])
                 for i, j in T.grid(rows, cols):
                     with T.block("copy"):
                         vi, vj = T.axis.remap("SS", [i, j])
-                        B[vi, vj] = T.Cast(output_dtype, A[vi, vj])
+                        B[vi, vj] = T.Cast(output_dtype, _read(A, (vi, vj)))
 
     @T.prim_func
     def impl(a: T.handle, b: T.handle):
         A = T.match_buffer(
-            a, shape, source_dtype, scope=source_scope, strides=_strides(rank), offset_factor=1
+            a,
+            source_shape,
+            source_dtype,
+            scope=source_scope,
+            strides=_strides(len(source_shape)),
+            offset_factor=1,
         )
         B = T.match_buffer(
             b, shape, output_dtype, scope=output_scope, strides=_strides(rank), offset_factor=1
@@ -141,8 +177,8 @@ def _copy_pair(rows, cols, rank, source_dtype, output_dtype, source_scope, outpu
                     B.access_ptr("w"),
                     T.uint32(rows),
                     T.uint32(cols),
-                    A.strides[0] * factor,
-                    B.strides[0] * factor,
+                    _dma_stride(A, factor),
+                    _dma_stride(B, factor),
                 )
             )
 
@@ -158,61 +194,88 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
         "widen_i8_i32",
         "add_i32",
         "add_i32_wrapping",
+        "fill_i8",
+        "fill_i32",
+        "fill_widen_i8_i32",
+        "add_i32_scalar_a",
+        "add_i32_scalar_b",
+        "add_i32_wrapping_scalar_a",
+        "add_i32_wrapping_scalar_b",
     ) or rank not in (1, 2):
         raise ValueError("Unsupported Gemmini elementwise intrinsic")
     if any(type(value) is not int or not 1 <= value <= 16 for value in (rows, cols)) or (
         rank == 1 and rows != 1
     ):
         raise ValueError("Invalid Gemmini DMA rectangle")
-    scope = SPAD if kind == "copy_i8" else ACC
-    dtype = "int8" if kind == "copy_i8" else "int32"
-    source_dtype = "int8" if kind in ("copy_i8", "widen_i8_i32") else "int32"
+    scalar_a, scalar_b = kind.endswith("_scalar_a"), kind.endswith("_scalar_b")
+    fill = kind.startswith("fill_")
+    if (fill or scalar_a or scalar_b) and cols != 1:
+        raise ValueError("Scalar broadcasts require one-column DMA")
+    scope = SPAD if kind in ("copy_i8", "fill_i8") else ACC
+    dtype = "int8" if kind in ("copy_i8", "fill_i8") else "int32"
+    source_dtype = (
+        "int8" if kind in ("copy_i8", "widen_i8_i32", "fill_i8", "fill_widen_i8_i32") else "int32"
+    )
     source_symbol = {
         "copy_i8": "tvm_gemmini_dma_a",
         "copy_i32": "tvm_gemmini_dma_acc_write",
         "widen_i8_i32": "tvm_gemmini_dma_widen",
+        "fill_i8": "tvm_gemmini_dma_a",
+        "fill_i32": "tvm_gemmini_dma_acc_write",
+        "fill_widen_i8_i32": "tvm_gemmini_dma_widen",
     }.get(kind)
     shape = (cols,) if rank == 1 else (rows, cols)
     factor = cols if rank == 1 else 1
-    wrapping = kind == "add_i32_wrapping"
+    a_shape, b_shape = () if scalar_a else shape, () if scalar_b else shape
+    wrapping = kind.startswith("add_i32_wrapping")
     if kind.startswith("add_i32"):
         if rank == 1:
 
             @T.prim_func
             def desc(a: T.handle, b: T.handle, c: T.handle):
-                A = T.match_buffer(a, shape, "int32", strides=_strides(rank), offset_factor=1)
-                B = T.match_buffer(b, shape, "int32", strides=_strides(rank), offset_factor=1)
+                A = T.match_buffer(
+                    a, a_shape, "int32", strides=_strides(len(a_shape)), offset_factor=1
+                )
+                B = T.match_buffer(
+                    b, b_shape, "int32", strides=_strides(len(b_shape)), offset_factor=1
+                )
                 C = T.match_buffer(
                     c, shape, "int32", scope=ACC, strides=_strides(rank), offset_factor=1
                 )
                 with T.block("root"):
-                    T.reads(A[0:cols], B[0:cols])
+                    T.reads(_region(A), _region(B))
                     T.writes(C[0:cols])
                     for j in T.serial(cols):
                         with T.block("add"):
                             vj = T.axis.spatial(cols, j)
-                            C[vj] = _add_reference(A[vj], B[vj], wrapping)
+                            C[vj] = _add_reference(_read(A, (vj,)), _read(B, (vj,)), wrapping)
         else:
 
             @T.prim_func
             def desc(a: T.handle, b: T.handle, c: T.handle):
-                A = T.match_buffer(a, shape, "int32", strides=_strides(rank), offset_factor=1)
-                B = T.match_buffer(b, shape, "int32", strides=_strides(rank), offset_factor=1)
+                A = T.match_buffer(
+                    a, a_shape, "int32", strides=_strides(len(a_shape)), offset_factor=1
+                )
+                B = T.match_buffer(
+                    b, b_shape, "int32", strides=_strides(len(b_shape)), offset_factor=1
+                )
                 C = T.match_buffer(
                     c, shape, "int32", scope=ACC, strides=_strides(rank), offset_factor=1
                 )
                 with T.block("root"):
-                    T.reads(A[0:rows, 0:cols], B[0:rows, 0:cols])
+                    T.reads(_region(A), _region(B))
                     T.writes(C[0:rows, 0:cols])
                     for i, j in T.grid(rows, cols):
                         with T.block("add"):
                             vi, vj = T.axis.remap("SS", [i, j])
-                            C[vi, vj] = _add_reference(A[vi, vj], B[vi, vj], wrapping)
+                            C[vi, vj] = _add_reference(
+                                _read(A, (vi, vj)), _read(B, (vi, vj)), wrapping
+                            )
 
         @T.prim_func
         def impl(a: T.handle, b: T.handle, c: T.handle):
-            A = T.match_buffer(a, shape, "int32", strides=_strides(rank), offset_factor=1)
-            B = T.match_buffer(b, shape, "int32", strides=_strides(rank), offset_factor=1)
+            A = T.match_buffer(a, a_shape, "int32", strides=_strides(len(a_shape)), offset_factor=1)
+            B = T.match_buffer(b, b_shape, "int32", strides=_strides(len(b_shape)), offset_factor=1)
             C = T.match_buffer(
                 c, shape, "int32", scope=ACC, strides=_strides(rank), offset_factor=1
             )
@@ -227,7 +290,7 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
                         C.access_ptr("w"),
                         T.uint32(rows),
                         T.uint32(cols),
-                        A.strides[0] * factor,
+                        _dma_stride(A, factor),
                         T.int32(0),
                     )
                 )
@@ -239,14 +302,24 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
                         C.access_ptr("rw"),
                         T.uint32(rows),
                         T.uint32(cols),
-                        B.strides[0] * factor,
+                        _dma_stride(B, factor),
                         T.int32(0),
                     )
                 )
 
         op = desc, impl
     else:
-        op = _copy_pair(rows, cols, rank, source_dtype, dtype, "global", scope, source_symbol)
+        op = _copy_pair(
+            rows,
+            cols,
+            rank,
+            source_dtype,
+            dtype,
+            "global",
+            scope,
+            source_symbol,
+            source_scalar=fill,
+        )
     store = _copy_pair(
         rows,
         cols,
@@ -327,8 +400,20 @@ def elementwise_blocks(func):
             return
         # Tensorize proves the access map below. Copies may use sliced,
         # repeated or permuted indices, with scalar DMA as a legal fallback.
-        if any(not load.buffer.shape or load.buffer.data.same_as(output.data) for load in loads):
+        if any(load.buffer.data.same_as(output.data) for load in loads):
             return
+        scalar_inputs = [index for index, load in enumerate(loads) if not load.buffer.shape]
+        if len(scalar_inputs) > 1:
+            return
+        if scalar_inputs:
+            if kind in ("copy_i8", "copy_i32", "widen_i8_i32"):
+                kind = {
+                    "copy_i8": "fill_i8",
+                    "copy_i32": "fill_i32",
+                    "widen_i8_i32": "fill_widen_i8_i32",
+                }[kind]
+            else:
+                kind += "_scalar_a" if scalar_inputs[0] == 0 else "_scalar_b"
         matches.append((node, kind))
 
     tir.stmt_functor.post_order_visit(func.body, visit)
@@ -348,6 +433,8 @@ def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=F
     # Divisor tiles keep every DMA inside the original buffer. Prime tails can
     # use smaller rectangles; no CPU packing or speculative padding is hidden.
     factors = [max(value for value in range(1, 17) if extent % value == 0) for extent in dimensions]
+    if kind.startswith("fill_") or "_scalar_" in kind:
+        factors[-1] = 1
     choices = [[1] * rank] if scalar else [factors]
     if tensorize and factors != [1] * rank and not scalar:
         choices.append([1] * rank)

@@ -40,6 +40,14 @@ Intrinsics and target scheduling rules are registered independently of graph
 matching. Registration describes an explicitly selected device; it does not
 discover a connected accelerator or make arbitrary operators tensorizable.
 
+Importing `tvm.relax.backend.contrib.gemmini` registers two standard Relax
+pipelines. `relax.get_pipeline("gemmini", **options)(mod)` prepares mathematical
+graphs for static export, retaining `call_tir`. For ordinary VM compilation,
+`relax.build(mod, target, pipeline="gemmini_build")` composes that preparation
+with TVM's stock `default_build_pipeline`. Options can be passed through
+`relax.get_pipeline("gemmini_build", **options)`. The implementation does not
+replace VM lowering or change the default pipeline for other targets.
+
 This remains a TVM v0.19 fork rather than an unmodified upstream baseline. The
 base commit already contains ONNX fidelity changes, FP/BF16 storage and strict
 arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy`
@@ -111,7 +119,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Native reduction mappings and dtype/rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32 copies, indexed repeats/slices and signed INT8-to-INT32 widening use native DMA where Tensorize proves the access map. Multiple-source selection, broadcast/fill and overlapping updates remain under audit |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32 copies, indexed repeats/slices, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
 
 ### Corrections to the proposed native-unit mappings
@@ -125,7 +133,7 @@ complete acceptance of every ATen overload or frontend graph.
 | Requested mapping | Evidence-backed boundary |
 | --- | --- |
 | `add.Tensor` / `sub.Tensor` through load scaling | Full-width accumulator loads have no configured scaler. Unscaled INT32 addition is supported and the RTL SRAM adder wraps to 32 bits. General alpha scaling or subtraction does not follow from that. INT8 scaled loads round/saturate; `-(-128)` demonstrates why they cannot replace arbitrary wrapping negation or widened subtraction. |
-| `add.Scalar`, `sub.Scalar` | Broadcasting a resident row through zero load stride is a real hardware capability. The appropriate scalar/row layout and its TensorIR rule remain implementation work; this is not an absent-hardware excuse. |
+| `add.Scalar`, `sub.Scalar` | A zero load stride repeats a scalar down a one-column DMA rectangle. Runtime INT32 scalar-tensor addition is now supported on either side, including an explicit wrapping variant. Immediate constants and native subtraction remain separate admission work; there is no full-width negative load scaler. |
 | `mul.Scalar`, `div.Scalar`, `neg` | The available scaled small readout narrows to INT8. It is not an arbitrary FP32 or full-INT32 multiply/divide unit. Any narrower integer recipe must specify its rounding, saturation and value range before admission. |
 | `relu` | Full-width INT32 readout bypasses the activation/scaling result. CPU INT32/FP ReLU therefore remains explicit. An INT8 input/output ReLU mapping is feasible but still needs a dedicated native rule. |
 | `mean.dim`, `mean.default`, `sum.dim_IntList` | A ones-vector contraction can implement a bounded signed-INT8-to-INT32 sum, but that is not the default INT64 or floating reduction contract. A native bounded sum rule remains implementation work. Mean additionally needs a specified divisor, output dtype and rounding; a narrowing readout scale cannot stand in for arbitrary floating mean. |
@@ -164,6 +172,22 @@ performance winners without measurements. Both options are visible to standard
 MetaSchedule, whose tensorization postprocessor rejects illegal candidates.
 In-place copies remain refused. DMA completion also protects external output
 buffers when CPU code in the same function subsequently accesses them.
+
+Runtime scalar fills support INT8-to-INT8, INT32-to-INT32 and signed
+INT8-to-INT32 output. They use one-column, zero-stride DMA and preserve the
+ordinary output layout through standard cache placement. Constant-only fills
+may disappear through normal FoldConstant. Non-integer output conversion is
+not implied. The same broadcast layout supports runtime INT32 scalar addition;
+the ordinary no-overflow and explicit widen/add/narrow variants remain distinct.
+
+Scalar descriptors omit stride metadata because v0.19's Python match-buffer
+builder indexes `shape[0]` when a stride list is supplied. There is also a
+target-local compatibility bridge before LowerMatchBuffer: Buffer.ElemOffset
+returns an INT32 zero for scalar regions while Tensorize may promote the match
+offset to INT64. The bridge binds an INT32 zero-offset variable and casts its
+pointer use back, preserving address, dtype and external ABI. It accepts only
+zero-offset scalar sources and access-pointer uses; it is not a core C++ patch
+or an arithmetic rewrite. Non-buffer primitive scalar ABIs retain CPU fallback.
 
 ## Verification tools
 
@@ -212,6 +236,15 @@ MetaSchedule postprocessing, indexed layouts, tails and delayed DMA. The
 CPU-consumer test deliberately removes a required output wait and fails its
 oracle. `unit-structural-native-v2.log` retains 11 contraction regressions and
 `unit-export-native-v1.log` retains 21 exporter/classifier checks.
+
+`device-scalar-v3` adds bounded runtime-scalar fixtures: INT8 and INT32 fills,
+INT8-to-INT32 fill widening and explicit wrapping INT32 scalar addition.
+Positive and wrong-oracle checks pass on both Spike and the selected RTL.
+`unit-scalar-fill-v3.log` covers eight host checks including both scalar operand
+positions, vectors/batches/tails, standard MetaSchedule processing, the named
+Relax preparation/build pipelines and preservation of CPU fallback for a hidden
+primitive scalar ABI. `unit-scalar-structural-v1.log` retains 11 contraction
+regressions after scalar support.
 
 The migration remains incomplete until the inventory's remaining native
 admission, CPU/frontend explanations and final regression/target checks are

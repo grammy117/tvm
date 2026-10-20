@@ -30,6 +30,7 @@ import tvm
 from tvm import relax, tir
 from tvm._ffi.runtime_ctypes import DataTypeCode
 from tvm.relax.expr_functor import PyExprMutator, mutator
+from tvm.relax.pipeline import default_build_pipeline, register_pipeline
 
 _SYMBOL = "tvm_gemmini_matmul_i8_i32"
 _MAX_K = ((1 << 31) - 1) // (128 * 128)
@@ -283,6 +284,25 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
 
     return prepare_gemmini_tensorir_graph(mod, optimize=optimize, capabilities=capabilities,
                                          order=order, schedule_options=schedule_options, report=report)
+
+
+@register_pipeline("gemmini")
+def gemmini_pipeline(**options):
+    """Select the backend through ``relax.get_pipeline('gemmini', ...)``.
+
+    Import this contrib module once to register it. Options are the same as
+    prepare_gemmini_graph, including explicit legacy regression selection.
+    """
+    @tvm.transform.module_pass(opt_level=0, name="GemminiPipeline")
+    def pipeline(mod, _ctx):
+        return prepare_gemmini_graph(mod, **options)
+    return pipeline
+
+
+@register_pipeline("gemmini_build")
+def gemmini_build_pipeline(**options):
+    """Compose Gemmini preparation with TVM's stock Relax VM lowering."""
+    return tvm.transform.Sequential([gemmini_pipeline(**options),default_build_pipeline()])
 
 
 def _inline_cpu_producers(mod):
