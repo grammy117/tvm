@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Exact integer copies, widening and addition with native DMA intrinsics.
+"""Exact copies, integer widening/addition and INT8 ReLU with DMA intrinsics.
 
 The reference programs remain mathematical pointwise blocks. Scheduling caches
 their output in real SRAM scopes, then tensorizes rectangular regions. No
@@ -191,11 +191,13 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
     if kind not in (
         "copy_i8",
         "copy_i32",
+        "copy_f32",
         "widen_i8_i32",
         "add_i32",
         "add_i32_wrapping",
         "fill_i8",
         "fill_i32",
+        "fill_f32",
         "fill_widen_i8_i32",
         "add_i32_scalar_a",
         "add_i32_scalar_b",
@@ -212,16 +214,24 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
     if (fill or scalar_a or scalar_b) and cols != 1:
         raise ValueError("Scalar broadcasts require one-column DMA")
     scope = SPAD if kind in ("copy_i8", "fill_i8") else ACC
-    dtype = "int8" if kind in ("copy_i8", "fill_i8") else "int32"
+    dtype = (
+        "float32"
+        if kind in ("copy_f32", "fill_f32")
+        else "int8"
+        if kind in ("copy_i8", "fill_i8")
+        else "int32"
+    )
     source_dtype = (
-        "int8" if kind in ("copy_i8", "widen_i8_i32", "fill_i8", "fill_widen_i8_i32") else "int32"
+        "int8" if kind in ("copy_i8", "widen_i8_i32", "fill_i8", "fill_widen_i8_i32") else dtype
     )
     source_symbol = {
         "copy_i8": "tvm_gemmini_dma_a",
         "copy_i32": "tvm_gemmini_dma_acc_write",
+        "copy_f32": "tvm_gemmini_dma_acc_write",
         "widen_i8_i32": "tvm_gemmini_dma_widen",
         "fill_i8": "tvm_gemmini_dma_a",
         "fill_i32": "tvm_gemmini_dma_acc_write",
+        "fill_f32": "tvm_gemmini_dma_acc_write",
         "fill_widen_i8_i32": "tvm_gemmini_dma_widen",
     }.get(kind)
     shape = (cols,) if rank == 1 else (rows, cols)
@@ -338,8 +348,93 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
     return result
 
 
+def _relu_reference(value, zero_first):
+    zero = tir.const(0, "int8")
+    return tir.max(zero, value) if zero_first else tir.max(value, zero)
+
+
+@lru_cache(None)
+def register_relu_intrinsic(rows, cols, rank, zero_first=False):
+    """An exact tile operation; its private accumulator is always INT32."""
+    if (
+        rank not in (1, 2)
+        or any(type(value) is not int or not 1 <= value <= 16 for value in (rows, cols))
+        or (rank == 1 and rows != 1)
+    ):
+        raise ValueError("Invalid Gemmini ReLU tile")
+    shape = (cols,) if rank == 1 else (rows, cols)
+    factor = cols if rank == 1 else 1
+
+    if rank == 1:
+
+        @T.prim_func
+        def desc(a: T.handle, b: T.handle):
+            A = T.match_buffer(a, shape, "int8", strides=_strides(rank), offset_factor=1)
+            B = T.match_buffer(b, shape, "int8", strides=_strides(rank), offset_factor=1)
+            with T.block("root"):
+                T.reads(_region(A))
+                T.writes(_region(B))
+                for j in T.serial(cols):
+                    with T.block("relu"):
+                        vj = T.axis.spatial(cols, j)
+                        B[vj] = _relu_reference(A[vj], zero_first)
+    else:
+
+        @T.prim_func
+        def desc(a: T.handle, b: T.handle):
+            A = T.match_buffer(a, shape, "int8", strides=_strides(rank), offset_factor=1)
+            B = T.match_buffer(b, shape, "int8", strides=_strides(rank), offset_factor=1)
+            with T.block("root"):
+                T.reads(_region(A))
+                T.writes(_region(B))
+                for i, j in T.grid(rows, cols):
+                    with T.block("relu"):
+                        vi, vj = T.axis.remap("SS", [i, j])
+                        B[vi, vj] = _relu_reference(A[vi, vj], zero_first)
+
+    @T.prim_func
+    def impl(a: T.handle, b: T.handle):
+        A = T.match_buffer(a, shape, "int8", strides=_strides(rank), offset_factor=1)
+        B = T.match_buffer(b, shape, "int8", strides=_strides(rank), offset_factor=1)
+        with T.block("root"):
+            T.reads(_region(A))
+            T.writes(_region(B))
+            with T.block("relu_readout"):
+                T.reads(_region(A))
+                T.writes(_region(B))
+                C = T.alloc_buffer((rows, 16), "int32", scope=ACC)
+                T.evaluate(
+                    T.call_extern(
+                        "void",
+                        "tvm_gemmini_dma_widen",
+                        A.access_ptr("r"),
+                        C.access_ptr("w"),
+                        T.uint32(rows),
+                        T.uint32(cols),
+                        _dma_stride(A, factor),
+                        T.int32(0),
+                    )
+                )
+                T.evaluate(
+                    T.call_extern(
+                        "void",
+                        "tvm_gemmini_dma_relu_out",
+                        C.access_ptr("r"),
+                        B.access_ptr("w"),
+                        T.uint32(rows),
+                        T.uint32(cols),
+                        T.int64(16),
+                        _dma_stride(B, factor),
+                    )
+                )
+
+    name = f"gemmini.relu_i8.{rank}d.{rows}x{cols}" + (".zero_first" if zero_first else "")
+    tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+    return name
+
+
 def elementwise_blocks(func):
-    """Find exact direct integer copy, widening and INT32 addition blocks."""
+    """Find exact copies, widening, INT32 addition and INT8 ReLU blocks."""
     matches = []
 
     def visit(node):
@@ -365,9 +460,25 @@ def elementwise_blocks(func):
         if (
             isinstance(value, tir.BufferLoad)
             and value.dtype == output.dtype
-            and output.dtype in ("int8", "int32")
+            and output.dtype in ("int8", "int32", "float32")
         ):
-            kind, loads = "copy_i8" if output.dtype == "int8" else "copy_i32", [value]
+            kind, loads = (
+                {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}[output.dtype],
+                [value],
+            )
+        elif isinstance(value, tir.Max) and output.dtype == "int8":
+            pairs = ((value.a, value.b), (value.b, value.a))
+            reads = [
+                load
+                for load, zero in pairs
+                if isinstance(load, tir.BufferLoad)
+                and load.dtype == "int8"
+                and isinstance(zero, tir.IntImm)
+                and int(zero) == 0
+            ]
+            if len(reads) != 1:
+                return
+            kind, loads = "relu_i8", reads
         elif (
             isinstance(value, tir.Cast)
             and value.dtype == "int32"
@@ -406,14 +517,17 @@ def elementwise_blocks(func):
         if len(scalar_inputs) > 1:
             return
         if scalar_inputs:
-            if kind in ("copy_i8", "copy_i32", "widen_i8_i32"):
+            if kind in ("copy_i8", "copy_i32", "copy_f32", "widen_i8_i32"):
                 kind = {
                     "copy_i8": "fill_i8",
                     "copy_i32": "fill_i32",
+                    "copy_f32": "fill_f32",
                     "widen_i8_i32": "fill_widen_i8_i32",
                 }[kind]
-            else:
+            elif kind.startswith("add_i32"):
                 kind += "_scalar_a" if scalar_inputs[0] == 0 else "_scalar_b"
+            else:
+                return
         matches.append((node, kind))
 
     tir.stmt_functor.post_order_visit(func.body, visit)
@@ -451,12 +565,26 @@ def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=F
 
 def _schedule_elementwise_candidate(func, node, kind, rank, factors, tensorize, mark_tensorize):
     rows, cols = factors if rank == 2 else (1, factors[0])
-    intrinsics = register_elementwise_intrinsics(kind, rows, cols, rank)
+    intrinsics = (
+        None if kind == "relu_i8" else register_elementwise_intrinsics(kind, rows, cols, rank)
+    )
     sch = tir.Schedule(func, debug_mask="all")
     block = sch.get_block(node.name_hint)
     loops = sch.get_loops(block)[-rank:]
     split = [sch.split(loop, [None, factor]) for loop, factor in zip(loops, factors)]
     sch.reorder(*[pair[0] for pair in split], *[pair[1] for pair in split])
+    if kind == "relu_i8":
+        mathematical = sch.mod
+        if tensorize or mark_tensorize:
+            tile = sch.blockize(sch.get_loops(block)[-rank])
+            intrinsic = register_relu_intrinsic(
+                rows, cols, rank, isinstance(node.body.value.a, tir.IntImm)
+            )
+            if tensorize:
+                sch.tensorize(tile, intrinsic)
+            else:
+                sch.annotate(tile, "meta_schedule.auto_tensorize", intrinsic)
+        return sch, mathematical, {"operation": kind, "tile_rows": rows, "tile_cols": cols}
     outer = split[-1][0]
     write = sch.cache_write(block, 0, intrinsics["scope"])
     sch.reverse_compute_at(write, outer, preserve_unit_loops=True)

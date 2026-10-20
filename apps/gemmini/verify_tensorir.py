@@ -51,7 +51,7 @@ void* memset(void* p,int c,size_t n) { volatile unsigned char* d=p;for(size_t i=
 void* memcpy(void* d,const void* s,size_t n) { volatile unsigned char* o=d;const volatile unsigned char* p=s;for(size_t i=0;i<n;++i)o[i]=p[i];return d; }
 int printf(const char* format,...) { (void)format;puts_htif("VENDOR_DIAGNOSTIC\n");return 0; }
 __attribute__((noreturn)) void exit(int code) { tohost=((uint64_t)(code?code:99)<<1)|1;for(;;){} }
-static unsigned computes,zeros,dmas,accumulates,acc_writes;
+static unsigned computes,zeros,dmas,accumulates,acc_writes,relus;
 void __real_tvm_gemmini_compute(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
 void __real_tvm_gemmini_zero_acc(uint32_t,uint32_t,uint32_t);
 void __wrap_tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
@@ -62,6 +62,7 @@ void __real_tvm_gemmini_dma_acc_write(const int32_t*,uint32_t,uint32_t,uint32_t,
 void __real_tvm_gemmini_dma_acc_add(const int32_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
 void __real_tvm_gemmini_dma_widen(const int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
 void __real_tvm_gemmini_dma_spad_out(int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __real_tvm_gemmini_dma_relu_out(int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
 void __wrap_tvm_gemmini_dma_acc_write(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
   ++dmas;++acc_writes;__real_tvm_gemmini_dma_acc_write(p,c,m,n,s,w);
 }
@@ -73,6 +74,9 @@ void __wrap_tvm_gemmini_dma_widen(const int8_t* p,uint32_t c,uint32_t m,uint32_t
 }
 void __wrap_tvm_gemmini_dma_spad_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
   ++dmas;__real_tvm_gemmini_dma_spad_out(p,c,m,n,s,w);
+}
+void __wrap_tvm_gemmini_dma_relu_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;++relus;__real_tvm_gemmini_dma_relu_out(p,c,m,n,s,w);
 }
 static uint64_t hash(const void* p,size_t n) {
   const volatile unsigned char* b=p;uint64_t h=1469598103934665603ULL;
@@ -86,6 +90,60 @@ def fixtures():
     from tvm import relax, te
 
     result = []
+    for name, shape in (("relu_i8", (16, 16)), ("relu_tail", (3, 17))):
+        a = (np.arange(np.prod(shape)).reshape(shape) % 256 - 128).astype("int8")
+        av = relax.Var("a", relax.TensorStructInfo(shape, "int8"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [av]):
+            with builder.dataflow():
+                output = builder.emit_output(relax.op.nn.relu(av))
+            builder.emit_func_output(output)
+        result.append((name, builder.get(), [a], np.maximum(a, 0)))
+    bits = np.array(
+        [
+            0,
+            0x80000000,
+            0x7F800000,
+            0xFF800000,
+            0x7FC12345,
+            0x7F812345,
+            0xFFA00001,
+            1,
+            0x007FFFFF,
+            0x00800000,
+            0x3F800000,
+            0xBF800000,
+        ],
+        "uint32",
+    )
+    for name in ("copy_f32", "repeat_f32", "fill_f32"):
+        a = (bits.reshape(3, 4) if name != "fill_f32" else np.array(0x7F812345, "uint32")).view(
+            "float32"
+        )
+        av = relax.Var("a", relax.TensorStructInfo(a.shape, "float32"))
+        builder = relax.BlockBuilder()
+        if name == "copy_f32":
+            source = te.placeholder(a.shape, "float32")
+            copied = te.compute(a.shape, lambda *i: source[i], name="copied")
+            gv = builder.add_func(te.create_prim_func([source, copied]), "copy")
+        with builder.function("main", [av]):
+            with builder.dataflow():
+                output = builder.emit_output(
+                    relax.call_tir(gv, (av,), relax.TensorStructInfo(a.shape, "float32"))
+                    if name == "copy_f32"
+                    else relax.op.tile(av, (2, 1))
+                    if name == "repeat_f32"
+                    else relax.op.full((3, 4), av, "float32")
+                )
+            builder.emit_func_output(output)
+        expected_bits = (
+            bits.reshape(3, 4)
+            if name == "copy_f32"
+            else np.tile(bits.reshape(3, 4), (2, 1))
+            if name == "repeat_f32"
+            else np.full((3, 4), 0x7F812345, "uint32")
+        )
+        result.append((name, builder.get(), [a], expected_bits.view("float32")))
     for name, m, n, k, batches, fused in (
         ("small", 3, 4, 5, 1, False),
         ("full", 16, 16, 16, 1, True),
@@ -356,14 +414,28 @@ def prepare(args):
     guest = [GUEST, '#include "package/model.h"']
     checks = []
     for index, (name, _, arrays, expected) in enumerate(cases):
-        output_ctype = "int8_t" if expected.dtype == np.int8 else "int32_t"
+        output_ctype = (
+            "uint32_t"
+            if expected.dtype == np.float32
+            else "int8_t"
+            if expected.dtype == np.int8
+            else "int32_t"
+        )
         for arg, array in enumerate(arrays):
-            ctype = "int8_t" if array.dtype == np.int8 else "int32_t"
-            values = ",".join(str(int(x)) for x in array.flat)
+            ctype = (
+                "uint32_t"
+                if array.dtype == np.float32
+                else "int8_t"
+                if array.dtype == np.int8
+                else "int32_t"
+            )
+            payload = array.view("uint32") if array.dtype == np.float32 else array
+            values = ",".join(str(int(x)) for x in payload.flat)
             guest.append(
                 f"static const {ctype} in_{index}_{arg}[] __attribute__((aligned(64)))={{{values}}};"
             )
-        values = ",".join(str(int(x)) for x in expected.flat)
+        expected_payload = expected.view("uint32") if expected.dtype == np.float32 else expected
+        values = ",".join(str(int(x)) for x in expected_payload.flat)
         guest.append(f"static const {output_ctype} expected_{index}[]={{{values}}};")
         size = expected.size
         workspace = manifest["stages"][name]["workspace_bytes"]
@@ -382,6 +454,7 @@ def prepare(args):
                 f"unsigned before_{index}=computes, zero_before_{index}=zeros;",
                 f"unsigned dma_before_{index}=dmas, add_before_{index}=accumulates;",
                 f"unsigned write_before_{index}=acc_writes;",
+                f"unsigned relu_before_{index}=relus;",
             ]
         )
         for arg in range(len(arrays)):
@@ -406,6 +479,8 @@ def prepare(args):
             )
         if operation is not None and operation.startswith("add_i32"):
             primitive_check += f"if(accumulates==add_before_{index})return 21;"
+        if operation == "relu_i8":
+            primitive_check += f"if(relus==relu_before_{index})return 21;"
         checks.extend(
             [
                 f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index},{workspace})) return 20;",
@@ -449,6 +524,7 @@ def prepare(args):
         "-Wl,--wrap=tvm_gemmini_dma_acc_add",
         "-Wl,--wrap=tvm_gemmini_dma_widen",
         "-Wl,--wrap=tvm_gemmini_dma_spad_out",
+        "-Wl,--wrap=tvm_gemmini_dma_relu_out",
         "-I" + str(out),
     ]
     sources = [out / "start.S", out / "runner.c", package / "runtime.c", package / "constants.S"]
@@ -679,6 +755,11 @@ def main():
             "bias_column",
             "bias_scalar",
             "bias_wrap",
+            "relu_i8",
+            "relu_tail",
+            "copy_f32",
+            "repeat_f32",
+            "fill_f32",
         ],
     )
     execute = sub.add_parser("run")

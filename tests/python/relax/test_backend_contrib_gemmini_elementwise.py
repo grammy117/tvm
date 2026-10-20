@@ -33,7 +33,13 @@ import test_backend_contrib_gemmini_tensorir as reference
 
 
 def workload(shape, kind):
-    dtype = "int8" if kind in ("copy_i8", "widen_i8_i32") else "int32"
+    dtype = (
+        "float32"
+        if kind == "copy_f32"
+        else "int8"
+        if kind in ("copy_i8", "widen_i8_i32", "relu_i8")
+        else "int32"
+    )
     a = te.placeholder(shape, dtype, "source")
     b = te.placeholder(shape, dtype, "other")
     value = te.compute(
@@ -44,6 +50,8 @@ def workload(shape, kind):
         if kind == "add_i32"
         else a[i].astype("int32")
         if kind == "widen_i8_i32"
+        else te.max(a[i], tir.const(0, "int8"))
+        if kind == "relu_i8"
         else a[i],
         name="value",
     )
@@ -53,6 +61,189 @@ def workload(shape, kind):
 class GemminiElementwiseTests(unittest.TestCase):
     setUp = reference.GemminiTensorIRTests.setUp
     build = reference.GemminiTensorIRTests.build
+
+    def test_int8_relu_all_values_shapes_indexed_layouts_and_trace(self):
+        for shape in ((1,), (31,), (16, 16), (3, 17), (2, 3, 4)):
+            with self.subTest(shape=shape):
+                original = workload(shape, "relu_i8")
+                scheduled = make_elementwise_schedule(original)
+                runtime, control = self.build(scheduled.scheduled_mod)
+                values = np.resize(np.arange(-128, 128, dtype="int16"), shape).astype("int8")
+                inputs, output = tvm.nd.array(values), tvm.nd.empty(shape, "int8")
+                runtime(inputs, output)
+                np.testing.assert_array_equal(output.numpy(), np.maximum(values, 0))
+                np.testing.assert_array_equal(inputs.numpy(), values)
+                self.assertEqual(control.emulator_faults(), 0)
+                self.assertEqual(control.emulator_pending(), 0)
+                calls = []
+                tir.stmt_functor.post_order_visit(
+                    scheduled.scheduled_mod["main"].body,
+                    lambda node: calls.append(node.args[0].value)
+                    if isinstance(node, tir.Call) and node.op == tvm.ir.Op.get("tir.call_extern")
+                    else None,
+                )
+                self.assertIn("tvm_gemmini_dma_widen", calls)
+                self.assertIn("tvm_gemmini_dma_relu_out", calls)
+                replay = tir.Schedule(original, debug_mask="all")
+                scheduled.trace.apply_to_schedule(replay, remove_postproc=False)
+                tvm.ir.assert_structural_equal(
+                    scheduled.scheduled_mod,
+                    lower_tensorir_schedule(
+                        original, replay, workload_metadata={"operation": "relu_i8"}
+                    ).scheduled_mod,
+                )
+                if shape == (16, 16):
+                    reference_output = tvm.nd.empty(shape, "int8")
+                    tvm.build(original, "llvm")(inputs, reference_output)
+                    np.testing.assert_array_equal(output.numpy(), reference_output.numpy())
+                    control.emulator_reset()
+                    control.emulator_wrong(1)
+                    runtime(inputs, output)
+                    self.assertFalse(np.array_equal(output.numpy(), np.maximum(values, 0)))
+
+        a = te.placeholder((5, 3), "int8")
+        b = te.compute((3, 5), lambda i, j: te.max(tir.const(0, "int8"), a[j, i]))
+        result = make_elementwise_schedule(te.create_prim_func([a, b]))
+        runtime, control = self.build(result.scheduled_mod)
+        values = np.arange(-7, 8, dtype="int8").reshape(5, 3)
+        output = tvm.nd.empty((3, 5), "int8")
+        runtime(tvm.nd.array(values), output)
+        np.testing.assert_array_equal(output.numpy(), np.maximum(values.T, 0))
+        self.assertEqual(control.emulator_faults(), 0)
+
+    def test_float32_movement_preserves_nan_payloads_and_signed_zero_bits(self):
+        patterns = np.array(
+            [
+                0,
+                0x80000000,
+                0x7F800000,
+                0xFF800000,
+                0x7FC12345,
+                0x7F812345,
+                0xFFA00001,
+                1,
+                0x007FFFFF,
+                0x00800000,
+                0x3F800000,
+                0xBF800000,
+            ],
+            "uint32",
+        )
+        for shape in ((1,), (31,), (3, 4), (16, 16), (2, 3, 4)):
+            with self.subTest(shape=shape):
+                bits = np.resize(patterns, shape)
+                values = bits.view("float32")
+                original = workload(shape, "copy_f32")
+                result = make_elementwise_schedule(original)
+                runtime, control = self.build(result.scheduled_mod)
+                source, output = tvm.nd.array(values), tvm.nd.empty(shape, "float32")
+                runtime(source, output)
+                np.testing.assert_array_equal(output.numpy().view("uint32"), bits)
+                np.testing.assert_array_equal(source.numpy().view("uint32"), bits)
+                self.assertEqual(control.emulator_faults(), 0)
+                self.assertEqual(control.emulator_pending(), 0)
+        scalar = te.placeholder((), "float32", "scalar")
+        filled = te.compute((3, 4), lambda i, j: scalar[()])
+        result = make_elementwise_schedule(te.create_prim_func([scalar, filled]))
+        runtime, control = self.build(result.scheduled_mod)
+        bits = np.array(0x7F812345, "uint32")
+        output = tvm.nd.empty((3, 4), "float32")
+        runtime(tvm.nd.array(bits.view("float32")), output)
+        np.testing.assert_array_equal(output.numpy().view("uint32"), np.full((3, 4), bits))
+        self.assertEqual(control.emulator_faults(), 0)
+
+    def test_relu_readout_completes_before_cpu_consumer(self):
+        a = te.placeholder((3, 4), "int8", "source")
+        b = te.compute((3, 4), lambda i, j: te.max(a[i, j], tir.const(0, "int8")), name="relu")
+        c = te.compute((3, 4), lambda i, j: b[i, j].astype("int32") * 3 + 1, name="cpu")
+        original = te.create_prim_func([a, b, c])
+        result = make_elementwise_schedule(original)
+        values = np.arange(-6, 6, dtype="int8").reshape(3, 4)
+        expected = np.maximum(values.astype("int32"), 0) * 3 + 1
+        for remove_wait in (False, True):
+            module = result.scheduled_mod
+            if remove_wait:
+
+                def rewrite(node):
+                    if (
+                        isinstance(node, tir.Call)
+                        and node.op == tvm.ir.Op.get("tir.call_extern")
+                        and node.args[0].value == "tvm_gemmini_dma_relu_out"
+                    ):
+                        return tir.call_extern(
+                            "void", node.args[0].value, *node.args[1:-1], tir.const(0, "int32")
+                        )
+                    return None
+
+                func = module["main"]
+                module = tvm.IRModule(
+                    {
+                        "main": func.with_body(
+                            tir.stmt_functor.ir_transform(func.body, None, rewrite)
+                        )
+                    }
+                )
+            runtime, control = self.build(module)
+            intermediate = tvm.nd.array(np.full((3, 4), -77, "int8"))
+            output = tvm.nd.empty((3, 4), "int32")
+            runtime(tvm.nd.array(values), intermediate, output)
+            if remove_wait:
+                self.assertFalse(np.array_equal(output.numpy(), expected))
+            else:
+                np.testing.assert_array_equal(output.numpy(), expected)
+                self.assertEqual(control.emulator_faults(), 0)
+
+    def test_normal_relax_relu_and_float_movement_use_standard_metaschedule(self):
+        from tvm import meta_schedule as ms
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator
+        from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
+
+        for dtype, operation in (("int8", "relu_i8"), ("float32", "copy_f32")):
+            value = relax.Var("value", relax.TensorStructInfo((3, 4), dtype))
+            builder = relax.BlockBuilder()
+            with builder.function("main", [value]):
+                with builder.dataflow():
+                    output = builder.emit_output(
+                        relax.op.nn.relu(value) if dtype == "int8" else relax.op.tile(value, (2, 1))
+                    )
+                builder.emit_func_output(output)
+            report = []
+            prepared = prepare_gemmini_graph(builder.get(), report=report)
+            self.assertEqual([row["placement"] for row in report], ["gemmini"], report)
+            self.assertEqual(report[0]["metadata"]["operation"], operation)
+            path = self.root / f"relax-{dtype}.so"
+            relax.build(prepared, "llvm").export_library(
+                str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11"]
+            )
+            vm = relax.VirtualMachine(tvm.runtime.load_module(str(path)), tvm.cpu())
+            values = np.arange(-6, 6, dtype=dtype).reshape(3, 4)
+            np.testing.assert_array_equal(
+                vm["main"](tvm.nd.array(values)).numpy(),
+                np.maximum(values, 0) if dtype == "int8" else np.tile(values, (2, 1)),
+            )
+            func = workload((3, 4), operation)
+            context = ms.TuneContext(
+                mod=func,
+                target=GemminiCapabilities().target(),
+                space_generator=gemmini_space_generator(),
+                num_threads=1,
+            )
+            designs = context.generate_design_space()
+            self.assertEqual(len(designs), 2)
+            for design in designs:
+                design.enter_postproc()
+                self.assertTrue(all(p.apply(design) for p in context.space_generator.postprocs))
+                result = lower_tensorir_schedule(
+                    func, design, workload_metadata={"operation": operation}
+                )
+                runtime, control = self.build(result.scheduled_mod)
+                values = np.arange(-6, 6, dtype=dtype).reshape(3, 4)
+                output = tvm.nd.empty((3, 4), dtype)
+                runtime(tvm.nd.array(values), output)
+                np.testing.assert_array_equal(
+                    output.numpy(), np.maximum(values, 0) if dtype == "int8" else values
+                )
+                self.assertEqual(control.emulator_faults(), 0)
 
     def test_exact_bits_extremes_vectors_batches_and_prime_tails(self):
         bits = np.array([0, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x12345678], "uint32").view(

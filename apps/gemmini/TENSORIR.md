@@ -128,6 +128,8 @@ profile digest; it is an explicit compiler profile, not hardware discovery.
 | `gemmini/Configs.scala` | `178c21ac741c89c08158efa71fb34da35d27b75bd50bde5116a5e19178f8391b` | INT8 inputs, INT32 accumulator, 20-bit PE output, 16x16 array, both dataflows, 256-KiB scratchpad, 64-KiB accumulator; no accumulator-load scaler |
 | `gemmini/GemminiConfigs.scala` | `7294a082a1df4ae7aa7d81adc5bde75b7d5118683c083f6a4b998c9ce64d102e` | Configuration fields and optional units |
 | selected `gemmini/LoadController.scala` | `780ee0a292d8653fa8a822aee28e2fb2cffbc25301431b4332182008d34fcf6a` | Null DMA address produces zeros; stride zero broadcasts a row |
+| selected `gemmini/AccumulatorScale.scala` | `bb7c65bdf112e5ab93da52278e5c30152fb2f84a8ed990d23008439cf41281d4` | Narrow output applies activation/scale/clipping; full-width data follows a separate unchanged path |
+| selected `gemmini/StoreController.scala` | `a0b556d109196c3c9d9ac5ed4dffc1bcad334c0f1f87780d948b84bde7402c6d` | Store configuration supplies activation and accumulator scale |
 | `include/gemmini_params.h` | `3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924` | Parameter/ABI geometry and float scaling/narrowing definitions |
 
 The implemented instruction subset is primitive-only OS; hardware loops remain
@@ -142,6 +144,22 @@ INT32 multiply/divide operations. In particular, negating INT8 -128 during a
 scaled INT8 load saturates, whereas widening then negating produces INT32 128.
 Any lowering must preserve the admitted operator's actual dtype and rounding.
 
+The target profile explicitly records full-width readout and narrow-readout
+ReLU, both enabled in this pinned configuration. Native INT8 ReLU widens each
+tile into a private INT32 accumulator, then uses identity-scale narrow ReLU
+readout. Every INT8 value is exactly representable at both steps; all 256 values
+are checked on the target. One typed tile intrinsic describes the entire
+sequence, with its owned accumulator allocation retained in a nested block.
+TVM chooses tile loops and rectangular/scalar access strategies; the temporary
+and its two-command sequence are fixed intrinsic implementation details. No
+arbitrary INT32 narrowing or floating ReLU is implied.
+
+FP32 copies use full-width DMA as raw 32-bit transport, with no scale or
+accumulation. The floating buffer type remains visible in mathematical TIR;
+the physical words preserve NaN payloads, signed zero, infinities and subnormals.
+Runtime scalar FP32 fills and indexed repeat/copy layouts use the same typed
+copy rules. This adds data movement, not floating accelerator arithmetic.
+
 ## Full requested operator inventory — completion audit pending
 
 The following 51 operator spellings retain the user's full requested scope.
@@ -152,11 +170,11 @@ Statuses here are development state, not a completed hardware-support table.
 | Matrix | `mm`, `bmm` | Structural scheduling, queued-DMA checks and bounded Spike/RTL checks implemented; full operator inventory remains pending |
 | Biased matrix | `addmm` | Exact integer matmul with eligible INT32 tensor bias uses accumulator preload; shared products and unsupported epilogues retain their original mathematics. CPU activation/scaling and complete ATen/frontend admission remain separate |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
-| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 tensor addition uses accumulator overwrite/add loads and full readout. Ordinary signed TIR has a no-overflow domain; explicit widen/add/narrow TIR also maps natively and defines modulo-2^32 output. Other mappings remain under audit; generic CPU fallback retained |
+| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 addition uses accumulator overwrite/add loads and full readout, with separate ordinary and explicit modulo-32 contracts. INT8 ReLU uses exact widen/readout tile intrinsics. Other mappings remain under audit; CPU fallback retained |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32 copies, indexed repeats/slices, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
 
 ### Corrections to the proposed native-unit mappings
@@ -172,7 +190,7 @@ complete acceptance of every ATen overload or frontend graph.
 | `add.Tensor` / `sub.Tensor` through load scaling | Full-width accumulator loads have no configured scaler. Unscaled INT32 addition is supported and the RTL SRAM adder wraps to 32 bits. General alpha scaling or subtraction does not follow from that. INT8 scaled loads round/saturate; `-(-128)` demonstrates why they cannot replace arbitrary wrapping negation or widened subtraction. |
 | `add.Scalar`, `sub.Scalar` | A zero load stride repeats a scalar down a one-column DMA rectangle. Runtime INT32 scalar-tensor addition is now supported on either side, including an explicit wrapping variant. Immediate constants and native subtraction remain separate admission work; there is no full-width negative load scaler. |
 | `mul.Scalar`, `div.Scalar`, `neg` | The available scaled small readout narrows to INT8. It is not an arbitrary FP32 or full-INT32 multiply/divide unit. Any narrower integer recipe must specify its rounding, saturation and value range before admission. |
-| `relu` | Full-width INT32 readout bypasses the activation/scaling result. CPU INT32/FP ReLU therefore remains explicit. An INT8 input/output ReLU mapping is feasible but still needs a dedicated native rule. |
+| `relu` | Full-width INT32 readout bypasses activation/scaling, so INT32/FP ReLU remains CPU work. Native INT8 ReLU uses a typed tile intrinsic with exact widening, identity scale and narrow readout. Its private INT32 temporary contains only widened INT8 values. |
 | `mean.dim`, `mean.default`, `sum.dim_IntList` | A registered sum intrinsic uses a ones-vector contraction for signed INT8-to-INT32 sums with K <= 16,777,216. This is not the default INT64 or floating reduction contract. Mean retains its specified CPU conversion/division; a narrowing readout scale cannot stand in for arbitrary floating mean. |
 | `avg_pool1d/2d/3d`, adaptive average pooling | Ordinary floating inputs do not fit the integer arithmetic unit. An integer recipe must specify windows, divisors, exclude-padding/ceil behavior and rounding. The max-pool readout feature does not implement average pooling. |
 | Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. No generic backward mapping is claimed. |
@@ -201,7 +219,7 @@ its proven range, then narrow to INT32. Target overflow/underflow fixtures use
 that explicit mathematical reference. The plain-add intrinsic preserves the
 defined no-overflow domain; it does not silently change the global TVM policy.
 
-Indexed INT8/INT32 copies are also matched by the framework: rectangular tiles
+Indexed INT8/INT32/FP32 copies are also matched by the framework: rectangular tiles
 are tried first, then single-element DMA when Tensorize cannot prove a larger
 access map. This covers materialized slices, diagonals, permutations and repeats
 without CPU value copying. Such schedules can issue many commands and are not
@@ -345,6 +363,21 @@ The exact rebuilt libraries are preserved in `compiler-core-v1`, independently
 of the mutable CMake build directory. The new tests include original-input
 preservation, full bias trace replay, grouped short tiles and rejection of a
 deliberately misaligned SRAM program. The 51-operator audit remains pending.
+
+`device-relu-copy-v1` adds exhaustive INT8 ReLU, a prime-sized ReLU tail and
+FP32 copy/repeat/scalar-fill fixtures. Positive and wrong-oracle checks pass on
+Spike and RTL within the same short-run bounds. FP32 guest data and references
+are emitted and compared as raw unsigned words, including signaling/quiet NaN
+payloads, signed zero, infinities and subnormals. The guest also requires actual
+ReLU readout calls. `adapter-relu-v1` binds the new primitive and audits the
+object against hardware-loop instructions.
+
+`unit-relu-copy-regression-v1.log` passes all 130 collected Gemmini backend/app
+checks with the isolated optional XGBoost dependency. The additional
+`unit-relu-wait-v1.log` check verifies a CPU consumer after device ReLU, then
+deliberately removes completion and detects the wrong result. No additional
+C++ patch is introduced for these operations. None of these checks supplies a
+performance label or completes the remaining operator inventory.
 
 The migration remains incomplete until the inventory's remaining native
 admission, CPU/frontend explanations and final regression/target checks are

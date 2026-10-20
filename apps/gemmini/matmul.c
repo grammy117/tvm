@@ -35,8 +35,8 @@
 
 /* Load the selected generated header before the library. Do not change its bytes.
  * The pinned library parses normalization branches even when hardware support is
- * absent. This parsing fallback enables no feature: the only admitted activation
- * below is NO_ACTIVATION, and HAS_NORMALIZATIONS stays absent.
+ * absent. This parsing fallback enables no normalization feature. Readout uses
+ * either NO_ACTIVATION or the separately admitted exact INT8 ReLU path.
  */
 #include "include/gemmini_params.h"
 #ifdef HAS_NORMALIZATIONS
@@ -227,6 +227,18 @@ void tvm_gemmini_dma_spad_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t
   gemmini_config_st((uint64_t)stride);
   asm volatile("" ::: "memory");
   gemmini_extended_mvout(dst, row, cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_relu_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
+  /* Clear read_full_acc_row for scaled/narrow readout. Callers establish that
+   * every source value was widened from INT8; identity scaling is then exact.
+   */
+  uint32_t address = accumulator_address(row, 0) & ~(1U << (ADDR_LEN - 3));
+  gemmini_extended_config_st((uint64_t)stride, RELU, ACC_SCALE_IDENTITY);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvout(dst, address, cols, rows);
   asm volatile("" ::: "memory");
   if (wait) tvm_gemmini_end();
 }

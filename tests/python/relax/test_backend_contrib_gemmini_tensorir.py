@@ -71,14 +71,17 @@ static void flush(void) {
       }
     } else if(x.op==3) {
       check(x.c+x.m<=1024 && x.stride>=x.n);
-      int32_t* p=x.dst;
-      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { check(initialized[x.c+i][j]); p[i*x.stride+j]=acc[x.c+i][j]; }
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
+        check(initialized[x.c+i][j]);
+        memcpy((unsigned char*)x.dst+4*(i*x.stride+j), &acc[x.c+i][j], 4);
+      }
     } else if(x.op==4 || x.op==5) {
       check(x.c+x.m<=1024 && (x.stride==0 || x.stride>=x.n));
-      const int32_t* p=x.src;
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
         if(x.op==5)check(initialized[x.c+i][j]);
-        uint32_t bits=(uint32_t)p[i*x.stride+j]+(x.op==5?(uint32_t)acc[x.c+i][j]:0);
+        uint32_t bits;
+        memcpy(&bits,(const unsigned char*)x.src+4*(i*x.stride+j),4);
+        bits += x.op==5?(uint32_t)acc[x.c+i][j]:0;
         memcpy(&acc[x.c+i][j],&bits,sizeof(bits));initialized[x.c+i][j]=1;
       }
     } else if(x.op==6) {
@@ -89,6 +92,14 @@ static void flush(void) {
       check(x.a+x.m<=16384 && x.stride>=x.n);
       int8_t* p=x.dst;
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { check(loaded[x.a+i][j]);p[i*x.stride+j]=sp[x.a+i][j]; }
+    } else if(x.op==8) {
+      check(x.c+x.m<=1024 && x.stride>=x.n);
+      int8_t* p=x.dst;
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
+        int32_t v=acc[x.c+i][j];
+        check(initialized[x.c+i][j] && v>=-128 && v<=127);
+        p[i*x.stride+j]=wrong?v:(v<0?0:v);
+      }
     }
   }
   count=0;
@@ -129,6 +140,9 @@ void tvm_gemmini_dma_widen(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int6
 }
 void tvm_gemmini_dma_spad_out(int8_t* p,uint32_t a,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
   push((struct command){.op=7,.dst=p,.a=a,.m=m,.n=n,.stride=stride});if(wait)flush();
+}
+void tvm_gemmini_dma_relu_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
+  push((struct command){.op=8,.dst=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
 }
 """
 

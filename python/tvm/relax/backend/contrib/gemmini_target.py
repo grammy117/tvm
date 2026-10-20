@@ -42,6 +42,8 @@ class GemminiCapabilities:
     dataflow: str = "OS"
     hardware_loops: bool = False
     accumulator_load_scale: bool = False
+    full_width_readout: bool = True
+    readout_relu: bool = True
     params_sha256: str = "3758ae967af3a179497660970201093a7fb624be00173990ce33d3f5c38da924"
     config_sha256: str = "178c21ac741c89c08158efa71fb34da35d27b75bd50bde5116a5e19178f8391b"
 
@@ -54,7 +56,9 @@ class GemminiCapabilities:
             self.dataflow,
             self.hardware_loops,
             self.accumulator_load_scale,
-        ) != (16, 20, 8, 32, "OS", False, False):
+            self.full_width_readout,
+            self.readout_relu,
+        ) != (16, 20, 8, 32, "OS", False, False, True, True):
             raise ValueError("Unsupported Gemmini primitive ABI configuration")
         if not 0 < self.spad_rows <= 16384 or not 0 < self.acc_rows <= 1024:
             raise ValueError("Gemmini SRAM limits exceed the bound hardware profile")
