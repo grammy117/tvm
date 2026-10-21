@@ -345,7 +345,7 @@ class DTypeMutator : private ReplaceBufferMutator {
     auto it = buffer_var_map_.find(node->buffer->data.get());
     if (it != buffer_var_map_.end()) {
       node.CopyOnWrite()->buffer = it->second;
-      node.CopyOnWrite()->value = Cast(tgt_dtype_, node->value);
+      node.CopyOnWrite()->value = cast(tgt_dtype_, node->value);
     }
     return node;
   }

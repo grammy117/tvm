@@ -865,7 +865,9 @@ void Tensorize(ScheduleState self, const StmtSRef& sref, const TensorIntrin& int
   // Step 6: Update the cached flags.
   StmtSRef result = self->stmt2ref.at(block_realize->block.get());
   StmtSRef scope_root = tir::GetScopeRoot(self, result, /*require_stage_pipeline=*/false);
-  self->UpdateScopeBlockInfo(scope_root->StmtAs<BlockNode>()->body);
+  bool scope_block_affine_binding = self->IsAffineBlockBinding(scope_root);
+  self->UpdateScopeBlockInfo(tir::GetBlockRealize(self, scope_root));
+  self->block_info[scope_root].affine_binding = scope_block_affine_binding;
 }
 
 /******** InstructionKind Registration ********/
