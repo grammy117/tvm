@@ -348,6 +348,47 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             raise NotImplementedError("Q/DQ currently qualifies FP16/FP32 quantization input")
         return self.block_builder.emit_te(implementation, data, *parameters)
 
+    def _frozen_array(self, value):
+        """Read a source constant for an exactness proof, never a runtime input."""
+        visited = set()
+        while isinstance(value, relax.Var) and value not in visited:
+            visited.add(value)
+            frozen = self._frozen_values.get(value)
+            if frozen is not None:
+                value = frozen
+                break
+            value = self.block_builder.lookup_binding(value)
+        if isinstance(value, relax.Constant):
+            return value.data.numpy()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        return None
+
+    def _integer_bias(self, bias, depth, weight_codes):
+        """Commute an integral frozen FP32 bias only under an exact prefix bound."""
+        import numpy as np
+        from tvm import tir
+
+        values = self._frozen_array(bias)
+        if (
+            values is None
+            or values.dtype != np.float32
+            or not values.size
+            or not np.isfinite(values).all()
+            or not np.equal(values, np.rint(values)).all()
+            or not isinstance(depth, tir.IntImm)
+        ):
+            return None
+        bound = int(depth) * 128 * 128
+        weights = self._frozen_array(weight_codes)
+        if weights is not None and weights.dtype == np.int8 and weights.ndim >= 2:
+            bound = 128 * int(
+                np.abs(weights.astype("int64")).reshape(weights.shape[0], -1).sum(axis=1).max()
+            )
+        if bound + float(np.max(np.abs(values))) > (1 << 24):
+            return None
+        return self.block_builder.emit(relax.op.astype(bias, "int32"))
+
     def _integer_carrier_pair(self, lhs, rhs, depth):
         """Prove exact FP32 contraction of signed-byte integer carriers.
 
@@ -357,7 +398,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         """
         from tvm import tir
 
-        if not isinstance(depth, tir.IntImm) or not 0 < int(depth) <= (1 << 24) // (128 * 128):
+        if not isinstance(depth, tir.IntImm) or int(depth) <= 0:
             return None
         codes = []
         for value in (lhs, rhs):
@@ -372,6 +413,25 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             ):
                 return None
             codes.append(binding.args[0])
+        if int(depth) > (1 << 24) // (128 * 128):
+            # Learned Linear/Conv weights are output-major. A frozen right
+            # operand supplies a tighter, order-independent bound for every
+            # output and every reduction prefix: 128 * sum(abs(weight)).
+            # This is a proof from input constants, not a changed recipe.
+            import numpy as np
+
+            weights = self._frozen_array(codes[1])
+            if weights is None:
+                return None
+            if (
+                weights.dtype != np.int8
+                or weights.ndim < 2
+                or int(np.prod(weights.shape[1:])) != int(depth)
+            ):
+                return None
+            bound = 128 * np.abs(weights.astype("int64")).reshape(weights.shape[0], -1).sum(axis=1)
+            if not len(bound) or int(bound.max()) > (1 << 24):
+                return None
         return codes
 
     def _linear(self, node: fx.Node) -> relax.Var:
@@ -382,6 +442,12 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         if codes is None:
             return super()._linear(node)
         product = self.block_builder.emit(relax.op.linear(*codes, out_dtype="int32"))
+        integer_bias = (
+            self._integer_bias(bias, self.shape_of(lhs)[-1], codes[1]) if bias is not None else None
+        )
+        if integer_bias is not None:
+            product = self.block_builder.emit(relax.op.add(product, integer_bias))
+            bias = None
         result = self.block_builder.emit(relax.op.astype(product, "float32"))
         return result if bias is None else self.block_builder.emit(relax.op.add(result, bias))
 
@@ -586,10 +652,15 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                     )
                 )
         if integer_carriers is not None:
-            # Bias remains the source FP32 addition; only the proved exact
-            # contraction changes representation. No bias-grid guess occurs.
-            result = self.block_builder.emit(relax.op.astype(result, "float32"))
-            compute_dtype = "float32"
+            integer_bias = (
+                self._integer_bias(bias, depth, integer_carriers[1]) if bias is not None else None
+            )
+            if integer_bias is not None:
+                bias = integer_bias
+            else:
+                # Unproved/fractional bias keeps the source FP32 addition.
+                result = self.block_builder.emit(relax.op.astype(result, "float32"))
+                compute_dtype = "float32"
         if bias is not None:
             bias = self.block_builder.emit(relax.op.reshape(bias, (1, -1) + (1,) * dim))
             if dtype in ("int32", "int64"):
@@ -1435,8 +1506,13 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             elif spec.kind is torch.export.graph_signature.InputKind.USER_INPUT:
                 for node in exported_program.graph.find_nodes(op="placeholder", target=spec.target):
                     if node.name == name_hint:
-                        shape = node.meta["tensor_meta"].shape
-                        torch_dtype = node.meta["tensor_meta"].dtype
+                        metadata = node.meta.get("tensor_meta", node.meta.get("val"))
+                        if metadata is None or not hasattr(metadata, "shape"):
+                            raise ValueError(
+                                "Exported input lacks tensor shape/dtype metadata: " + name_hint
+                            )
+                        shape = metadata.shape
+                        torch_dtype = metadata.dtype
                         break
             else:
                 # PARAMETER or BUFFER
@@ -1512,9 +1588,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         self.env[node] = getattr(exported_program.graph_module, node.target)
                     elif node.op == "call_function":
                         func_name = node.target.__name__
-                        assert (
-                            func_name in self.convert_map
-                        ), f"Unsupported function type {func_name}"
+                        assert func_name in self.convert_map, (
+                            f"Unsupported function type {func_name}"
+                        )
                         self.env[node] = self.convert_map[func_name](node)
                     else:
                         raise ValueError(f"Unsupported op {node.op}")
@@ -1536,14 +1612,19 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 if tensor_name == spec.target:
                     bind_name = spec.arg.name
                     break
-            binding[bind_name] = tvm.nd.from_dlpack(tensor_value.detach())
+            # Loaded export archives may expose storage views with offsets
+            # below TVM's alignment guarantee. Own a contiguous Torch allocation
+            # before DLPack transfer; preserve every dtype's bits, including BF16.
+            binding[bind_name] = tvm.nd.from_dlpack(tensor_value.detach().contiguous().clone())
 
         mod = self.block_builder.get()
         mod = relax.transform.BindParams("main", binding)(mod)
 
         if keep_params_as_input:
             parameters = dict(exported_program.named_parameters())
-            params = [tvm.nd.from_dlpack(p.detach()) for p in parameters.values()]
+            params = [
+                tvm.nd.from_dlpack(p.detach().contiguous().clone()) for p in parameters.values()
+            ]
             mod["main"] = mod["main"].with_attr("params", params)
 
         return mod

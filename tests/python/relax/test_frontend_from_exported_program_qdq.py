@@ -129,6 +129,108 @@ def test_integer_carrier_convolution_preserves_floating_bias():
     check(Model(), (a, b, torch.tensor([-0.25, 1.75, 0.0, -1.5])))
 
 
+@pytest.mark.parametrize("weight_code,integer", [(1, True), (-128, False)])
+def test_frozen_weight_bounds_extend_exact_carrier_reductions(weight_code, integer):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.full((3, 2048), weight_code, dtype=torch.int8))
+
+        def forward(self, x):
+            a = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                x, 1.0, 0, -128, 127, torch.int8
+            )
+            b = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.weight, 1.0, 0, -128, 127, torch.int8
+            )
+            return torch.nn.functional.linear(a, b)
+
+    x = torch.full((2, 2048), -128, dtype=torch.int8)
+    mod = check(Model(), (x,))
+    products = []
+    relax.analysis.post_order_visit(
+        mod["main"],
+        lambda node: products.append(node)
+        if isinstance(node, relax.Call) and node.op == tvm.ir.Op.get("relax.matmul")
+        else None,
+    )
+    assert len(products) == 1
+    assert (products[0].attrs.out_dtype == "int32") == integer
+
+
+def test_serialized_export_owns_aligned_constants_and_restores_input_metadata(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("offset_constant", torch.arange(18, dtype=torch.float32)[1:])
+
+        def forward(self, values):
+            return values + self.offset_constant
+
+    values = torch.arange(17, dtype=torch.float32)
+    path = tmp_path / "offset.pt2"
+    torch.export.save(torch.export.export(Model(), (values,)), path)
+    script = """
+import sys, torch, tvm, numpy as np
+from tvm import relax
+from tvm.relax.frontend.torch import from_exported_program
+loaded = torch.export.load(sys.argv[1])
+for node in loaded.graph.nodes:
+    node.meta.pop('tensor_meta', None)
+mod = from_exported_program(loaded, unwrap_unit_return_tuple=True)
+for value in loaded.state_dict.values():
+    value.zero_()
+vm = relax.VirtualMachine(relax.build(mod, 'llvm'), tvm.cpu())
+actual = vm['main'](tvm.nd.array(np.arange(17, dtype='float32'))).numpy()
+np.testing.assert_array_equal(actual, np.arange(17, dtype='float32') * 2 + 1)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(path)],
+        env=dict(os.environ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stdout
+
+
+@pytest.mark.parametrize(
+    "bias,integer",
+    [([3.0, -5.0, 32775.0], True), ([0.25, -1.75, 0.0], False), ([16777216.0, 0.0, 0.0], False)],
+)
+def test_frozen_bias_normalization_requires_integrality_and_fp32_prefix_bound(bias, integer):
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.ones((3, 17), dtype=torch.int8))
+            self.register_buffer("bias", torch.tensor(bias, dtype=torch.float32))
+
+        def forward(self, x):
+            a = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                x, 1.0, 0, -128, 127, torch.int8
+            )
+            b = torch.ops.quantized_decomposed.dequantize_per_tensor.default(
+                self.weight, 1.0, 0, -128, 127, torch.int8
+            )
+            return torch.nn.functional.linear(a, b, self.bias)
+
+    mod = check(Model(), (torch.full((2, 17), -128, dtype=torch.int8),))
+    additions = []
+    relax.analysis.post_order_visit(
+        mod["main"],
+        lambda node: additions.append(node)
+        if isinstance(node, relax.Call) and node.op == tvm.ir.Op.get("relax.add")
+        else None,
+    )
+    assert len(additions) == 1
+    assert (additions[0].struct_info.dtype == "int32") == integer
+
+
 @pytest.mark.parametrize("weighted,epsilon", [(True, None), (False, 1e-5)])
 def test_fp32_rms_norm_and_flatten(weighted, epsilon):
     class Model(torch.nn.Module):
