@@ -5,6 +5,12 @@ The original checkout and branch remain unchanged. The old template backend is
 available as `prepare_gemmini_graph(..., route="legacy")` and
 `prepare_gemmini_graph_legacy`; its tests explicitly select that route.
 
+> Historical migration record: the implementation and qualification tables below
+> describe the earlier source freeze, including explicit movement-capability
+> fixtures. Current production placement, sampled MetaSchedule, weight packing,
+> readout fusion and compiler packaging are documented in [EL4_STATUS.md](EL4_STATUS.md)
+> and [FIRESIM.md](FIRESIM.md). Do not interpret the old DMA placements as current defaults.
+
 ## Required end state
 
 This migration is complete only after the framework integration, requested

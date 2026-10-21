@@ -247,6 +247,7 @@ def capture(root, name, *, seed=1907, calibration_count=8):
         "input_dtypes": [str(value.dtype) for value in inputs],
         "calibration_count": calibration_count,
         "seed": seed,
+        "weight_initialization": "benchmark_el4.seeded_weights: ((index*37 + module_ordinal*101 + field*53)%251 - 125)/512; overrides learned public defaults",
         "scope": "reduced_synthetic_compiler_diagnostic; no_pretrained_accuracy_claim",
         "quantization": stats,
         "aten_ops": dict(

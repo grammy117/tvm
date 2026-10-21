@@ -32,13 +32,13 @@ LIMITS = {
     ),
     "aten.conv2d.default": (
         "FP32 carriers of signed INT8 codes",
-        "Array only after proof; packing, FP32 bias and scale remain CPU",
-        "Both scale-one/zero-point-zero INT8 carriers; K <= 1024 proves exact FP32 prefixes. General FP32 convolution stays CPU. No LOOP_CONV or fused pool.",
+        "Array after integer-carrier proof; runtime windows on CPU; frozen weight packing folds at compile time",
+        "Scale-one/zero-point-zero INT8 carriers: K <= 1024 or frozen-weight L1 bound proves exact FP32 prefixes. Proven integral bias may preload; eligible uniform-scale RNE/INT8 ReLU epilogues fuse by a full-INT32 proof. General floating conv stays CPU; no LOOP_CONV or fused pool.",
     ),
     "aten.linear.default": (
         "FP32 carriers of signed INT8 codes",
-        "Array only after proof; FP32 bias/scale remain CPU",
-        "Same carrier proof and K <= 1024. No implicit calibration or FP32-to-INT8 approximation. INT32 bias preload requires a separate integer graph.",
+        "Array after carrier proof; integral bias and exact scalar readout may fuse",
+        "K <= 1024 or frozen-weight L1 prefix proof; integral bias needs its own FP32 exactness bound. Fractional/unproved bias and per-channel/dynamic readout scales remain explicit CPU math; no implicit calibration.",
     ),
     "aten.matmul.default": (
         "FP32 in retained source sites",
@@ -47,7 +47,7 @@ LIMITS = {
     ),
     "quantized_decomposed.quantize_per_tensor.default": (
         "FP32 -> INT8",
-        "CPU multiply/RNE/add/clamp/cast",
+        "CPU multiply/RNE/add/clamp/cast unless the exact scalar contraction readout proof admits fusion",
         "Finite positive static scale, bounded integer zero point. Exact source rounding; not searched. Tensor-valued qparams and runtime per-channel quantization remain unsupported.",
     ),
     "quantized_decomposed.dequantize_per_tensor.default": (
@@ -57,13 +57,13 @@ LIMITS = {
     ),
     "aten.round.default": (
         "FP32 in these graphs",
-        "CPU nearbyint; ties to even",
+        "CPU nearbyint; bounded guarded byte quantization uses clamp plus hardware RNE conversion",
         "RNE floating environment; scalar/tensor rounding stays distinct from hardware integer-shift RNE and portable half-up.",
     ),
     "aten.relu.default": (
         "FP32 carrier/epilogue",
-        "CPU arithmetic in these recipes",
-        "Registered native ReLU is INT8 -> INT8 through exact widening and identity-scale narrow readout; general scaled INT32 readout is absent.",
+        "Observed source ReLU; placement must be read from the function-level dispatch evidence",
+        "FP32 ReLU alone has no native arithmetic implementation. The two eligible CNN requant sites now fuse into scalar scaled ReLU readout after a full-INT32-domain threshold proof. Arbitrary floating ReLU, per-lane scales, nonzero zero points and unequal rounding chains retain CPU math.",
     ),
     "aten.add.Tensor": (
         "FP32 in recipe graphs",
@@ -93,7 +93,7 @@ LIMITS = {
     "aten.clamp.default": (
         "FP32 before cast",
         "CPU",
-        "Saturating narrow DMA alone does not reproduce the explicit source FP32 multiply/RNE/clamp sequence.",
+        "Only a proved integer-derived scalar FP32 RNE/clamp/cast chain can fuse into narrow readout; general clamp remains CPU.",
     ),
     "aten.exp.default": (
         "FP32",
@@ -187,8 +187,8 @@ for name in (
 ):
     LIMITS["aten." + name] = (
         "INT8, INT32 or FP32 payloads in these graphs",
-        "Metadata when folded; otherwise proved DMA regions plus any CPU reindexing",
-        "Static positive spans, bounded region proof, no hidden aliases/in-place overlap. Contiguous columns/row strides use rectangles; indexed cases may degrade to scalar DMA. Not a profitability claim.",
+        "Metadata when folded; materialized copies default to CPU; native DMA is explicit or measured",
+        "Static positive spans and bounded nonoverlap proof. Native copies require opt-in or a measured record; rectangular failure keeps CPU fallback. Scalar DMA is an explicit diagnostic choice, never an implicit fallback.",
     )
 for name in ("aten._to_copy.default", "aten.to.dtype"):
     LIMITS[name] = (
@@ -304,6 +304,7 @@ def main():
     ops = [
         {
             "op": op,
+            "contract_source": "maintained semantic explanation in report_el4.LIMITS; not inferred dispatch",
             "dtype": LIMITS[op][0],
             "execution": LIMITS[op][1],
             "limits": LIMITS[op][2],
@@ -313,6 +314,7 @@ def main():
     ]
     report = {
         "scope": "reduced_synthetic_recipe_diagnostics; not full model or FireSim qualification",
+        "operator_table_scope": "Operator spellings/site counts are observed. Dtype/execution/limit prose is maintained contract documentation; exact dispatch appears in function_placement_and_refusals, not a proven source-op-to-function mapping.",
         "benchmarks": benchmarks,
         "ops": ops,
         "runs": runs,
@@ -360,7 +362,9 @@ def main():
         "",
         "## Operator contracts",
         "",
-        cells(["Operation", "Actual dtype", "Where its work executes", "Specific limits"]),
+        "Operator spellings and occurrence counts come from captures. The descriptions below are maintained semantic contracts, not receipt-derived per-op dispatch. Fusion can merge source ops; consult each benchmark's function dispatch evidence for measured placement.",
+        "",
+        cells(["Observed operation", "Contract dtype", "Execution contract", "Specific limits"]),
         cells(["---"] * 4),
     ]
     lines += [cells([row[key] for key in ("op", "dtype", "execution", "limits")]) for row in ops]

@@ -21,19 +21,24 @@ under the License.
 
 The `gemmini/tensorir` migration changes the default `prepare_gemmini_graph`
 route to mathematical legalization/fusion followed by structural TensorIR
-scheduling. [TENSORIR.md](TENSORIR.md) records that architecture, its current
-verification and the outstanding operator audit. The original template path is
+scheduling. [EL4_STATUS.md](EL4_STATUS.md) records current placement, scheduling, numerical
+contracts and reviewer corrections. [FIRESIM.md](FIRESIM.md) documents the offline
+compiler, portable archive, guarded boot ELFs and deployment bindings.
+[TENSORIR.md](TENSORIR.md) retains the earlier functional migration audit. The original template path is
 preserved as `route="legacy"` and `prepare_gemmini_graph_legacy`; the template
 scheduling/search recipes below describe that preserved route.
 
-Work belongs on `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
+The current compiler branch is `gemmini/tensorir`; the older setup and template recipes below refer to `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
 
 | Location | Integration responsibility |
 | --- | --- |
 | `python/tvm/relax/backend/contrib/gemmini.py` | Matmul admission, lowering and graph optimization around the device boundary. |
 | `python/tvm/relax/backend/contrib/gemmini_conv.py` | Semantic convolution packing, matmul decomposition and layout restoration. |
 | `python/tvm/relax/backend/contrib/gemmini_schedule.py` | Semantic tiled TIR, primitive tensorization and resource contracts. |
-| `python/tvm/relax/backend/contrib/gemmini_tuning.py` | Bounded candidates, structural features, correctness gates and learned ranking. |
+| `python/tvm/relax/backend/contrib/gemmini_tuning.py` | Preserved legacy template search. |
+| `gemmini_tensorir.py`, `gemmini_intrin.py`, `gemmini_target.py` in the same contrib directory | Current mathematical scheduling, TensorIntrins, scopes and capability identity. |
+| `gemmini_meta_schedule.py`, `gemmini_search.py`, `gemmini_dse.py` | Current standard sampled/evolutionary tuning, small sweep and checked replay. |
+| `gemmini_layout.py`, `gemmini_epilogue.py` | Frozen layout folding and exact scaled-readout proof/normalization. |
 | `apps/gemmini/` | C primitives, static graph export and host/simulator verification recipes. |
 | `tests/python/relax/test_backend_contrib_gemmini*.py` | Focused admission, scheduling, graph, export and search regressions. |
 
