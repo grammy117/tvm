@@ -46,6 +46,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         chunks=(8, 16),
         row_tiles=(1, 2, 4),
         col_tiles=(1, 2, 4),
+        include_cpu=False,
     ):
         self.capabilities = capabilities or GemminiCapabilities()
         self.orders = tuple(orders)
@@ -53,7 +54,14 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         self.chunks = tuple(chunks)
         self.row_tiles = tuple(row_tiles)
         self.col_tiles = tuple(col_tiles)
+        if type(include_cpu) is not bool:
+            raise ValueError("include_cpu must be a boolean")
+        self.include_cpu = include_cpu
         self.target = None
+
+    def _alternatives(self, sch, candidates):
+        """Expose CPU execution as an explicit measured placement alternative."""
+        return [sch] + candidates if self.include_cpu else candidates
 
     def _initialize_with_tune_context(self, context):
         self.target = context.target
@@ -86,7 +94,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
                         candidate = sch.copy()
                         transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
                         candidates.append(candidate)
-                return candidates
+                return self._alternatives(sch, candidates)
             pointwise = elementwise_blocks(func)
             if pointwise and sch.get(block).same_as(pointwise[0][0]):
                 candidates, traces = [], set()
@@ -102,7 +110,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
                         candidate = sch.copy()
                         transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
                         candidates.append(candidate)
-                return candidates or [sch]
+                return self._alternatives(sch, candidates) if candidates else [sch]
             return [sch]
         if len(matches) != 1 or not sch.get(block).same_as(matches[0][0]):
             return [sch]
@@ -126,7 +134,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
                 continue
             transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
             results.append(candidate)
-        return results
+        return self._alternatives(sch, results)
 
     def clone(self):
         return GemminiScheduleRule(
@@ -136,6 +144,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             self.chunks,
             self.row_tiles,
             self.col_tiles,
+            self.include_cpu,
         )
 
 
@@ -162,11 +171,11 @@ class VerifyGemminiMemory(ms.postproc.PyPostproc):
         return VerifyGemminiMemory(self.capabilities)
 
 
-def gemmini_space_generator(capabilities=None):
+def gemmini_space_generator(capabilities=None, **rule_options):
     """Return a normal PostOrderApply generator with target-specific rules."""
     capabilities = capabilities or GemminiCapabilities()
     return ms.space_generator.PostOrderApply(
-        sch_rules=[GemminiScheduleRule(capabilities)],
+        sch_rules=[GemminiScheduleRule(capabilities, **rule_options)],
         postprocs=[ms.postproc.RewriteTensorize(), VerifyGemminiMemory(capabilities)],
         mutator_probs={},
     )

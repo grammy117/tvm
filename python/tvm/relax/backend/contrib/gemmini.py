@@ -263,7 +263,7 @@ def prepare_gemmini_graph_legacy(mod, tile_i=1, tile_j=1, optimize=True, tile_ch
 
 def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None,
                           *, route="tensorir", capabilities=None, order="ij", schedule_options=None,
-                          report=None):
+                          report=None, bias_preload=True):
     """Prepare Gemmini through mathematical TensorIR; retain explicit legacy mode.
 
     The default route legalizes/fuses ordinary computations before structural
@@ -271,6 +271,8 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
     explicitly selected regression route, never silently ignored.
     """
     if route == "legacy":
+        if bias_preload is not True:
+            raise ValueError("bias_preload choices require route='tensorir'")
         if schedule_options:
             raise ValueError("TensorIR schedule options require route='tensorir'")
         return prepare_gemmini_graph_legacy(mod, tile_i, tile_j, optimize, tile_choices)
@@ -283,7 +285,8 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
     from .gemmini_tensorir import prepare_gemmini_tensorir_graph  # pylint: disable=import-outside-toplevel
 
     return prepare_gemmini_tensorir_graph(mod, optimize=optimize, capabilities=capabilities,
-                                         order=order, schedule_options=schedule_options, report=report)
+                                         order=order, schedule_options=schedule_options, report=report,
+                                         bias_preload=bias_preload)
 
 
 @register_pipeline("gemmini")

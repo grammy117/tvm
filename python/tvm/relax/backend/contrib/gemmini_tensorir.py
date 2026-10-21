@@ -716,7 +716,7 @@ class ScheduleGemminiTensorIR:
                 workload = tvm.IRModule({"main": func})
                 record = (
                     database.query_tuning_record(workload, target, workload_name=gv.name_hint)
-                    if database
+                    if database is not None
                     else None
                 )
                 # v0.19's default database query ignores its target argument.
@@ -732,6 +732,37 @@ class ScheduleGemminiTensorIR:
                     if record is not None
                     else None
                 )
+                if selected is not None:
+                    bound_profile = selected.mod["main"].body.block.annotations.get(
+                        "gemmini_measurement_profile"
+                    )
+                    if bound_profile is not None and str(bound_profile) != self.capabilities.fingerprint:
+                        raise ValueError("Selected cycle schedule belongs to another hardware profile")
+                    native_calls = []
+                    tir.stmt_functor.post_order_visit(
+                        selected.mod["main"].body,
+                        lambda node: native_calls.append(node)
+                        if isinstance(node, tir.Call)
+                        and node.op == tvm.ir.Op.get("tir.call_extern")
+                        and node.args[0].value.startswith("tvm_gemmini_")
+                        else None,
+                    )
+                    if not native_calls:
+                        # The target rule can also expose an ordinary CPU
+                        # candidate. Never label it native or insert an
+                        # accelerator envelope merely because its database
+                        # record carries this target's measurement identity.
+                        mod.update_func(gv, selected.mod["main"])
+                        self.report.append(
+                            {
+                                "function": gv.name_hint,
+                                "placement": "cpu",
+                                "origin": "TVM MetaSchedule database",
+                                "reason": "Selected CPU schedule from matching tuning record",
+                                "trace": selected.trace.as_json(),
+                            }
+                        )
+                        continue
                 if selected is not None:
                     result = lower_tensorir_schedule(
                         func,
@@ -781,13 +812,12 @@ class ScheduleGemminiTensorIR:
         return mod
 
 
-def prepare_gemmini_tensorir_graph(
-    mod, *, optimize=True, capabilities=None, order="ij", schedule_options=None, report=None
-):
-    """Use normal mathematical legalization/fusion before Gemmini scheduling."""
+def prepare_gemmini_tensorir_workloads(mod, *, optimize=True, bias_preload=True):
+    """Expose the same mathematical workloads used by compile and DSE paths."""
     from tvm import relax  # pylint: disable=import-outside-toplevel
-    from .gemmini import _inline_cpu_producers  # pylint: disable=import-outside-toplevel
 
+    if type(optimize) is not bool:
+        raise ValueError("optimize must be a boolean")
     passes = [relax.transform.LegalizeOps(), relax.transform.AnnotateTIROpPattern()]
     if optimize:
         passes.extend(
@@ -803,8 +833,24 @@ def prepare_gemmini_tensorir_graph(
     mod = tvm.transform.Sequential(passes)(mod)
     from .gemmini_bias import CanonicalizeGemminiBias
 
+    if type(bias_preload) is not bool:
+        raise ValueError("bias_preload must be a boolean")
     references, normalizations = {}, {}
-    mod = CanonicalizeGemminiBias(references=references, report=normalizations)(mod)
+    if bias_preload:
+        mod = CanonicalizeGemminiBias(references=references, report=normalizations)(mod)
+    return mod, references, normalizations
+
+
+def prepare_gemmini_tensorir_graph(
+    mod, *, optimize=True, capabilities=None, order="ij", schedule_options=None, report=None,
+    bias_preload=True,
+):
+    """Use normal mathematical legalization/fusion before Gemmini scheduling."""
+    from .gemmini import _inline_cpu_producers  # pylint: disable=import-outside-toplevel
+
+    mod, references, normalizations = prepare_gemmini_tensorir_workloads(
+        mod, optimize=optimize, bias_preload=bias_preload
+    )
     mod = ScheduleGemminiTensorIR(
         capabilities=capabilities,
         order=order,
