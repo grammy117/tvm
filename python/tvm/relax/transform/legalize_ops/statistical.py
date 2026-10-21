@@ -16,6 +16,7 @@
 # under the License.
 # pylint: disable=invalid-name
 """Default legalization function for statistical operators."""
+
 from typing import List
 from tvm import topi, tir, te
 from ...block_builder import BlockBuilder
@@ -38,9 +39,39 @@ def _compute_shape_prod(x: te.Tensor, axis: List[tir.IntImm]) -> tir.PrimExpr:
     return shape_prod
 
 
+def _reduction_axes(x, axis):
+    return (
+        tuple(range(len(x.shape))) if axis is None else tuple(int(i) % len(x.shape) for i in axis)
+    )
+
+
+def _empty_reduction_shape(x, axes, keepdims):
+    return tuple(
+        tir.const(1, extent.dtype) if i in axes else extent
+        for i, extent in enumerate(x.shape)
+        if keepdims or i not in axes
+    )
+
+
+def _te_sum(x: te.Tensor, axis: List[tir.IntImm], keepdims: bool) -> te.Tensor:
+    axes = _reduction_axes(x, axis)
+    if not axes:
+        return topi.identity(x)
+    if any(isinstance(x.shape[i], tir.IntImm) and int(x.shape[i]) == 0 for i in axes):
+        # An init nested in a zero-trip reduction loop never executes. Express
+        # the additive identity as an ordinary fill over the output domain.
+        return topi.full(_empty_reduction_shape(x, axes, keepdims), x.dtype, 0)
+    return topi.sum(x, axis, keepdims)
+
+
 def _te_mean(x: te.Tensor, axis: List[tir.IntImm], keepdims: bool) -> te.Tensor:
+    axes = _reduction_axes(x, axis)
+    if not axes:
+        return topi.identity(x)
+    if any(isinstance(x.shape[i], tir.IntImm) and int(x.shape[i]) == 0 for i in axes):
+        return topi.full(_empty_reduction_shape(x, axes, keepdims), x.dtype, float("nan"))
     shape_prod = _compute_shape_prod(x, axis)
-    res_sum = topi.sum(x, axis, keepdims)
+    res_sum = _te_sum(x, axis, keepdims)
     return topi.divide(res_sum, shape_prod)
 
 
@@ -84,4 +115,10 @@ def _variance(bb: BlockBuilder, call: Call) -> Expr:
 register_legalize("relax.max", _statistical(topi.max))
 register_legalize("relax.min", _statistical(topi.min))
 register_legalize("relax.prod", _statistical(topi.prod))
-register_legalize("relax.sum", _statistical(topi.sum))
+
+
+@register_legalize("relax.sum")
+def _sum(bb: BlockBuilder, call: Call) -> Expr:
+    return bb.call_te(
+        _te_sum, call.args[0], call.attrs.axis, call.attrs.keepdims, primfunc_name_hint="sum"
+    )
