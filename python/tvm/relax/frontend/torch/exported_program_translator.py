@@ -35,6 +35,151 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     from torch import fx
 
+    def _captured_dtype(self, node: fx.Node) -> str:
+        captured = node.meta.get("val")
+        if not isinstance(captured, torch.Tensor):
+            raise NotImplementedError("Arithmetic import requires the captured output dtype")
+        return self._convert_data_type(captured.dtype)
+
+    def _numeric_operand(self, value, dtype):
+        if isinstance(value, relax.Expr):
+            return (
+                value
+                if value.struct_info.dtype == dtype
+                else self.block_builder.emit(relax.op.astype(value, dtype))
+            )
+        if dtype.startswith("int"):
+            bits = tvm.DataType(dtype).bits
+            value = (int(value) + (1 << (bits - 1))) % (1 << bits) - (1 << (bits - 1))
+        return relax.const(value, dtype)
+
+    def _numeric_values(self, lhs, rhs, dtype, operation, alpha=1):
+        import numpy as np
+        from ._numeric import binary_int64, binary_narrow_integer, fused_alpha_add
+
+        if dtype == "bool":
+            lhs, rhs = self._numeric_operand(lhs, dtype), self._numeric_operand(rhs, dtype)
+            if operation == "multiply":
+                return self.block_builder.emit(relax.op.logical_and(lhs, rhs))
+            if operation == "add":
+                scaled = rhs if alpha else relax.const(False, "bool")
+                return self.block_builder.emit(relax.op.logical_or(lhs, scaled))
+            raise NotImplementedError("Boolean subtraction is not a valid Torch operation")
+        if dtype.startswith("int"):
+            lhs, rhs = self._numeric_operand(lhs, dtype), self._numeric_operand(rhs, dtype)
+            bits = tvm.DataType(dtype).bits
+            if not isinstance(alpha, int) or not -(1 << (bits - 1)) <= alpha < (1 << (bits - 1)):
+                raise NotImplementedError("Integer alpha must fit the result's signed dtype")
+            if dtype == "int64":
+                return self.block_builder.emit_te(
+                    binary_int64,
+                    lhs,
+                    rhs,
+                    operation,
+                    alpha,
+                    primfunc_name_hint="wrapping_" + operation,
+                )
+            # Two signed INT32 operands and an admitted INT32 alpha have a
+            # product-plus-input within INT64. Narrow only after the arithmetic.
+            return self.block_builder.emit_te(
+                binary_narrow_integer,
+                lhs,
+                rhs,
+                operation,
+                alpha,
+                primfunc_name_hint="wrapping_" + operation,
+            )
+        opmath = "float32" if dtype == "float16" else dtype
+        # Add/sub convert a weak scalar to the result dtype. Reduced-precision
+        # mul/div preserve a scalar in opmath precision (ATen BinaryOpsKernel).
+        if dtype == "float16" and operation in ("add", "subtract"):
+            lhs, rhs = self._numeric_operand(lhs, dtype), self._numeric_operand(rhs, dtype)
+        lhs, rhs = self._numeric_operand(lhs, opmath), self._numeric_operand(rhs, opmath)
+        if operation in ("add", "subtract"):
+            if dtype == "float16" and alpha not in (1, -1):
+                raise NotImplementedError(
+                    "Exact FP16 nonunit alpha is unqualified: the captured CPU reference "
+                    "uses different scalar-tail and vector intermediate rounding"
+                )
+            alpha = float(np.float16(alpha)) if dtype == "float16" else alpha
+            alpha = -alpha if operation == "subtract" else alpha
+            if alpha == 1:
+                result = self.block_builder.emit(relax.op.add(lhs, rhs))
+            elif alpha == -1:
+                result = self.block_builder.emit(relax.op.subtract(lhs, rhs))
+            else:
+                result = self.block_builder.emit_te(
+                    fused_alpha_add, lhs, rhs, alpha, primfunc_name_hint="alpha_add"
+                )
+        else:
+            op = relax.op.multiply if operation == "multiply" else relax.op.divide
+            result = self.block_builder.emit(op(lhs, rhs))
+        return self._numeric_operand(result, dtype)
+
+    def _numeric_binary(self, node: fx.Node, *, operation: str) -> relax.Var:
+        args = self.retrieve_args(node)
+        alpha = args[2] if len(args) > 2 else node.kwargs.get("alpha", 1)
+        return self._numeric_values(args[0], args[1], self._captured_dtype(node), operation, alpha)
+
+    def _numeric_negative(self, node: fx.Node) -> relax.Var:
+        x = self.retrieve_args(node)[0]
+        dtype = self._captured_dtype(node)
+        if dtype.startswith("int"):
+            return self._numeric_values(0, x, dtype, "subtract")
+        return self.block_builder.emit(relax.op.negative(x))
+
+    def _matmul_values(self, lhs, rhs, dtype):
+        from tvm import tir
+        from ._numeric import modular_matmul
+
+        prototype = self.block_builder.normalize(relax.op.matmul(lhs, rhs, out_dtype=dtype))
+        shape = prototype.struct_info.shape
+        depth = self.shape_of(lhs)[-1]
+        if isinstance(depth, tir.IntImm) and int(depth) == 0:
+            return self.block_builder.emit(relax.op.zeros(shape, dtype))
+        if dtype in ("int32", "int64"):
+            if not isinstance(depth, tir.IntImm):
+                raise NotImplementedError(
+                    "Modular integer matmul requires a static reduction extent to establish empty initialization"
+                )
+            return self.block_builder.emit_te(
+                modular_matmul, lhs, rhs, tuple(shape), primfunc_name_hint="modular_matmul"
+            )
+        compute_dtype = "float32" if dtype == "float16" else dtype
+        if dtype == "int8":
+            if not isinstance(depth, tir.IntImm):
+                raise NotImplementedError("INT8 matmul requires a static accumulation bound")
+            max_product = (1 << (tvm.DataType(lhs.struct_info.dtype).bits - 1)) ** 2
+            compute_dtype = "int32" if int(depth) * max_product <= (1 << 31) - 1 else "int64"
+            if int(depth) * max_product > (1 << 63) - 1:
+                raise NotImplementedError("INT8 matmul exceeds the proven INT64 prefix bound")
+        result = self.block_builder.emit(relax.op.matmul(lhs, rhs, out_dtype=compute_dtype))
+        return self._numeric_operand(result, dtype)
+
+    def _matmul(self, node: fx.Node) -> relax.Var:
+        lhs, rhs = self.retrieve_args(node)
+        return self._matmul_values(lhs, rhs, self._captured_dtype(node))
+
+    def _addmm(self, node: fx.Node) -> relax.Var:
+        bias, lhs, rhs = self.retrieve_args(node)
+        dtype = self._captured_dtype(node)
+        alpha, beta = node.kwargs.get("alpha", 1), node.kwargs.get("beta", 1)
+        shape = self.block_builder.normalize(
+            relax.op.matmul(lhs, rhs, out_dtype=dtype)
+        ).struct_info.shape
+        if alpha == 0:
+            if beta == 0:
+                return self.block_builder.emit(relax.op.zeros(shape, dtype))
+            scaled = bias if beta == 1 else self._numeric_values(bias, beta, dtype, "multiply")
+            return self.block_builder.emit(relax.op.broadcast_to(scaled, shape))
+        product = self._matmul_values(lhs, rhs, dtype)
+        if alpha != 1:
+            product = self._numeric_values(product, alpha, dtype, "multiply")
+        if beta == 0:
+            return product
+        scaled = bias if beta == 1 else self._numeric_values(bias, beta, dtype, "multiply")
+        return self._numeric_values(scaled, product, dtype, "add")
+
     ########## Unary Ops ##########
 
     def _hardtanh(self, node: fx.Node) -> relax.Expr:
@@ -395,7 +540,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "hardtanh.default": self._hardtanh,
             "leaky_relu.default": self._leakyrelu,
             "log_softmax.int": self._log_softmax,
-            "neg.default": self._unary_op(relax.op.negative),
+            "neg.default": self._numeric_negative,
             "relu.default": self._unary_op(relax.op.nn.relu),
             "round.default": self._round,
             "rsqrt.default": self._unary_op(relax.op.rsqrt),
@@ -410,30 +555,31 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "tril.default": self._tril_triu(relax.op.tril),
             "triu.default": self._tril_triu(relax.op.triu),
             # binary
-            "add.Tensor": self._binary_op(relax.op.add, operator.add),
-            "div.Tensor": self._binary_op(relax.op.divide, operator.truediv),
+            "add.Tensor": partial(self._numeric_binary, operation="add"),
+            "add.Scalar": partial(self._numeric_binary, operation="add"),
+            "div.Tensor": partial(self._numeric_binary, operation="divide"),
+            "div.Scalar": partial(self._numeric_binary, operation="divide"),
             "eq.Scalar": self._binary_op(relax.op.equal, operator.eq),
             "eq.Tensor": self._binary_op(relax.op.equal, operator.eq),
             "floor_divide.default": self._binary_op(relax.op.floor_divide, operator.floordiv),
             "lt.Scalar": self._binary_op(relax.op.less, operator.lt),
             "lt.Tensor": self._binary_op(relax.op.less, operator.lt),
-            "matmul.default": self._binary_op(
-                partial(relax.op.linear_algebra.matmul, out_dtype="float32"), operator.matmul
-            ),
+            "matmul.default": self._matmul,
+            "mm.default": self._matmul,
             "max.other": self._binary_op(relax.op.maximum, max),
-            "mul.Tensor": self._binary_op(relax.op.multiply, operator.mul),
+            "mul.Tensor": partial(self._numeric_binary, operation="multiply"),
+            "mul.Scalar": partial(self._numeric_binary, operation="multiply"),
             "pow.Tensor_Scalar": self._binary_op(relax.op.power, operator.pow),
             "pow.Tensor_Tensor": self._binary_op(relax.op.power, operator.pow),
-            "sub.Tensor": self._binary_op(relax.op.subtract, operator.sub),
+            "sub.Tensor": partial(self._numeric_binary, operation="subtract"),
+            "sub.Scalar": partial(self._numeric_binary, operation="subtract"),
             # neural network
             "_native_batch_norm_legit_no_training.default": self._batch_norm_legit_no_training,
             "adaptive_avg_pool2d.default": self._adaptive_avg_pool2d,
             "addmm.default": self._addmm,
             "avg_pool2d.default": self._avg_pool2d,
             "baddbmm.default": self._baddbmm,
-            "bmm.default": self._binary_op(
-                partial(relax.op.linear_algebra.matmul, out_dtype="float32"), operator.matmul
-            ),
+            "bmm.default": self._matmul,
             "conv_transpose1d.default": self._conv_transpose1d,
             "conv_transpose2d.input": self._conv_transpose2d,
             "conv1d.default": self._conv1d,
