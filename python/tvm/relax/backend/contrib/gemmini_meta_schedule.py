@@ -66,6 +66,8 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
 
     def apply(self, sch, block):
         func = sch.mod["main"]
+        if sch.get(sch.get_block("root")).annotations.get("gemmini_regions_scheduled", False):
+            return [sch]
         matches = contraction_block(func) or _normalizable_contractions(func)
         if not matches:
             reductions = reduction_blocks(func)
@@ -86,7 +88,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
                         candidates.append(candidate)
                 return candidates
             pointwise = elementwise_blocks(func)
-            if len(pointwise) == 1 and sch.get(block).same_as(pointwise[0][0]):
+            if pointwise and sch.get(block).same_as(pointwise[0][0]):
                 candidates, traces = [], set()
                 for scalar in (False, True):
                     candidate = sch.copy()

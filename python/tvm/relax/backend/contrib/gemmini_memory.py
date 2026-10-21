@@ -155,6 +155,35 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
 
     tir.stmt_functor.post_order_visit(func.body, cpu_access)
 
+    dma_writes, dma_reads = {}, set()
+
+    def dma_access(node):
+        if not isinstance(node, tir.Call) or node.op != tvm.ir.Op.get("tir.call_extern"):
+            return
+        symbol = node.args[0].value
+        output = symbol in (
+            "tvm_gemmini_dma_out",
+            "tvm_gemmini_dma_spad_out",
+            "tvm_gemmini_dma_relu_out",
+        )
+        if not output and symbol not in (
+            "tvm_gemmini_dma_a",
+            "tvm_gemmini_dma_b",
+            "tvm_gemmini_dma_acc_write",
+            "tvm_gemmini_dma_acc_add",
+            "tvm_gemmini_dma_widen",
+        ):
+            return
+        pointer = node.args[2 if output else 1]
+        if isinstance(pointer, tir.Call) and pointer.op == tvm.ir.Op.get("tir.tvm_access_ptr"):
+            data = pointer.args[1]
+            if output:
+                dma_writes[data] = dma_writes.get(data, 0) + 1
+            else:
+                dma_reads.add(data)
+
+    tir.stmt_functor.post_order_visit(func.body, dma_access)
+
     def host_wait(expr, *, output=False):
         return (
             isinstance(expr, tir.Call)
@@ -162,7 +191,14 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
             and (
                 expr.args[1] in host_private
                 or expr.args[1] in host_writes
-                or (output and expr.args[1] in host_reads)
+                or (
+                    output
+                    and (
+                        expr.args[1] in host_reads
+                        or expr.args[1] in dma_reads
+                        or dma_writes.get(expr.args[1], 0) > 1
+                    )
+                )
             )
         )
 

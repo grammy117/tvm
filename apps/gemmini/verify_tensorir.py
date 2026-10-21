@@ -177,6 +177,39 @@ def fixtures():
                 )
             builder.emit_func_output(output)
         result.append((name, builder.get(), [a], np.pad(a, widths, mode=mode)))
+    for name, dtype, value in (
+        ("constant_i8", "int8", -128),
+        ("constant_i32", "int32", 2147483647),
+        ("constant_f32", "float32", -3.5),
+        ("constant_zero", "float32", -0.0),
+        ("constant_nan", "float32", float("-nan")),
+        ("constant_crop", "int32", -7),
+    ):
+        shape = (3, 4)
+        widths = ((-1, 1), (2, -1)) if name == "constant_crop" else ((1, 1), (2, 1))
+        a = (
+            bits.reshape(shape).view("float32")
+            if dtype == "float32"
+            else (np.arange(12).reshape(shape) * 17 - 128).astype(dtype)
+        )
+        av = relax.Var("a", relax.TensorStructInfo(shape, dtype))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [av]):
+            with builder.dataflow():
+                output = builder.emit_output(
+                    relax.op.nn.pad(av, tuple(x for pair in widths for x in pair), value)
+                )
+            builder.emit_func_output(output)
+        expected = np.pad(
+            a, [(max(left, 0), max(right, 0)) for left, right in widths], constant_values=value
+        )
+        expected = expected[
+            tuple(
+                slice(max(-left, 0), extent - max(-right, 0))
+                for (left, right), extent in zip(widths, expected.shape)
+            )
+        ].copy()
+        result.append((name, builder.get(), [a], expected))
     for name, m, n, k, batches, fused in (
         ("small", 3, 4, 5, 1, False),
         ("full", 16, 16, 16, 1, True),
@@ -608,6 +641,9 @@ def prepare(args):
         "apps/gemmini/matmul.h",
         "src/tir/schedule/primitive/reduction.cc",
         "src/tir/schedule/state.cc",
+        "src/tir/schedule/primitive/decompose_padding.cc",
+        "src/tir/schedule/primitive/blockize_tensorize.cc",
+        "src/tir/schedule/ir_comparator.cc",
         "python/tvm/relax/transform/legalize_ops/nn.py",
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
         *[
@@ -800,6 +836,12 @@ def main():
             "reflect3d",
             "edge2d",
             "edge3d",
+            "constant_i8",
+            "constant_i32",
+            "constant_f32",
+            "constant_zero",
+            "constant_nan",
+            "constant_crop",
         ],
     )
     execute = sub.add_parser("run")

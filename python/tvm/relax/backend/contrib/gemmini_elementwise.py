@@ -22,6 +22,8 @@ whole-operation C kernel or CPU arithmetic is hidden inside the intrinsic.
 """
 
 from functools import lru_cache
+import hashlib
+import struct
 
 import tvm
 from tvm import tir
@@ -433,6 +435,92 @@ def register_relu_intrinsic(rows, cols, rank, zero_first=False):
     return name
 
 
+@lru_cache(None)
+def register_literal_intrinsic(rows, cols, rank, dtype, value_bits):
+    """Materialize one typed host scalar, then broadcast it through primitive DMA."""
+    if dtype not in ("int8", "int32", "float32"):
+        raise ValueError("Unsupported constant DMA dtype")
+    value = tir.const(struct.unpack("!d" if dtype == "float32" else "!q", value_bits)[0], dtype)
+    if (
+        rank not in (1, 2)
+        or any(type(extent) is not int or not 1 <= extent <= 16 for extent in (rows, cols))
+        or (rank == 1 and rows != 1)
+        or not isinstance(value, (tir.IntImm, tir.FloatImm))
+    ):
+        raise ValueError("Invalid constant DMA tile or literal")
+    if cols != 1:
+        raise ValueError("Constant DMA fill requires an admitted dtype and one column")
+    # Keep the implementation literal as an explicit bit pattern. In v0.19,
+    # Tensorize copies its implementation through JSON, whose FloatImm loader
+    # cannot read NaN/Inf. A typed reinterpret also preserves signed zero.
+    impl_value = (
+        tir.reinterpret(
+            "float32", tir.IntImm("uint32", struct.unpack("!I", struct.pack("!f", value.value))[0])
+        )
+        if dtype == "float32"
+        else value
+    )
+    scope = SPAD if dtype == "int8" else ACC
+    shape = (cols,) if rank == 1 else (rows, cols)
+    if rank == 1:
+
+        @T.prim_func
+        def desc(b: T.handle):
+            B = T.match_buffer(
+                b, shape, dtype, scope=scope, strides=_strides(rank), offset_factor=1
+            )
+            with T.block("root"):
+                T.reads()
+                T.writes(_region(B))
+                for j in T.serial(cols):
+                    with T.block("fill"):
+                        vj = T.axis.spatial(cols, j)
+                        B[vj] = value
+    else:
+
+        @T.prim_func
+        def desc(b: T.handle):
+            B = T.match_buffer(
+                b, shape, dtype, scope=scope, strides=_strides(rank), offset_factor=1
+            )
+            with T.block("root"):
+                T.reads()
+                T.writes(_region(B))
+                for i, j in T.grid(rows, cols):
+                    with T.block("fill"):
+                        vi, vj = T.axis.remap("SS", [i, j])
+                        B[vi, vj] = value
+
+    @T.prim_func
+    def impl(b: T.handle):
+        B = T.match_buffer(b, shape, dtype, scope=scope, strides=_strides(rank), offset_factor=1)
+        with T.block("root"):
+            T.reads()
+            T.writes(_region(B))
+            with T.block("constant_source"):
+                T.reads()
+                T.writes(_region(B))
+                scalar = T.alloc_buffer((), dtype)
+                scalar[()] = impl_value
+                T.evaluate(
+                    T.call_extern(
+                        "void",
+                        "tvm_gemmini_dma_a" if dtype == "int8" else "tvm_gemmini_dma_acc_write",
+                        scalar.access_ptr("r"),
+                        B.access_ptr("w"),
+                        T.uint32(rows),
+                        T.uint32(cols),
+                        T.int64(0),
+                        T.int32(0),
+                    )
+                )
+
+    key = hashlib.sha256(dtype.encode() + value_bits).hexdigest()
+    name = f"gemmini.constant.{dtype}.{rank}d.{rows}x{cols}.{key}"
+    tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+    return name
+
+
 def elementwise_blocks(func):
     """Find exact copies, widening, INT32 addition and INT8 ReLU blocks."""
     matches = []
@@ -455,7 +543,15 @@ def elementwise_blocks(func):
             return
         axes = [axis.var for axis in node.iter_vars]
         output, value = node.body.buffer, node.body.value
-        if not tvm.ir.structural_equal(node.body.indices, axes):
+        analyzer = tvm.arith.Analyzer()
+        if len(node.body.indices) != len(axes) or any(
+            not isinstance(offset := analyzer.simplify(index - axis), tir.IntImm)
+            or int(offset) < 0
+            or not analyzer.can_prove(offset + iterator.dom.extent <= extent)
+            for index, axis, iterator, extent in zip(
+                node.body.indices, axes, node.iter_vars, output.shape
+            )
+        ):
             return
         if (
             isinstance(value, tir.BufferLoad)
@@ -466,6 +562,21 @@ def elementwise_blocks(func):
                 {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}[output.dtype],
                 [value],
             )
+        elif isinstance(value, (tir.IntImm, tir.FloatImm)) and output.dtype in (
+            "int8",
+            "int32",
+            "float32",
+        ):
+            kind, loads = "constant_" + output.dtype, []
+        elif (
+            isinstance(value, tir.Call)
+            and value.op == tvm.ir.Op.get("tir.if_then_else")
+            and isinstance(value.args[1], tir.BufferLoad)
+            and isinstance(value.args[2], (tir.IntImm, tir.FloatImm))
+            and value.args[1].dtype == output.dtype
+            and output.dtype in ("int8", "int32", "float32")
+        ):
+            kind, loads = "padding", [value.args[1]]
         elif isinstance(value, tir.Max) and output.dtype == "int8":
             pairs = ((value.a, value.b), (value.b, value.a))
             reads = [
@@ -538,37 +649,81 @@ def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=F
     """Let Tensorize prove native rectangular access maps without padded DMA."""
     if tensorize and mark_tensorize:
         raise ValueError("Choose immediate tensorization or MetaSchedule annotations")
-    matches = elementwise_blocks(func)
-    if len(matches) != 1:
-        raise ValueError("Expected one supported exact integer pointwise block")
-    node, kind = matches[0]
-    rank = min(2, len(node.iter_vars))
-    dimensions = [int(axis.dom.extent) for axis in node.iter_vars[-rank:]]
-    # Divisor tiles keep every DMA inside the original buffer. Prime tails can
-    # use smaller rectangles; no CPU packing or speculative padding is hidden.
-    factors = [max(value for value in range(1, 17) if extent % value == 0) for extent in dimensions]
-    if kind.startswith("fill_") or "_scalar_" in kind:
-        factors[-1] = 1
-    choices = [[1] * rank] if scalar else [factors]
-    if tensorize and factors != [1] * rank and not scalar:
-        choices.append([1] * rank)
+    if not elementwise_blocks(func):
+        raise ValueError("Expected supported exact pointwise blocks")
     failure = None
-    for selected in choices:
+    for use_scalar in [scalar, True] if tensorize and not scalar else [scalar]:
         try:
-            return _schedule_elementwise_candidate(
-                func, node, kind, rank, selected, tensorize, mark_tensorize
+            sch = tir.Schedule(func, debug_mask="all")
+            for node, kind in elementwise_blocks(func):
+                if kind == "padding":
+                    block = sch.get_block(node.name_hint)
+                    loop = sch.get_loops(block)[0]
+                    if not sch.can_decompose_padding(block, loop):
+                        raise ValueError("TVM cannot prove a constant-padding decomposition")
+                    sch.decompose_padding(block, loop)
+            regions = elementwise_blocks(sch.mod["main"])
+            metadata = []
+            for original, kind in regions:
+                if kind == "padding":
+                    raise ValueError("Constant padding remains after decomposition")
+                block = sch.get_block(original.name_hint)
+                if len(regions) > 1:
+                    # Each region has one writer within this standard local
+                    # block scope, even when the external output has many writers.
+                    sch.blockize(sch.get_loops(block)[0])
+                node = sch.get(block)
+                rank = min(2, len(node.iter_vars))
+                dimensions = [int(axis.dom.extent) for axis in node.iter_vars[-rank:]]
+                factors = [
+                    max(value for value in range(1, 17) if extent % value == 0)
+                    for extent in dimensions
+                ]
+                if kind.startswith(("fill_", "constant_")) or "_scalar_" in kind:
+                    factors[-1] = 1
+                if use_scalar:
+                    factors = [1] * rank
+                metadata.append(
+                    _schedule_elementwise_candidate(
+                        sch, node, kind, rank, factors, tensorize or mark_tensorize
+                    )
+                )
+            sch.annotate(sch.get_block("root"), "gemmini_regions_scheduled", 1)
+            mathematical = sch.mod
+            if tensorize:
+                if not tvm.meta_schedule.postproc.RewriteTensorize().apply(sch):
+                    raise ValueError("TVM Tensorize could not prove the selected DMA rectangles")
+                # v0.19 RewriteTensorize logs a failed replacement but still
+                # returns true. Apply the same target legality check as DSE
+                # before accepting this candidate or trying scalar DMA.
+                from .gemmini_memory import lower_memory
+
+                lower_memory(sch.mod)
+            info = (
+                metadata[0]
+                if len(metadata) == 1
+                else {"operation": "pointwise_regions", "regions": metadata}
             )
-        except tir.schedule.ScheduleError as error:
+            return sch, mathematical, info
+        except (ValueError, tir.schedule.ScheduleError) as error:
             failure = error
     raise failure
 
 
-def _schedule_elementwise_candidate(func, node, kind, rank, factors, tensorize, mark_tensorize):
+def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensorize):
     rows, cols = factors if rank == 2 else (1, factors[0])
-    intrinsics = (
-        None if kind == "relu_i8" else register_elementwise_intrinsics(kind, rows, cols, rank)
-    )
-    sch = tir.Schedule(func, debug_mask="all")
+    if kind.startswith("constant_"):
+        copy_kind = {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}[
+            node.body.buffer.dtype
+        ]
+        intrinsics = dict(register_elementwise_intrinsics(copy_kind, rows, cols, rank))
+        literal = node.body.value
+        bits = struct.pack("!d" if literal.dtype == "float32" else "!q", literal.value)
+        intrinsics["op"] = register_literal_intrinsic(rows, cols, rank, literal.dtype, bits)
+    else:
+        intrinsics = (
+            None if kind == "relu_i8" else register_elementwise_intrinsics(kind, rows, cols, rank)
+        )
     block = sch.get_block(node.name_hint)
     # TOPI can conservatively infer an entire input region for a single indexed
     # load (for example, reflected indices). State the exact per-iteration
@@ -597,34 +752,26 @@ def _schedule_elementwise_candidate(func, node, kind, rank, factors, tensorize, 
     split = [sch.split(loop, [None, factor]) for loop, factor in zip(loops, factors)]
     sch.reorder(*[pair[0] for pair in split], *[pair[1] for pair in split])
     if kind == "relu_i8":
-        mathematical = sch.mod
-        if tensorize or mark_tensorize:
+        if mark_tensorize:
             tile = sch.blockize(sch.get_loops(block)[-rank])
             intrinsic = register_relu_intrinsic(
                 rows, cols, rank, isinstance(node.body.value.a, tir.IntImm)
             )
-            if tensorize:
-                sch.tensorize(tile, intrinsic)
-            else:
-                sch.annotate(tile, "meta_schedule.auto_tensorize", intrinsic)
-        return sch, mathematical, {"operation": kind, "tile_rows": rows, "tile_cols": cols}
+            sch.annotate(tile, "meta_schedule.auto_tensorize", intrinsic)
+        return {"operation": kind, "tile_rows": rows, "tile_cols": cols}
     outer = split[-1][0]
     write = sch.cache_write(block, 0, intrinsics["scope"])
     sch.reverse_compute_at(write, outer, preserve_unit_loops=True)
     if rank == 2:
         sch.storage_align(block, 0, axis=-2, factor=16, offset=0)
-    mathematical = sch.mod
     for target, key in ((block, "op"), (write, "store")):
         loop = sch.get_loops(target)[-rank]
-        if tensorize or mark_tensorize:
+        if mark_tensorize:
             tiled = sch.blockize(loop)
             if key == "op" and rank == 2:
                 sch.storage_align(tiled, 0, axis=-2, factor=16, offset=0)
-        if tensorize:
-            sch.tensorize(tiled, intrinsics[key])
-        elif mark_tensorize:
             sch.annotate(tiled, "meta_schedule.auto_tensorize", intrinsics[key])
-    return sch, mathematical, {"operation": kind, "tile_rows": rows, "tile_cols": cols}
+    return {"operation": kind, "tile_rows": rows, "tile_cols": cols}
 
 
 def make_elementwise_schedule(func, *, capabilities=None):

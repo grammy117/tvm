@@ -45,9 +45,18 @@ static unsigned char loaded[16384][16], initialized[1024][16];
 struct command { int op; const void* src; void* dst; uint32_t a,b,c,m,n,k; int64_t stride; };
 static struct command queue[65536];
 static unsigned count, faults, commands, fences;
-static int wrong;
+static int wrong, reverse_stores;
+struct pending_store { void* dst; uint32_t bits; unsigned width; };
+static struct pending_store stores[65536];
+static unsigned store_count;
 static void check(int condition) { if (!condition) ++faults; }
 static void push(struct command x) { if(count>=65536) { ++faults; return; } queue[count++]=x; ++commands; }
+static void store(void* dst,const void* src,unsigned width) {
+  if(!reverse_stores) { memcpy(dst,src,width);return; }
+  if(store_count>=65536) { ++faults;return; }
+  struct pending_store* s=&stores[store_count++];s->dst=dst;s->width=width;
+  memcpy(&s->bits,src,width);
+}
 static void flush(void) {
   ++fences;
   for(unsigned t=0;t<count;++t) {
@@ -73,7 +82,7 @@ static void flush(void) {
       check(x.c+x.m<=1024 && x.stride>=x.n);
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
         check(initialized[x.c+i][j]);
-        memcpy((unsigned char*)x.dst+4*(i*x.stride+j), &acc[x.c+i][j], 4);
+        store((unsigned char*)x.dst+4*(i*x.stride+j), &acc[x.c+i][j], 4);
       }
     } else if(x.op==4 || x.op==5) {
       check(x.c+x.m<=1024 && (x.stride==0 || x.stride>=x.n));
@@ -91,21 +100,25 @@ static void flush(void) {
     } else if(x.op==7) {
       check(x.a+x.m<=16384 && x.stride>=x.n);
       int8_t* p=x.dst;
-      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { check(loaded[x.a+i][j]);p[i*x.stride+j]=sp[x.a+i][j]; }
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { check(loaded[x.a+i][j]);store(&p[i*x.stride+j],&sp[x.a+i][j],1); }
     } else if(x.op==8) {
       check(x.c+x.m<=1024 && x.stride>=x.n);
       int8_t* p=x.dst;
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
         int32_t v=acc[x.c+i][j];
         check(initialized[x.c+i][j] && v>=-128 && v<=127);
-        p[i*x.stride+j]=wrong?v:(v<0?0:v);
+        int8_t value=wrong?v:(v<0?0:v);store(&p[i*x.stride+j],&value,1);
       }
     }
   }
-  count=0;
+  for(unsigned i=store_count;i>0;--i) {
+    struct pending_store s=stores[i-1];memcpy(s.dst,&s.bits,s.width);
+  }
+  count=store_count=0;
 }
-void emulator_reset(void) { count=faults=commands=fences=0; wrong=0; memset(loaded,0,sizeof(loaded));memset(initialized,0,sizeof(initialized)); }
+void emulator_reset(void) { count=store_count=faults=commands=fences=0; wrong=reverse_stores=0; memset(loaded,0,sizeof(loaded));memset(initialized,0,sizeof(initialized)); }
 void emulator_wrong(int x) { wrong=x; }
+void emulator_reverse_stores(int x) { reverse_stores=x; }
 unsigned emulator_faults(void) { return faults; }
 unsigned emulator_commands(void) { return commands; }
 unsigned emulator_fences(void) { return fences; }

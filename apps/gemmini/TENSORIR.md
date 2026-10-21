@@ -56,7 +56,7 @@ arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy
 guard described in README.md. That guard rejects unsupported automatic-copy
 annotations and is not a DMA optimization.
 
-The migration fixes two generic C++ scheduler issues.
+The migration fixes five generic C++ scheduler issues.
 In `decompose_reduction`, initialization reads were omitted and retained
 on the update block instead. Separate read-region analysis preserves an
 input-dependent initialization and lets subsequent cache placement see its
@@ -68,6 +68,15 @@ Otherwise splitting an inner loop can mutate the original workload and break
 trace replay. General split/reorder tests retain and check the original input.
 The handwritten static deployment packaging is retained, with standard USMP
 used for operator pools; this is not a claim of stock microTVM/AOT deployment.
+
+Constant-padding scheduling exposed three further general issues, each with
+target-independent regressions. `decompose_padding`'s Python trace printer must
+accept the loop's printed name rather than a LoopRV object. Repeated blockization
+must give generated outer blocks unique names so ordinary `GetBlock` and
+MetaSchedule tensorization can address them. Tensorization must compare floating
+literal bits: numerical equality rejects an identical NaN and accepts opposite
+zero signs. The matcher now preserves NaN payloads and signed zero. These are
+explicit fork patches, not changes to the accelerator's arithmetic contract.
 
 `gemmini_space_generator()` is a standard MetaSchedule `PostOrderApply` space
 generator with a target-specific `PyScheduleRule`, standard `RewriteTensorize`
@@ -174,7 +183,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Multiple-source selection, broader literal arithmetic and scatter updates remain under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
 
 ### Corrections to the proposed native-unit mappings
@@ -213,8 +222,9 @@ not Gemmini kernel selection. Reflection requires proven positive input extents
 and widths smaller than the corresponding input dimension, matching the
 single-reflection TOPI implementation. Unproved bounds retain the Relax call;
 they are an explicit legalization limitation, not a successful CPU fallback.
-Constant padding still follows its existing generic path and is not newly
-qualified as native DMA merely because its frontend spelling imports.
+Constant padding follows its generic mathematical legalization before the
+region schedule described below. Import alone does not establish native support
+for other dtypes or an arbitrary frontend graph.
 
 `gemmini_elementwise.py` registers typed copy, widening and INT32 add intrinsics
 and uses standard `split`, `reorder`, `cache_write`, placement and `tensorize`.
@@ -259,6 +269,38 @@ ordinary output layout through standard cache placement. Constant-only fills
 may disappear through normal FoldConstant. Non-integer output conversion is
 not implied. The same broadcast layout supports runtime INT32 scalar addition;
 the ordinary no-overflow and explicit widen/add/narrow variants remain distinct.
+
+Constant padding uses standard `decompose_padding` to form a full-output fill
+and an interior copy. Standard blockization gives each region its own scope;
+ordinary caches can then serve one local writer even though the external output
+has two writers. Translated output index maps are admitted only when each is a
+constant, in-bounds translation of the corresponding block axis. The entire
+decomposition, scoping, tiling, placement and tensorization trace replays from
+the original mathematical workload, in Python and JSON.
+
+A typed literal intrinsic materializes one host scalar and broadcasts it by
+zero-stride DMA; the CPU does not fill the output tensor. Constant identity uses
+its dtype and exact scalar bits, keeping positive/negative zero distinct.
+Floating implementation constants use typed integer-bit reinterpretation:
+v0.19's internal Tensorize implementation copy cannot JSON-load a nonfinite
+FloatImm. This does not fix general JSON loading of nonfinite mathematical
+workloads, so persistence of such workloads through the JSON tuning database
+remains unqualified. Ordinary trace replay and static device execution are
+checked separately.
+
+The default DMA schedule now uses the same standard `RewriteTensorize`
+postprocessor as design-space candidates. v0.19 logs a failed replacement but
+can return true, so target memory legality must also reject residual CPU SRAM
+accesses before accepting a candidate or trying scalar DMA. Multiple regions
+currently share the rectangular/scalar strategy choice; independent per-region
+search and alternative padding algorithms are not implemented.
+
+DMA writes complete when an output has multiple DMA writers or is subsequently
+read through DMA, as well as for the existing CPU/staging dependencies. This
+conservatively orders full fill before interior overwrite. A host control can
+reverse captured store completion order; correct waits preserve the padding,
+while deliberately removing them exposes an incorrect overlapping result.
+This is a dependency check, not a hardware timing model or measured speedup.
 
 Scalar descriptors omit stride metadata because v0.19's Python match-buffer
 builder indexes `shape[0]` when a stride list is supplied. There is also a
@@ -428,3 +470,23 @@ the unchanged baseline Python legalizers and the same compiled library;
 `unit-pad-nn-regression-v1.log` and `unit-pad-nn-baseline-v1.log` retain both
 runs. These failures are not reported as passing regressions or resolved by
 this padding change.
+
+`device-constant-v2` adds INT8/INT32/FP32 constant padding, negative zero,
+negative-NaN literal padding and cropping, plus small contraction and sum
+regressions. All eight cases pass positive and wrong-oracle checks on Spike
+and RTL within 60 seconds and 300,000 RTL cycles. The adapter is unchanged;
+ELF audits continue to reject hardware loops. `unit-regions-full-v2.log`
+passes all 173 collected Gemmini/backend/app and generic padding checks with
+the preserved `compiler-core-v4` libraries. Region checks include integer
+extremes, both zero signs, NaNs/infinities, raw input payload preservation,
+cropping, independent references, Python/JSON traces, standard MetaSchedule
+and deliberately missing completion.
+
+`unit-core-regions-v4.log` passes 88 general schedule tests, with one existing
+affine-analysis skip. The literal-only tests pass all nine cases after the
+matcher fix; the prior immutable library fails the two identical-NaN cases
+and the opposite-zero-sign refusal. `qualification-core-regions-v1.json`
+binds those checks, source patches and immutable compiled libraries. These
+checks qualify the disclosed scheduler fixes and functional region support;
+the full requested operator inventory and final coverage-wide source freeze
+remain unfinished.
