@@ -90,6 +90,69 @@ def fixtures():
     from tvm import relax, te, topi
 
     result = []
+    for kind, dtype in (
+        ("mm", "int8"),
+        ("bmm", "int8"),
+        ("addmm", "int8"),
+        ("add", "int32"),
+        ("scalar_add", "int32"),
+        ("subtract", "int32"),
+        ("multiply", "int32"),
+        ("divide", "int32"),
+        ("alpha", "float32"),
+        ("int64_add", "int64"),
+        ("int64_mm", "int64"),
+    ):
+        import torch
+        from tvm.relax.frontend.torch import from_exported_program
+
+        class Arithmetic(torch.nn.Module):
+            def forward(self, x, y, bias):
+                if kind in ("mm", "int64_mm"):
+                    return torch.mm(x, y)
+                if kind == "bmm":
+                    return torch.bmm(x, y)
+                if kind == "addmm":
+                    return torch.addmm(bias, x, y)
+                if kind in ("add", "int64_add"):
+                    return torch.add(x, y)
+                if kind == "scalar_add":
+                    return torch.ops.aten.add.Scalar(x, 17)
+                if kind == "subtract":
+                    return torch.sub(x, y, alpha=3)
+                if kind == "multiply":
+                    return torch.ops.aten.mul.Scalar(x, -3)
+                if kind == "divide":
+                    return torch.ops.aten.div.Scalar(x, 3)
+                return torch.add(x, y, alpha=1.1)
+
+        shapes = (
+            ((2, 3), (3, 4), (4,))
+            if kind in ("mm", "addmm", "int64_mm")
+            else (((2, 2, 3), (2, 3, 4), (4,)) if kind == "bmm" else ((2, 3), (2, 3), (3,)))
+        )
+        seed = (
+            np.array([-3.75, 1.125, -0.0, 1, 0.25, -0.5], dtype)
+            if dtype == "float32"
+            else np.array([np.iinfo(dtype).min, np.iinfo(dtype).max, -1, 0, 1, 17], dtype)
+        )
+        values = [
+            np.resize(seed if i % 2 == 0 else seed[::-1], shape) for i, shape in enumerate(shapes)
+        ]
+        examples = [torch.from_numpy(value) for value in values]
+        model = Arithmetic()
+        graph = from_exported_program(
+            torch.export.export(model, tuple(examples)), unwrap_unit_return_tuple=True
+        )
+        result.append(
+            (
+                "aten_" + kind,
+                graph,
+                values,
+                model(*examples).numpy(),
+                "gemmini" if kind in ("mm", "bmm", "addmm", "add", "scalar_add") else "host",
+            )
+        )
     for kind in ("full", "full_like"):
         for dtype, fill in (("int8", -128), ("int32", -2147483648), ("float32", -0.0)):
             import torch
@@ -898,6 +961,7 @@ def prepare(args):
         "python/tvm/relax/transform/legalize_ops/nn.py",
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
         "python/tvm/relax/frontend/torch/base_fx_graph_translator.py",
+        "python/tvm/relax/frontend/torch/_numeric.py",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -1123,6 +1187,22 @@ def main():
             "view_noop_i32",
             "view_scalar_f32",
             "view_alias_i32",
+            *[
+                "aten_" + name
+                for name in (
+                    "mm",
+                    "bmm",
+                    "addmm",
+                    "add",
+                    "scalar_add",
+                    "subtract",
+                    "multiply",
+                    "divide",
+                    "alpha",
+                    "int64_add",
+                    "int64_mm",
+                )
+            ],
             *[
                 f"creation_{kind}_{dtype}_{mode}"
                 for kind in ("full", "full_like")

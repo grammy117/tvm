@@ -200,12 +200,12 @@ Statuses here are development state, not a completed hardware-support table.
 
 | Family | Requested operations | Current migration state |
 | --- | --- | --- |
-| Matrix | `mm`, `bmm` | Mathematical integer contractions have structural scheduling, queued-DMA checks and bounded Spike/RTL checks. The direct ATen audit still finds missing `mm.default` import and incorrect FP32 output for integer `bmm`; these are separate frontend defects |
-| Biased matrix | `addmm` | Exact integer matmul with eligible INT32 tensor bias uses accumulator preload; shared products and unsupported epilogues retain their original mathematics. CPU activation/scaling and complete ATen/frontend admission remain separate |
+| Matrix | `mm`, `bmm` | Direct ATen import preserves the captured dtype. INT8 products use a proven wider sum and explicit output conversion, with native array scheduling where legal. INT32/INT64 input arithmetic retains exact modular CPU reductions. Integer reduction extents require static admission; general floating matmul remains CPU work |
+| Biased matrix | `addmm` | Eligible mathematical INT8-to-INT32 products with INT32 tensor bias use native accumulator preload. Direct ATen addmm preserves its dtype, alpha/beta, broadcasting and wrapping; INT8 results can use an array contraction followed by CPU casts/bias. Direct ATen INT8 bias is not thereby claimed to be preloaded |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
-| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 addition uses accumulator overwrite/add loads and full readout, with separate ordinary and explicit modulo-32 contracts. INT8 ReLU uses exact widen/readout tile intrinsics. ATen add/sub currently ignore nondefault alpha and direct scalar overload conversions are missing; the next fidelity work must repair these before claiming complete frontend/CPU fallback support |
+| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | Direct arithmetic import preserves scalar promotion, alpha and explicit wrapping. Unit-alpha INT32 tensor/scalar addition uses native accumulator loads/readout; general scale/subtract/negate and wider arithmetic stay on CPU. INT8 ReLU uses exact widen/readout tile intrinsics. Exact FP16 add/sub with alpha outside +/-1 is explicitly unqualified because the pinned CPU reference rounds vector and scalar-tail intermediates differently |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; wider frontend and rounding audit remains required |
-| Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
+| Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Import/CPU audit finds missing 1D/3D conversions, incorrect default padding/divisor behavior in the existing 2D importer, and a DMA scheduling failure with remaining CPU reduction initialization. One ordinary adaptive-2D CPU example passes; the remaining work is not a hardware-qualified pooling claim |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
 | Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies expose concatenation and static positive-stride scatter regions through standard scheduling. Constant full/full_like import preserves the captured dtype; normal constant folding can eliminate them, and unfolded literal fills use the existing DMA intrinsic. Broader dtype/frontend/aliasing admission remains under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Admitted static frontend forms execute as standard metadata or INT8/INT32/FP32 mathematical copies. Internal reshapes can disappear; indexed or boundary materializations use DMA when Tensorize proves the access map. Constants and nonunit squeeze can require no device calls. Hidden storage aliases, dynamic contracts and zero-extent static-export buffers remain explicit limitations |
@@ -722,3 +722,64 @@ reproduces five INT32/FP32 mismatches and six refusals; that older importer also
 refuses INT8 input. These defects are not concealed by the passing mathematical
 TensorIR tests. Frontend fidelity work and the remaining pooling/backward
 inventory are still required before completing the migration.
+
+The following arithmetic change resolves the thirty-case admission/semantic
+audit for its INT8/INT32/FP32 contracts. Direct mm/bmm/matmul and addmm use the
+captured output dtype rather than forcing FP32. INT8 matmul has a proved wider
+prefix sum followed by an explicit output conversion; the widening choice is
+derived from dtype bounds, independently of hardware geometry. INT32/INT64
+input matmuls use ordinary TE modulo reducers on CPU. Their unsigned limb sums
+fit within 33 bits and their 32-by-32 products fit within UINT64, so no
+intermediate relies on LLVM's nsw/nuw overflow. This requires static integer
+reduction extents; known empty contractions become ordinary zero fills.
+
+Scalar arithmetic and tensor add/sub retain promotion and alpha. INT8/INT32
+pointwise arithmetic uses bounded INT64 intermediates and a final cast;
+INT64 arithmetic uses the same overflow-free unsigned limb mathematics. These
+are unscheduled TE definitions, with no device instructions, hidden C kernels
+or scheduling decisions. The existing Gemmini rule recognizes admitted modulo-32
+addition, including a constant scalar, while other scale/subtract/wider paths
+remain CPU work. Addmm also preserves output shape for zero coefficients and
+does not consume an ignored bias when beta is zero.
+
+For nontrivial FP32/FP64 add/sub alpha, a typed LLVM FMA intrinsic preserves
+fused rounding on this LLVM deployment route. The pinned PyTorch 2.10
+[CPU add definition](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/ufunc/add.h)
+uses vector fused multiply-add; its
+[scalar multiply/divide kernels](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/BinaryOpsKernel.cpp)
+also distinguish reduced-precision opmath from weak-scalar conversion.
+This is a disclosed LLVM-specific numerical lowering, not a Gemmini floating
+arithmetic capability. Exact FP16 nonunit add/sub alpha is refused: the
+independent `torch-half-alpha-audit-v2.json` shows a 129-element example whose
+first 128 results match one FP32 intermediate round, while its final result
+matches separately rounded FP16 operations. No source-CPU vector width is encoded
+in production IR. Other FP16 scalar conversion cases are tested independently.
+
+`unit-arithmetic-full-pinned-v1.log` passes all 461 collected regression checks.
+The 118 new frontend checks include four explicit FP16 refusal cases; they are
+not counted as successfully executed FP16 arithmetic. Independent unbounded
+Python-integer references cover random full-range INT64 reduction and pointwise
+results. Other checks cover overflow, scalar promotion, nontrivial floating
+rounding, NaN propagation at zero alpha, zero coefficients, empty contractions
+and vector/batch broadcast matmul. The backend check independently exercises
+eleven native/CPU contracts through static export and delayed-DMA emulation.
+
+`device-arithmetic-native-v1` and `device-arithmetic-cpu-v1` pass fifteen bounded
+fixture executions on Spike and the pinned RTL, with wrong-oracle controls.
+Native fixtures require INT8 mm/bmm/addmm contraction commands and wrapping
+INT32 tensor/scalar addition. CPU fixtures require zero device commands for
+subtraction/scaling, integer-to-floating division, FP32 fused alpha and full-width
+INT64 math, alongside split and sum regressions. Positive RTL runs complete in
+approximately 36 and 43 seconds. The compiler-core-v6 libraries and
+adapter-creation-v1 object are unchanged; ELF audits reject hardware loops.
+These are functional checks and supply no performance labels.
+
+The next pooling audit remains incomplete. `pooling-cpu-audit-v2.json` separates
+ordinary CPU semantics from device preparation: the existing default 2D average
+pool and divisor-override cases are numerically wrong before Gemmini selection;
+exclude-padding matches its small reference. All three device preparations
+reach allocation placement with a remaining CPU reduction initializer and fail.
+The 1D/3D average/adaptive conversions are also missing. These are frontend and
+pipeline issues to repair, separate from the integer array's lack of general
+floating pooling arithmetic. Pooling/backward admission and the final whole-scope
+audit remain required; this arithmetic checkpoint does not complete the goal.
