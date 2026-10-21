@@ -19,7 +19,10 @@ import numpy as np
 import tvm
 import tvm.testing
 from tvm import tir
-from tvm.tir.schedule.testing import assert_structural_equal_ignore_global_symbol
+from tvm.tir.schedule.testing import (
+    assert_structural_equal_ignore_global_symbol,
+    verify_trace_roundtrip,
+)
 from tvm.script import tir as T
 
 # pylint: disable=no-member,invalid-name,unused-variable,unexpected-keyword-arg
@@ -110,6 +113,7 @@ def test_1d_decompose_padding():
     block = sch.get_block("block")
     sch.decompose_padding(block, sch.get_loops(block)[0])
     check_decompose_padding(before_decompose, sch.mod["main"], after_decompose, check_run=False)
+    verify_trace_roundtrip(sch, before_decompose)
 
 
 @T.prim_func
