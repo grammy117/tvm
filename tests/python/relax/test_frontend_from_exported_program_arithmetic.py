@@ -248,3 +248,25 @@ def test_zero_floating_alpha_preserves_nonfinite_propagation():
     np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
     finite = ~np.isnan(expected)
     np.testing.assert_array_equal(actual[finite].view("uint32"), expected[finite].view("uint32"))
+
+
+@pytest.mark.parametrize("dtype", ["int8", "int32", "int64"])
+@pytest.mark.parametrize("scalar_kind", ["minimum", "maximum", "ordinary"])
+@pytest.mark.parametrize("alpha", [-1, 1, 2])
+def test_constant_integer_subtraction_folds_offset_in_the_result_ring(dtype, scalar_kind, alpha):
+    torch = pytest.importorskip("torch")
+    bits = np.dtype(dtype).itemsize * 8
+    minimum, maximum = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+    scalar = minimum if scalar_kind == "minimum" else maximum if scalar_kind == "maximum" else 17
+
+    class Subtract(torch.nn.Module):
+        def forward(self, x):
+            return torch.ops.aten.sub.Scalar(x, scalar, alpha)
+
+    values = np.array([minimum, maximum, -1, 0, 1, 17], dtype)
+    actual, source = execute(Subtract(), [values])
+    expected = np.array(
+        [(int(value) - scalar * alpha - minimum) % (1 << bits) + minimum for value in values], dtype
+    )
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(source, expected)

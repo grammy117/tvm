@@ -66,10 +66,15 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 return self.block_builder.emit(relax.op.logical_or(lhs, scaled))
             raise NotImplementedError("Boolean subtraction is not a valid Torch operation")
         if dtype.startswith("int"):
-            lhs, rhs = self._numeric_operand(lhs, dtype), self._numeric_operand(rhs, dtype)
             bits = tvm.DataType(dtype).bits
             if not isinstance(alpha, int) or not -(1 << (bits - 1)) <= alpha < (1 << (bits - 1)):
                 raise NotImplementedError("Integer alpha must fit the result's signed dtype")
+            if operation == "subtract" and isinstance(rhs, int):
+                # Fold a known scalar offset in the source modulo ring. This
+                # target-independent identity exposes ordinary addition without
+                # requiring a runtime negation or a different rounding policy.
+                rhs, alpha, operation = -alpha * rhs, 1, "add"
+            lhs, rhs = self._numeric_operand(lhs, dtype), self._numeric_operand(rhs, dtype)
             if dtype == "int64":
                 return self.block_builder.emit_te(
                     binary_int64,
