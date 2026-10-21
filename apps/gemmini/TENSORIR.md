@@ -56,7 +56,7 @@ arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy
 guard described in README.md. That guard rejects unsupported automatic-copy
 annotations and is not a DMA optimization.
 
-The migration fixes five generic C++ scheduler issues.
+The migration fixes seven generic C++ scheduler/IR issues.
 In `decompose_reduction`, initialization reads were omitted and retained
 on the update block instead. Separate read-region analysis preserves an
 input-dependent initialization and lets subsequent cache placement see its
@@ -77,6 +77,17 @@ MetaSchedule tensorization can address them. Tensorization must compare floating
 literal bits: numerical equality rejects an identical NaN and accepts opposite
 zero signs. The matcher now preserves NaN payloads and signed zero. These are
 explicit fork patches, not changes to the accelerator's arithmetic contract.
+
+Copy-region scheduling exposed two more generic defects. `loop_partition` now
+uses zero-based physical loops while preserving logical block domains and
+access maps. The old implementation narrowed domains and rewrote regions by
+display names, which could change a reduction's initialization or make a later
+blockization simplify a copy selector incorrectly. Partitioning now renews
+private definitions, derives wrapper dependencies and also handles a nonzero
+input loop origin or a single partition. `RenewDefs` preserves a domain's
+minimum/extent and the identities of externally defined buffers, including
+metadata-only references. General regressions check CPU execution, private
+allocations, dependencies and trace replay independently of the target.
 
 `gemmini_space_generator()` is a standard MetaSchedule `PostOrderApply` space
 generator with a target-specific `PyScheduleRule`, standard `RewriteTensorize`
@@ -183,7 +194,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Multiple-source selection, broader literal arithmetic and scatter updates remain under audit |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies now expose concatenation and static positive-stride scatter regions through standard scheduling; their bounded target qualification is separate from the earlier padding checkpoint. Broader literal arithmetic and full frontend/aliasing admission remain under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
 
 ### Corrections to the proposed native-unit mappings
@@ -294,6 +305,38 @@ can return true, so target memory legality must also reject residual CPU SRAM
 accesses before accepting a candidate or trying scalar DMA. Multiple regions
 currently share the rectangular/scalar strategy choice; independent per-region
 search and alternative padding algorithms are not implemented.
+
+Concatenation and functional scatter updates remain mathematical lazy selections
+between buffer loads. `gemmini_regions.py` proves index-only predicates with
+TVM's arithmetic analyzer, then exposes constant-selection regions through
+`loop_partition`, `cache_write`, `compute_inline` and `blockize`. Both temporary
+global caches disappear through ordinary inlining; the surviving region is a
+pure mathematical copy before scoped DMA caches and Tensorize are applied.
+Unit iterators are eliminated during normalization so singleton regions do not
+retain a selector depending on an outer unit binding. Block references are
+resolved structurally through ordinary child-block queries, including when
+generated display names are duplicated. Conservative ancestor read declarations
+can still mention unreachable branches; executable leaf copies and their DMA
+regions have the selected source only.
+
+Region analysis has explicit compiler-work budgets: at most 128 regions, and
+at most 65,536 index positions for a nonlinear one-axis predicate. These are
+engineering limits, not hardware limitations. Runtime data predicates, excessive
+partitioning or unproved access maps retain the original CPU mathematics.
+MetaSchedule also preserves an unchanged CPU candidate if no region schedule
+is admitted. Memory-resource checks can impose a tighter bound because region
+SRAM allocations currently do not share storage by lifetime.
+
+The PyTorch ExportedProgram importer now admits INT8 tensors and functional
+`slice_scatter`/`select_scatter` with static shapes and bounds, positive slice
+steps, negative dimensions/indices and clipped Python slice bounds. It emits
+ordinary TOPI `strided_set` mathematics; it makes no hardware or scheduling
+decisions. Empty slices produce an identity copy. TOPI's index expressions are
+promoted to the shape's index dtype, correcting its INT32-bound/INT64-shape
+mismatch independently of the target. Internal constant index-vector producers
+are removed through standard `compute_inline`. A separate expand-dimensions
+materialization may remain CPU work in the static exporter, particularly when
+the copy changes rank; the ordinary VM pipeline can apply its own view lowering.
 
 DMA writes complete when an output has multiple DMA writers or is subsequently
 read through DMA, as well as for the existing CPU/staging dependencies. This

@@ -91,15 +91,18 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             if pointwise and sch.get(block).same_as(pointwise[0][0]):
                 candidates, traces = [], set()
                 for scalar in (False, True):
-                    candidate = sch.copy()
-                    transformed, _, _ = schedule_elementwise(
-                        func, tensorize=False, mark_tensorize=True, scalar=scalar
-                    )
+                    try:
+                        transformed, _, _ = schedule_elementwise(
+                            func, tensorize=False, mark_tensorize=True, scalar=scalar
+                        )
+                    except (ValueError, tir.schedule.ScheduleError):
+                        continue
                     if str(transformed.trace) not in traces:
                         traces.add(str(transformed.trace))
+                        candidate = sch.copy()
                         transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
                         candidates.append(candidate)
-                return candidates
+                return candidates or [sch]
             return [sch]
         if len(matches) != 1 or not sch.get(block).same_as(matches[0][0]):
             return [sch]

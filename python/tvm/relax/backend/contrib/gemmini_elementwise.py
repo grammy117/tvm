@@ -30,6 +30,12 @@ from tvm import tir
 from tvm.script import tir as T
 
 from .gemmini_intrin import ACC, SPAD
+from .gemmini_regions import (
+    block_rv,
+    copy_selection_loads,
+    inline_index_constants,
+    partition_copy_regions,
+)
 
 
 def _strides(rank):
@@ -562,6 +568,11 @@ def elementwise_blocks(func):
                 {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}[output.dtype],
                 [value],
             )
+        elif (
+            output.dtype in ("int8", "int32", "float32")
+            and (selected := copy_selection_loads(value, output.dtype)) is not None
+        ):
+            kind, loads = "select_copy", selected
         elif isinstance(value, (tir.IntImm, tir.FloatImm)) and output.dtype in (
             "int8",
             "int32",
@@ -655,9 +666,15 @@ def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=F
     for use_scalar in [scalar, True] if tensorize and not scalar else [scalar]:
         try:
             sch = tir.Schedule(func, debug_mask="all")
-            for node, kind in elementwise_blocks(func):
+            inline_index_constants(sch)
+            selections = [
+                node for node, kind in elementwise_blocks(sch.mod["main"]) if kind == "select_copy"
+            ]
+            if selections:
+                partition_copy_regions(sch, selections)
+            for node, kind in elementwise_blocks(sch.mod["main"]):
                 if kind == "padding":
-                    block = sch.get_block(node.name_hint)
+                    block = block_rv(sch, node)
                     loop = sch.get_loops(block)[0]
                     if not sch.can_decompose_padding(block, loop):
                         raise ValueError("TVM cannot prove a constant-padding decomposition")
@@ -665,9 +682,9 @@ def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=F
             regions = elementwise_blocks(sch.mod["main"])
             metadata = []
             for original, kind in regions:
-                if kind == "padding":
-                    raise ValueError("Constant padding remains after decomposition")
-                block = sch.get_block(original.name_hint)
+                if kind in ("padding", "select_copy"):
+                    raise ValueError("An unscheduled copy selection remains after decomposition")
+                block = block_rv(sch, original)
                 if len(regions) > 1:
                     # Each region has one writer within this standard local
                     # block scope, even when the external output has many writers.
@@ -724,7 +741,7 @@ def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensori
         intrinsics = (
             None if kind == "relu_i8" else register_elementwise_intrinsics(kind, rows, cols, rank)
         )
-    block = sch.get_block(node.name_hint)
+    block = block_rv(sch, node)
     # TOPI can conservatively infer an entire input region for a single indexed
     # load (for example, reflected indices). State the exact per-iteration
     # accesses through the public schedule API before placing/tensorizing caches.

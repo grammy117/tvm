@@ -87,7 +87,7 @@ static uint64_t hash(const void* p,size_t n) {
 
 def fixtures():
     import numpy as np
-    from tvm import relax, te
+    from tvm import relax, te, topi
 
     result = []
     for name, shape in (("relu_i8", (16, 16)), ("relu_tail", (3, 17))):
@@ -116,6 +116,78 @@ def fixtures():
         ],
         "uint32",
     )
+    for name, dtype, shape, sizes, axis in (
+        ("cat_i8", "int8", (3, 3), (3, 4, 1), 1),
+        ("cat_i32", "int32", (3, 3), (3, 2, 1), 0),
+        ("cat_f32", "float32", (2, 1, 3), (1, 2, 1), 1),
+    ):
+        arrays = []
+        for i, size in enumerate(sizes):
+            dims = list(shape)
+            dims[axis] = size
+            arrays.append(
+                np.resize(bits, dims).view("float32")
+                if dtype == "float32"
+                else (np.arange(np.prod(dims)).reshape(dims) * 37 + 19 * i - 128).astype(dtype)
+            )
+        variables = [
+            relax.Var(f"input_{i}", relax.TensorStructInfo(a.shape, dtype))
+            for i, a in enumerate(arrays)
+        ]
+        builder = relax.BlockBuilder()
+        with builder.function("main", variables):
+            with builder.dataflow():
+                output = builder.emit_output(relax.op.concat(variables, axis))
+            builder.emit_func_output(output)
+        result.append((name, builder.get(), arrays, np.concatenate(arrays, axis=axis)))
+    for name, dtype, shape, axis, start, stop, step, select in (
+        ("scatter_i8", "int8", (3, 7), 1, 1, 7, 2, False),
+        ("scatter_i32", "int32", (3, 7), 1, 2, 5, 1, False),
+        ("scatter_f32", "float32", (7, 3), 0, 0, 7, 3, False),
+        ("select_i32", "int32", (3, 7), 1, 6, 7, 1, True),
+        ("select_f32", "float32", (3, 7), 0, 1, 2, 1, True),
+    ):
+        update_shape = list(shape)
+        update_shape[axis] = len(range(start, stop, step))
+        if select:
+            update_shape.pop(axis)
+        base = (np.arange(np.prod(shape)).reshape(shape) * 7 - 128).astype(dtype)
+        updates = (
+            np.resize(bits, update_shape).view("float32")
+            if dtype == "float32"
+            else (np.arange(np.prod(update_shape)).reshape(update_shape) * 17 - 128).astype(dtype)
+        )
+        variables = [
+            relax.Var("base", relax.TensorStructInfo(shape, dtype)),
+            relax.Var("updates", relax.TensorStructInfo(update_shape, dtype)),
+        ]
+        begin, end, strides = [0] * len(shape), list(shape), [1] * len(shape)
+        begin[axis], end[axis], strides[axis] = start, stop, step
+
+        def compute(data, source):
+            return topi.strided_set(
+                data,
+                source,
+                topi.utils.const_vector(np.array(begin, "int32")),
+                topi.utils.const_vector(np.array(end, "int32")),
+                topi.utils.const_vector(np.array(strides, "int32")),
+            )
+
+        builder = relax.BlockBuilder()
+        with builder.function("main", variables):
+            with builder.dataflow():
+                source = (
+                    builder.emit(relax.op.expand_dims(variables[1], axis))
+                    if select
+                    else variables[1]
+                )
+                output = builder.emit_output(builder.call_te(compute, variables[0], source))
+            builder.emit_func_output(output)
+        expected = base.copy()
+        selection = [slice(None)] * len(shape)
+        selection[axis] = start if select else slice(start, stop, step)
+        expected[tuple(selection)] = updates
+        result.append((name, builder.get(), [base, updates], expected))
     for name in ("copy_f32", "repeat_f32", "fill_f32"):
         a = (bits.reshape(3, 4) if name != "fill_f32" else np.array(0x7F812345, "uint32")).view(
             "float32"
@@ -644,8 +716,12 @@ def prepare(args):
         "src/tir/schedule/primitive/decompose_padding.cc",
         "src/tir/schedule/primitive/blockize_tensorize.cc",
         "src/tir/schedule/ir_comparator.cc",
+        "src/tir/schedule/primitive/loop_transformation.cc",
+        "src/tir/transforms/renew_defs.cc",
+        "python/tvm/topi/transform.py",
         "python/tvm/relax/transform/legalize_ops/nn.py",
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
+        "python/tvm/relax/frontend/torch/base_fx_graph_translator.py",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -658,6 +734,7 @@ def prepare(args):
                 "gemmini_elementwise",
                 "gemmini_reduction",
                 "gemmini_bias",
+                "gemmini_regions",
             )
         ],
     ):
@@ -842,6 +919,14 @@ def main():
             "constant_zero",
             "constant_nan",
             "constant_crop",
+            "cat_i8",
+            "cat_i32",
+            "cat_f32",
+            "scatter_i8",
+            "scatter_i32",
+            "scatter_f32",
+            "select_i32",
+            "select_f32",
         ],
     )
     execute = sub.add_parser("run")
