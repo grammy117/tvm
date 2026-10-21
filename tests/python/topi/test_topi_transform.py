@@ -959,6 +959,33 @@ def test_strided_set():
     verify_strided_set((3, 4, 3), (2, 3, 3), [1, 1], [4, 4, 3])
 
 
+@pytest.mark.parametrize("index_dtype", ["int32", "int64"])
+@pytest.mark.parametrize("step", [1, -1, 2])
+def test_strided_set_shape_index_dtype(index_dtype, step):
+    shape = tuple(tir.IntImm(index_dtype, extent) for extent in (3, 7))
+    start, stop = (6, 0) if step < 0 else (1, 7)
+    source_shape = (shape[0], tir.IntImm(index_dtype, len(range(start, stop, step))))
+    base = te.placeholder(shape, "int32", "base")
+    updates = te.placeholder(source_shape, "int32", "updates")
+    begin = te.placeholder((2,), "int32", "begin")
+    end = te.placeholder((2,), "int32", "end")
+    strides = te.placeholder((2,), "int32", "strides")
+    output = topi.strided_set(base, updates, begin, end, strides)
+    runtime = tvm.build(te.create_prim_func([base, updates, begin, end, strides, output]), "llvm")
+    values = np.arange(21, dtype="int32").reshape(3, 7)
+    source = (np.arange(3 * int(source_shape[1])) * 17 - 128).astype("int32").reshape(3, -1)
+    expected = values.copy()
+    expected[:, start:stop:step] = source
+    actual = tvm.nd.empty(expected.shape, "int32")
+    runtime(
+        tvm.nd.array(values), tvm.nd.array(source),
+        tvm.nd.array(np.array([0, start], "int32")),
+        tvm.nd.array(np.array([3, stop], "int32")),
+        tvm.nd.array(np.array([1, step], "int32")), actual,
+    )
+    np.testing.assert_array_equal(actual.numpy(), expected)
+
+
 @tvm.testing.uses_gpu
 def test_expand_dims():
     verify_expand_dims((3, 10), (3, 10, 1, 1), 2, 2)
