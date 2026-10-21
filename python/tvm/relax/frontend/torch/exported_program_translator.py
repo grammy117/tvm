@@ -234,6 +234,25 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         )
         return relax.const(value, self._convert_data_type(dtype))
 
+    def _full(self, node: fx.Node, *, like: bool = False) -> relax.Var:
+        args = self.retrieve_args(node)
+        source = args[0]
+        value = args[1] if len(args) > 1 else node.kwargs["fill_value"]
+        captured = node.meta.get("val")
+        if not isinstance(captured, torch.Tensor):
+            raise NotImplementedError("Full import requires the captured output dtype")
+        if not isinstance(value, (int, float, bool)):
+            raise NotImplementedError("Full import currently requires a constant scalar fill value")
+        # The captured result preserves PyTorch's default dtype for full and
+        # its input/explicit dtype policy for full_like, without guessing from
+        # the scalar's Python type or inheriting full_like's input dtype.
+        dtype = self._convert_data_type(captured.dtype)
+        fill = relax.const(value, dtype)
+        result = (
+            relax.op.full_like(source, fill, dtype) if like else relax.op.full(source, fill, dtype)
+        )
+        return self.block_builder.emit(result)
+
     def _pad(self, node: fx.Node, *, mode=None) -> relax.Var:
         args = self.retrieve_args(node)
         x = args[0]
@@ -479,6 +498,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "clone.default": lambda node: self.env[node.args[0]],
             "empty.memory_format": self._empty,
             "fill.Scalar": self._fill,
+            "full.default": self._full,
+            "full_like.default": partial(self._full, like=True),
             "scalar_tensor.default": self._scalar_tensor,
             "new_ones.default": self._new_ones,
             # other

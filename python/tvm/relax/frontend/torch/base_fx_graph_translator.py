@@ -54,6 +54,8 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         input_type = input_type.lower() if isinstance(input_type, str) else input_type
         if input_type in ["float", "float32", "torch.float32", torch.float32]:
             return "float32"
+        elif input_type in ["double", "float64", "torch.float64", torch.float64]:
+            return "float64"
         elif input_type in ["float16", "torch.float16", torch.float16]:
             return "float16"
         elif input_type in ["int64", "torch.int64", torch.int64]:
