@@ -191,6 +191,249 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     ########## Neural Network ##########
 
+    @staticmethod
+    def _convolution_axes(value, dim, *, positive=True):
+        values = (value,) * dim if isinstance(value, int) else tuple(value)
+        if len(values) == 1:
+            values *= dim
+        if len(values) != dim or any(
+            not isinstance(item, int) or item < (1 if positive else 0) for item in values
+        ):
+            raise ValueError("Convolution geometry requires static integers in its valid range")
+        return values
+
+    def _convolution(self, node: fx.Node, *, dim=None, transpose=False, direct=False):
+        import math
+        from tvm import tir, topi
+        from ._convolution import modular_convolution
+
+        args = self.retrieve_args(node)
+        data, weight = args[:2]
+
+        def argument(index, name, default):
+            return args[index] if len(args) > index else node.kwargs.get(name, default)
+
+        dim = len(self.shape_of(weight)) - 2 if dim is None else dim
+        if dim not in (1, 2, 3):
+            raise NotImplementedError("Convolution import requires one to three spatial axes")
+        bias = argument(2, "bias", None)
+        strides = self._convolution_axes(argument(3, "stride", 1), dim)
+        padding = self._convolution_axes(argument(4, "padding", 0), dim, positive=False)
+        if direct:
+            dilation = self._convolution_axes(argument(5, "dilation", 1), dim)
+            transpose = argument(6, "transposed", False)
+            output_padding = self._convolution_axes(
+                argument(7, "output_padding", 0), dim, positive=False
+            )
+            groups = argument(8, "groups", 1)
+        elif transpose:
+            output_padding = self._convolution_axes(
+                argument(5, "output_padding", 0), dim, positive=False
+            )
+            groups = argument(6, "groups", 1)
+            dilation = self._convolution_axes(argument(7, "dilation", 1), dim)
+        else:
+            dilation = self._convolution_axes(argument(5, "dilation", 1), dim)
+            groups, output_padding = argument(6, "groups", 1), (0,) * dim
+        if not isinstance(groups, int) or groups <= 0:
+            raise ValueError("Convolution groups must be a positive static integer")
+        unbatched = len(self.shape_of(data)) == dim + 1
+        if unbatched:
+            data = self.block_builder.emit(relax.op.expand_dims(data, 0))
+        if len(self.shape_of(data)) != dim + 2:
+            raise ValueError("Convolution input rank does not match its weight")
+        dtype = self._captured_dtype(node)
+        if dtype not in ("int8", "int32", "int64", "float16", "float32", "float64"):
+            raise NotImplementedError("Convolution dtype is outside the admitted numeric contract")
+        if data.struct_info.dtype != dtype or weight.struct_info.dtype != dtype:
+            raise ValueError("Convolution data, weight and captured result must have one dtype")
+        data_shape, weight_shape = tuple(self.shape_of(data)), tuple(self.shape_of(weight))
+        out_channels = weight_shape[1] * groups if transpose else weight_shape[0]
+        spatial = tuple(
+            (size - 1) * stride - 2 * pad + dil * (kernel - 1) + 1 + extra
+            if transpose
+            else (size + 2 * pad - dil * (kernel - 1) - 1) // stride + 1
+            for size, kernel, stride, pad, dil, extra in zip(
+                data_shape[2:], weight_shape[2:], strides, padding, dilation, output_padding
+            )
+        )
+        shape = data_shape[:1] + (out_channels,) + spatial
+        compute_dtype = "float32" if dtype == "float16" else dtype
+        if dtype == "int8":
+            extents = weight_shape[2:] + (data_shape[1] // groups,)
+            if not all(isinstance(size, tir.IntImm) for size in extents):
+                raise NotImplementedError("INT8 convolution requires a static accumulation bound")
+            magnitude = 1 << (tvm.DataType(dtype).bits - 1)
+            bound = math.prod(int(size) for size in extents) * magnitude**2 + (
+                magnitude if bias is not None else 0
+            )
+            if bound > (1 << 63) - 1:
+                raise NotImplementedError("INT8 convolution exceeds the proven INT64 prefix bound")
+            compute_dtype = "int32" if bound <= (1 << 31) - 1 else "int64"
+        if dtype in ("int32", "int64"):
+            if not all(isinstance(size, tir.IntImm) for size in data_shape + weight_shape):
+                raise NotImplementedError("Modular convolution requires static tensor extents")
+            result = self.block_builder.emit_te(
+                modular_convolution,
+                data,
+                weight,
+                shape,
+                strides,
+                padding,
+                dilation,
+                groups,
+                transpose,
+                primfunc_name_hint="modular_convolution",
+            )
+        else:
+            lhs, rhs = data, weight
+            if dtype == "float16":
+                lhs = self.block_builder.emit(relax.op.astype(lhs, compute_dtype))
+                rhs = self.block_builder.emit(relax.op.astype(rhs, compute_dtype))
+            if transpose and (
+                dim == 3 or any(extra >= stride for extra, stride in zip(output_padding, strides))
+            ):
+                result = self.block_builder.emit_te(
+                    topi.nn.group_conv_transpose_ncx,
+                    lhs,
+                    rhs,
+                    strides,
+                    padding * 2,
+                    output_padding,
+                    dilation,
+                    groups,
+                    compute_dtype,
+                    primfunc_name_hint=f"conv{dim}d_transpose",
+                )
+            else:
+                op = getattr(relax.op.nn, f"conv{dim}d" + ("_transpose" if transpose else ""))
+                kwargs = {"output_padding": output_padding} if transpose else {}
+                result = self.block_builder.emit(
+                    op(
+                        lhs,
+                        rhs,
+                        strides=strides,
+                        padding=padding * 2,
+                        dilation=dilation,
+                        groups=groups,
+                        out_dtype=compute_dtype,
+                        **kwargs,
+                    )
+                )
+        if bias is not None:
+            bias = self.block_builder.emit(relax.op.reshape(bias, (1, -1) + (1,) * dim))
+            if dtype in ("int32", "int64"):
+                result = self._numeric_values(result, bias, dtype, "add")
+            else:
+                if bias.struct_info.dtype != compute_dtype:
+                    bias = self.block_builder.emit(relax.op.astype(bias, compute_dtype))
+                result = self.block_builder.emit(relax.op.add(result, bias))
+        if result.struct_info.dtype != dtype:
+            result = self.block_builder.emit(relax.op.astype(result, dtype))
+        if unbatched:
+            result = self.block_builder.emit(relax.op.squeeze(result, 0))
+        return result
+
+    def _convolution_backward(self, node: fx.Node):
+        from tvm import tir
+        from tvm.relax.op._op_gradient import conv2d_grad
+        from ._convolution import convolution_input_gradient, convolution_weight_gradient
+
+        args = self.retrieve_args(node)
+        gradient, data, weight = args[:3]
+        dim = len(self.shape_of(weight)) - 2
+        if dim not in (1, 2, 3) or len(self.shape_of(data)) != dim + 2:
+            raise NotImplementedError(
+                "Convolution backward requires batched one/two/three-dimensional inputs"
+            )
+        dtype = data.struct_info.dtype
+        if dtype not in ("float32", "float64"):
+            raise NotImplementedError(
+                "Convolution backward currently admits FP32/FP64 CPU contracts; integer gradients "
+                "are not source CPU operations and FP16 backward is unqualified on this CPU build"
+            )
+        if weight.struct_info.dtype != dtype or gradient.struct_info.dtype != dtype:
+            raise ValueError("Convolution gradients, data and weight must have one dtype")
+        strides = self._convolution_axes(args[4], dim)
+        padding = self._convolution_axes(args[5], dim, positive=False)
+        dilation = self._convolution_axes(args[6], dim)
+        transpose, groups, mask = args[7], args[9], tuple(args[10])
+        data_shape, weight_shape = tuple(self.shape_of(data)), tuple(self.shape_of(weight))
+        if not all(
+            isinstance(size, tir.IntImm)
+            for size in data_shape + weight_shape + tuple(self.shape_of(gradient))
+        ):
+            raise NotImplementedError(
+                "Convolution adjoint admission currently requires static tensor extents"
+            )
+        results = [None, None, None]
+        if int(data_shape[0]) == 0:
+            shapes = (data_shape, weight_shape, (self.shape_of(gradient)[1],))
+            return tuple(
+                self.block_builder.emit(relax.op.zeros(shape, dtype)) if requested else None
+                for shape, requested in zip(shapes, mask)
+            )
+        if not transpose and dim < 3 and (mask[0] or mask[1]):
+            lhs, rhs, grad = data, weight, gradient
+            s2, p2, d2 = strides, padding, dilation
+            if dim == 1:
+                lhs = self.block_builder.emit(relax.op.expand_dims(lhs, 2))
+                rhs = self.block_builder.emit(relax.op.expand_dims(rhs, 2))
+                grad = self.block_builder.emit(relax.op.expand_dims(grad, 2))
+                s2, p2, d2 = (1,) + strides, (0,) + padding, (1,) + dilation
+            original = self.block_builder.emit(
+                relax.op.nn.conv2d(
+                    lhs,
+                    rhs,
+                    strides=s2,
+                    padding=p2 * 2,
+                    dilation=d2,
+                    groups=groups,
+                    out_dtype=dtype,
+                )
+            )
+            mathematical = conv2d_grad(
+                original, self.block_builder.lookup_binding(original), grad, self.block_builder
+            )
+            for index in (0, 1):
+                if mask[index]:
+                    value = self.block_builder.emit(mathematical[index])
+                    results[index] = (
+                        self.block_builder.emit(relax.op.squeeze(value, 2)) if dim == 1 else value
+                    )
+        else:
+            if mask[0]:
+                results[0] = self.block_builder.emit_te(
+                    convolution_input_gradient,
+                    gradient,
+                    weight,
+                    data_shape,
+                    strides,
+                    padding,
+                    dilation,
+                    groups,
+                    transpose,
+                    primfunc_name_hint="convolution_input_gradient",
+                )
+            if mask[1]:
+                results[1] = self.block_builder.emit_te(
+                    convolution_weight_gradient,
+                    data,
+                    gradient,
+                    weight_shape,
+                    strides,
+                    padding,
+                    dilation,
+                    groups,
+                    transpose,
+                    primfunc_name_hint="convolution_weight_gradient",
+                )
+        if mask[2]:
+            results[2] = self.block_builder.emit(
+                relax.op.sum(gradient, axis=[0] + list(range(2, dim + 2)))
+            )
+        return tuple(results)
+
     def _pool_input(self, node, dim):
         x = self.retrieve_args(node)[0]
         rank = len(self.shape_of(x))
@@ -817,11 +1060,14 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "col2im.default": self._col2im,
             "baddbmm.default": self._baddbmm,
             "bmm.default": self._matmul,
-            "conv_transpose1d.default": self._conv_transpose1d,
-            "conv_transpose2d.input": self._conv_transpose2d,
-            "conv1d.default": self._conv1d,
-            "conv2d.default": self._conv2d,
-            "conv3d.default": self._conv3d,
+            "convolution.default": partial(self._convolution, direct=True),
+            "convolution_backward.default": self._convolution_backward,
+            "conv_transpose1d.default": partial(self._convolution, dim=1, transpose=True),
+            "conv_transpose2d.input": partial(self._convolution, dim=2, transpose=True),
+            "conv_transpose3d.input": partial(self._convolution, dim=3, transpose=True),
+            "conv1d.default": partial(self._convolution, dim=1),
+            "conv2d.default": partial(self._convolution, dim=2),
+            "conv3d.default": partial(self._convolution, dim=3),
             "einsum.default": self._einsum,
             "embedding.default": lambda node: self._embedding_impl(
                 self.env[node.args[1]], self.env[node.args[0]]

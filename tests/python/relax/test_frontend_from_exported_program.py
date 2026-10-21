@@ -1570,7 +1570,7 @@ def test_conv_transpose1d():
                     padding=[0, 0],
                     dilation=[1],
                     data_layout="NCW",
-                    kernel_layout="OIW",
+                    kernel_layout="IOW",
                     out_layout="NCW",
                     out_dtype="float32",
                 )
@@ -1604,7 +1604,7 @@ def test_conv_transpose1d():
                     padding=[0, 0],
                     dilation=[1],
                     data_layout="NCW",
-                    kernel_layout="OIW",
+                    kernel_layout="IOW",
                     out_layout="NCW",
                     out_dtype="float32",
                 )
@@ -1662,7 +1662,7 @@ def test_conv_transpose2d():
                     padding=[0, 0, 0, 0],
                     dilation=[1, 1],
                     data_layout="NCHW",
-                    kernel_layout="OIHW",
+                    kernel_layout="IOHW",
                     out_layout="NCHW",
                     out_dtype="float32",
                 )
@@ -1696,7 +1696,7 @@ def test_conv_transpose2d():
                     padding=[0, 0, 0, 0],
                     dilation=[1, 1],
                     data_layout="NCHW",
-                    kernel_layout="OIHW",
+                    kernel_layout="IOHW",
                     out_layout="NCHW",
                     out_dtype="float32",
                 )
