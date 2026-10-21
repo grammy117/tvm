@@ -200,14 +200,14 @@ Statuses here are development state, not a completed hardware-support table.
 
 | Family | Requested operations | Current migration state |
 | --- | --- | --- |
-| Matrix | `mm`, `bmm` | Structural scheduling, queued-DMA checks and bounded Spike/RTL checks implemented; full operator inventory remains pending |
+| Matrix | `mm`, `bmm` | Mathematical integer contractions have structural scheduling, queued-DMA checks and bounded Spike/RTL checks. The direct ATen audit still finds missing `mm.default` import and incorrect FP32 output for integer `bmm`; these are separate frontend defects |
 | Biased matrix | `addmm` | Exact integer matmul with eligible INT32 tensor bias uses accumulator preload; shared products and unsupported epilogues retain their original mathematics. CPU activation/scaling and complete ATen/frontend admission remain separate |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
-| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 addition uses accumulator overwrite/add loads and full readout, with separate ordinary and explicit modulo-32 contracts. INT8 ReLU uses exact widen/readout tile intrinsics. Other mappings remain under audit; CPU fallback retained |
+| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 addition uses accumulator overwrite/add loads and full readout, with separate ordinary and explicit modulo-32 contracts. INT8 ReLU uses exact widen/readout tile intrinsics. ATen add/sub currently ignore nondefault alpha and direct scalar overload conversions are missing; the next fidelity work must repair these before claiming complete frontend/CPU fallback support |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; wider frontend and rounding audit remains required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies now expose concatenation and static positive-stride scatter regions through standard scheduling; their bounded target qualification is separate from the earlier padding checkpoint. Broader literal arithmetic and full frontend/aliasing admission remain under audit |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies expose concatenation and static positive-stride scatter regions through standard scheduling. Constant full/full_like import preserves the captured dtype; normal constant folding can eliminate them, and unfolded literal fills use the existing DMA intrinsic. Broader dtype/frontend/aliasing admission remains under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Admitted static frontend forms execute as standard metadata or INT8/INT32/FP32 mathematical copies. Internal reshapes can disappear; indexed or boundary materializations use DMA when Tensorize proves the access map. Constants and nonunit squeeze can require no device calls. Hidden storage aliases, dynamic contracts and zero-extent static-export buffers remain explicit limitations |
 
 ### Corrections to the proposed native-unit mappings
@@ -674,3 +674,51 @@ runtime scalar construction still needs a representable frontend contract.
 The next creation-op audit reproduces unsupported `aten.full.default` and
 `aten.full_like.default` import. Those are frontend gaps, not missing hardware
 fill capabilities, and do not count as successful CPU fallback.
+
+The following creation change resolves that `full`/`full_like` audit for constant
+scalar arguments. Import emits ordinary Relax `full`/`full_like` with the captured
+output dtype, preserving default integer/bool/float inference and explicit dtype
+overrides. Standard constant folding may remove the computation. Without that
+optimization, standard legalization and the existing literal-fill scheduling
+rule tensorize the mathematical fill; there is no new creation kernel or
+operator-name hardware dispatch. The shared frontend dtype converter also admits
+FP64, including a changed PyTorch floating default. Native movement remains
+limited to the explicitly admitted INT8/INT32/FP32 contracts.
+
+TensorIR admission now accepts output-only functions. Their output pointer,
+alignment, positive span and address overflow are checked before any device
+command. `adapter-creation-v1` retains all nineteen preceding executable section
+byte sequences and adds only the six-line output-buffer validator. This is an
+ABI admission helper, not a mathematical implementation. The guest directly
+checks null, nonpositive, misaligned and wrapping output spans against the
+cross-compiled helper; target positive runs require these rejection checks.
+
+`device-creation-native-v1` qualifies both creation ops with INT8/INT32/FP32
+literal DMA and a small contraction regression. These explicitly unoptimized
+fixtures demonstrate hardware mapping, not performance. The optimized fixtures
+in `device-creation-folded-v1` require all six creation computations to fold to
+constant outputs with zero device commands; split and INT64 sum regressions
+still exercise the array/DMA path. All fifteen fixture executions pass Spike
+and RTL with wrong-oracle controls. Positive RTL runs take approximately 33 and
+40 seconds within the existing bounds; ELF audits contain no prohibited loop
+instructions. The immutable compiler-core-v6 libraries are unchanged.
+
+`unit-creation-full-pinned-v1.log` passes all 339 collected checks, including
+the preceding view/export regressions and 27 creation checks. Creation checks
+preserve output shape/dtype/bits for defaults, overrides, integer extremes,
+fractional-to-integer conversion, NaN, signed zero, scalar and empty shapes.
+They check native DMA and constant folding separately. Empty tensors remain
+outside the static export ABI, and runtime scalar arguments to these ATen
+creation overloads are not admitted by this importer; runtime tensor fills
+continue through the separately tested fill.Scalar path.
+
+The independent `arithmetic-next-audit-v1.json` probes thirty small ATen
+operator/dtype combinations rather than certifying whole operators. Seventeen
+are refused or fail, eight have semantic mismatches, and five match independent
+CPU references. It finds missing direct mm/scalar-overload conversion, forced
+FP32 integer bmm output, mixed-dtype integer addmm failure and ignored tensor
+add/sub alpha. A twelve-case diagnostic with unchanged legacy Python importers
+reproduces five INT32/FP32 mismatches and six refusals; that older importer also
+refuses INT8 input. These defects are not concealed by the passing mathematical
+TensorIR tests. Frontend fidelity work and the remaining pooling/backward
+inventory are still required before completing the migration.

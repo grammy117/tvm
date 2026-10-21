@@ -90,6 +90,36 @@ def fixtures():
     from tvm import relax, te, topi
 
     result = []
+    for kind in ("full", "full_like"):
+        for dtype, fill in (("int8", -128), ("int32", -2147483648), ("float32", -0.0)):
+            import torch
+            from tvm.relax.frontend.torch import from_exported_program
+
+            class Creation(torch.nn.Module):
+                def forward(self, x):
+                    return (
+                        torch.full((2, 3), fill, dtype=getattr(torch, dtype))
+                        if kind == "full"
+                        else torch.full_like(x, fill)
+                    )
+
+            values = np.arange(6).reshape(2, 3).astype(dtype)
+            example = torch.from_numpy(values)
+            model = Creation()
+            graph = from_exported_program(
+                torch.export.export(model, (example,)), unwrap_unit_return_tuple=True
+            )
+            for optimized in (False, True):
+                result.append(
+                    (
+                        f"creation_{kind}_{dtype}_{'folded' if optimized else 'native'}",
+                        graph,
+                        [values],
+                        model(example).numpy(),
+                        "host" if optimized else "gemmini",
+                        {"optimize": optimized},
+                    )
+                )
     for name, shape in (("relu_i8", (16, 16)), ("relu_tail", (3, 17))):
         a = (np.arange(np.prod(shape)).reshape(shape) % 256 - 128).astype("int8")
         av = relax.Var("a", relax.TensorStructInfo(shape, "int8"))
@@ -731,7 +761,9 @@ def prepare(args):
         placement = case[4] if len(case) > 4 else "gemmini"
         report = []
         options = {"col_tiles": 2, "reduction_chunk": 8} if name == "reuse" else None
-        modules[name] = prepare_gemmini_graph(mod, report=report, schedule_options=options)
+        modules[name] = prepare_gemmini_graph(
+            mod, report=report, schedule_options=options, **(case[5] if len(case) > 5 else {})
+        )
         if sum(row["placement"] == "gemmini" for row in report) != (
             0 if placement == "host" else 1
         ):
@@ -740,7 +772,16 @@ def prepare(args):
     package = out / "package"
     manifest = export_graphs(modules, package, memory_limit_bytes=16 << 20)
     guest = [GUEST, '#include "package/model.h"']
-    checks = []
+    checks = [
+        "extern int32_t tvm_gemmini_validate_tensor_output(void*,int64_t);",
+        "uint32_t admission_probe=0;",
+        "if(tvm_gemmini_validate_tensor_output(&admission_probe,sizeof(admission_probe))!=0 || "
+        "tvm_gemmini_validate_tensor_output(NULL,4)!=-1 || "
+        "tvm_gemmini_validate_tensor_output(&admission_probe,0)!=-1 || "
+        "tvm_gemmini_validate_tensor_output(&admission_probe,-1)!=-1 || "
+        "tvm_gemmini_validate_tensor_output((uint8_t*)&admission_probe+1,4)!=-1 || "
+        "tvm_gemmini_validate_tensor_output((void*)(UINTPTR_MAX-3),8)!=-2)return 25;",
+    ]
     for index, case in enumerate(cases):
         name, _, arrays, expected = case[:4]
         placement = case[4] if len(case) > 4 else "gemmini"
@@ -885,6 +926,7 @@ def prepare(args):
         "case_count": len(cases),
         "cases": [case[0] for case in cases],
         "placements": {case[0]: case[4] if len(case) > 4 else "gemmini" for case in cases},
+        "preparation_options": {case[0]: case[5] if len(case) > 5 else {} for case in cases},
     }
     (out / "bundle.json").write_text(json.dumps(bundle, indent=2) + "\n")
     print(json.dumps({"status": "prepared", "bundle": str(out / "bundle.json")}))
@@ -1081,6 +1123,12 @@ def main():
             "view_noop_i32",
             "view_scalar_f32",
             "view_alias_i32",
+            *[
+                f"creation_{kind}_{dtype}_{mode}"
+                for kind in ("full", "full_like")
+                for dtype in ("int8", "int32", "float32")
+                for mode in ("native", "folded")
+            ],
         ],
     )
     execute = sub.add_parser("run")
