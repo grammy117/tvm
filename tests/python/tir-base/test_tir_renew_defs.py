@@ -17,6 +17,7 @@
 
 import tvm
 import tvm.testing
+import numpy as np
 from tvm.script import tir as T
 from tvm.tir.buffer import Buffer
 from tvm.tir.function import PrimFunc
@@ -203,6 +204,40 @@ def test_gather():
     f1 = take
     f2 = tvm.tir.stmt_functor.renew_defs(take)
     tvm.ir.assert_structural_equal(f1, f2)
+
+
+def test_nonzero_iteration_domain_preserves_extent_and_execution():
+    @T.prim_func
+    def source(A: T.Buffer((12,), "int32"), B: T.Buffer((12,), "int32")):
+        for i in T.serial(6):
+            with T.block("copy"):
+                vi = T.axis.spatial((3, 9), i + 3)
+                B[vi] = T.if_then_else(vi >= 6, A[vi], T.int32(-7))
+
+    renewed = tvm.tir.stmt_functor.renew_defs(source)
+    tvm.ir.assert_structural_equal(source, renewed)
+    values = np.arange(12, dtype="int32")
+    output = tvm.nd.array(np.full(12, -99, "int32"))
+    tvm.build(renewed, "llvm")(tvm.nd.array(values), output)
+    expected = np.full(12, -99, "int32")
+    expected[3:6] = -7
+    expected[6:9] = values[6:9]
+    np.testing.assert_array_equal(output.numpy(), expected)
+
+
+def test_free_buffer_identity_and_access_only_reference():
+    buffer = tvm.tir.decl_buffer((8,), "int32", name="free")
+    block = tvm.tir.Block(
+        [],
+        [tvm.tir.BufferRegion(buffer, [tvm.ir.Range(0, 8)])],
+        [],
+        "opaque",
+        tvm.tir.Evaluate(buffer.data),
+    )
+    func = tvm.tir.PrimFunc([], tvm.tir.BlockRealize([], True, block))
+    renewed = tvm.tir.stmt_functor.renew_defs(func)
+    tvm.ir.assert_structural_equal(func, renewed)
+    assert renewed.body.block.reads[0].buffer.same_as(buffer)
 
 
 if __name__ == "__main__":

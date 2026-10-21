@@ -25,6 +25,8 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
+
 #include "../ir/functor_common.h"
 
 namespace tvm {
@@ -226,8 +228,8 @@ class RenewDefMutator : public StmtExprMutator {
     }
     PrimExpr min = VisitExpr(iter_var->dom->min);
     PrimExpr extent = VisitExpr(iter_var->dom->extent);
-    IterVar new_iter_var(Range(min, extent), ReDefineVar(iter_var->var), iter_var->iter_type,
-                         iter_var->thread_tag);
+    IterVar new_iter_var(Range::FromMinExtent(min, extent), ReDefineVar(iter_var->var),
+                         iter_var->iter_type, iter_var->thread_tag);
     this->AddDefRemap(iter_var, new_iter_var);
     return new_iter_var;
   }
@@ -247,6 +249,16 @@ class RenewDefMutator : public StmtExprMutator {
     Array<PrimExpr> strides =
         buffer->strides.Map(std::bind(&RenewDefMutator::VisitExpr, this, std::placeholders::_1));
     PrimExpr elem_offset = VisitExpr(buffer->elem_offset);
+
+    auto same_expr = [](const PrimExpr& a, const PrimExpr& b) { return a.same_as(b); };
+    if (data.same_as(buffer->data) && elem_offset.same_as(buffer->elem_offset) &&
+        std::equal(shape.begin(), shape.end(), buffer->shape.begin(), same_expr) &&
+        std::equal(strides.begin(), strides.end(), buffer->strides.begin(), same_expr)) {
+      // This buffer is defined outside the renewed function/subtree. Preserve
+      // its identity so dependency analysis still connects it to other users.
+      this->AddDefRemap(buffer, buffer);
+      return buffer;
+    }
 
     auto n = make_object<BufferNode>(*buffer.get());
     n->data = std::move(data);
@@ -275,7 +287,7 @@ class RenewDefMutator : public StmtExprMutator {
   }
 
   BufferRegion VisitBufferRegion(const BufferRegion& buffer_region) {
-    Buffer buffer = VisitBuffer(buffer_region->buffer);
+    Buffer buffer = VisitDeclOrRemapBuffer(buffer_region->buffer);
     Array<Range> region = buffer_region->region.Map(
         std::bind(&RenewDefMutator::VisitRange, this, std::placeholders::_1));
     if (buffer.same_as(buffer_region->buffer) && region.same_as(buffer_region->region)) {
