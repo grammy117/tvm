@@ -312,6 +312,113 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             result = self.block_builder.emit(relax.op.squeeze(result, 0))
         return result
 
+    @staticmethod
+    def _window_pair(value, *, positive=True):
+        values = (value, value) if isinstance(value, int) else tuple(value)
+        if len(values) == 1:
+            values = values * 2
+        if len(values) != 2 or any(
+            not isinstance(item, int) or item < (1 if positive else 0) for item in values
+        ):
+            raise ValueError("Window geometry requires two static integers in its valid range")
+        return values
+
+    def _pool_backward(self, node: fx.Node, *, adaptive=False) -> relax.Var:
+        from ._overlap import adaptive_pool_backward, average_pool_backward
+
+        args = self.retrieve_args(node)
+        gradient, data = args[:2]
+        shape = self.shape_of(data)
+        unbatched = len(shape) == 3
+        if len(shape) not in (3, 4) or len(self.shape_of(gradient)) != len(shape):
+            raise ValueError("Pool backward requires matching batched or unbatched 2D ranks")
+        dtype = data.struct_info.dtype
+        if gradient.struct_info.dtype != dtype:
+            raise ValueError("Pool gradient dtype must match its input")
+        allowed = ("float16", "float32", "float64") + (() if adaptive else ("int64",))
+        if dtype not in allowed:
+            raise NotImplementedError("Pool backward dtype is outside the admitted CPU contract")
+        if unbatched:
+            gradient = self.block_builder.emit(relax.op.expand_dims(gradient, 0))
+            data = self.block_builder.emit(relax.op.expand_dims(data, 0))
+            shape = self.shape_of(data)
+        if adaptive:
+            result = self.block_builder.emit_te(
+                adaptive_pool_backward,
+                gradient,
+                tuple(shape),
+                primfunc_name_hint="adaptive_pool_backward",
+            )
+        else:
+
+            def argument(index, name, default):
+                return args[index] if len(args) > index else node.kwargs.get(name, default)
+
+            kernel = self._window_pair(argument(2, "kernel_size", None))
+            stride_arg = argument(3, "stride", [])
+            strides = (
+                kernel
+                if stride_arg is None or stride_arg == [] or stride_arg == ()
+                else self._window_pair(stride_arg)
+            )
+            padding = self._window_pair(argument(4, "padding", 0), positive=False)
+            ceil = argument(5, "ceil_mode", False)
+            include = argument(6, "count_include_pad", True)
+            divisor = argument(7, "divisor_override", None)
+            if divisor is not None and (not isinstance(divisor, int) or divisor == 0):
+                raise ValueError("Average-pool backward divisor must be a nonzero static integer")
+            if dtype in ("float32", "float64") and divisor is None:
+                result = self.block_builder.emit(
+                    relax.op.grad.avg_pool2d_backward(
+                        gradient,
+                        data,
+                        kernel,
+                        strides,
+                        padding * 2,
+                        ceil_mode=ceil,
+                        count_include_pad=include,
+                    )
+                )
+            else:
+                result = self.block_builder.emit_te(
+                    average_pool_backward,
+                    gradient,
+                    tuple(shape),
+                    kernel,
+                    strides,
+                    padding,
+                    include,
+                    divisor,
+                    primfunc_name_hint="average_pool_backward",
+                )
+        if unbatched:
+            result = self.block_builder.emit(relax.op.squeeze(result, 0))
+        return result
+
+    def _col2im(self, node: fx.Node) -> relax.Var:
+        from ._overlap import col2im
+
+        args = self.retrieve_args(node)
+        data = args[0]
+        if len(self.shape_of(data)) not in (2, 3):
+            raise ValueError("Col2im requires a batched or unbatched column matrix")
+        if data.struct_info.dtype not in ("float16", "float32", "float64", "bool"):
+            raise NotImplementedError("Col2im dtype is outside the admitted CPU contract")
+
+        def argument(index, name, default):
+            return args[index] if len(args) > index else node.kwargs.get(name, default)
+
+        return self.block_builder.emit_te(
+            col2im,
+            data,
+            self._window_pair(argument(1, "output_size", None)),
+            self._window_pair(argument(2, "kernel_size", None)),
+            self._window_pair(argument(3, "dilation", 1)),
+            self._window_pair(argument(4, "padding", 0), positive=False),
+            self._window_pair(argument(5, "stride", 1)),
+            primfunc_name_hint="col2im",
+        )
+
     def _batch_norm_legit_no_training(self, node: fx.Node) -> relax.Var:
         import numpy as np
 
@@ -705,6 +812,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "avg_pool1d.default": partial(self._average_pool, dim=1),
             "avg_pool2d.default": partial(self._average_pool, dim=2),
             "avg_pool3d.default": partial(self._average_pool, dim=3),
+            "avg_pool2d_backward.default": self._pool_backward,
+            "_adaptive_avg_pool2d_backward.default": partial(self._pool_backward, adaptive=True),
+            "col2im.default": self._col2im,
             "baddbmm.default": self._baddbmm,
             "bmm.default": self._matmul,
             "conv_transpose1d.default": self._conv_transpose1d,
