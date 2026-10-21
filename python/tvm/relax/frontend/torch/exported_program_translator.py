@@ -312,7 +312,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "upsample_bilinear2d.vec": self._upsample_bilinear2d,
             "upsample_nearest2d.vec": self._upsample_nearest2d,
             # statistical
+            "mean.default": self._mean,
             "mean.dim": self._mean,
+            "sum.default": self._sum,
             "sum.dim_IntList": self._sum,
             # search
             "argmax.default": self._argmax_argmin(relax.op.argmax),
