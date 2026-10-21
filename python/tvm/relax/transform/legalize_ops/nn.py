@@ -167,11 +167,18 @@ def _nn_conv1d_transpose(bb: BlockBuilder, call: Call) -> Expr:
         return call
     dilation = call.attrs.dilation
     if len(dilation) != 1 or dilation[0] != 1:
-        logging.info(
-            "TOPI conv1d_transpose does not support dilations other than 1, "
-            "and thus cannot be legalized by TOPI"
+        return bb.call_te(
+            topi.nn.group_conv_transpose_ncx,
+            call.args[0],
+            call.args[1],
+            call.attrs.strides,
+            call.attrs.padding,
+            call.attrs.output_padding,
+            dilation,
+            call.attrs.groups,
+            call.struct_info.dtype,
+            primfunc_name_hint="conv1d_transpose",
         )
-        return call
 
     return bb.call_te(
         topi.nn.group_conv1d_transpose_ncw,
@@ -202,11 +209,18 @@ def _nn_conv2d_transpose(bb: BlockBuilder, call: Call) -> Expr:
         return call
     dilation = call.attrs.dilation
     if len(dilation) != 2 or dilation[0] != 1 or dilation[1] != 1:
-        logging.info(
-            "TOPI conv2d_transpose does not support dilations other than 1, "
-            "and thus cannot be legalized by TOPI"
+        return bb.call_te(
+            topi.nn.group_conv_transpose_ncx,
+            call.args[0],
+            call.args[1],
+            call.attrs.strides,
+            call.attrs.padding,
+            call.attrs.output_padding,
+            dilation,
+            call.attrs.groups,
+            call.struct_info.dtype,
+            primfunc_name_hint="conv2d_transpose",
         )
-        return call
 
     return bb.call_te(
         topi.nn.group_conv2d_transpose_nchw,
