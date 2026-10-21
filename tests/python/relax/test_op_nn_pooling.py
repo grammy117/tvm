@@ -23,6 +23,45 @@ from tvm.ir import Op, VDevice
 from tvm.script import relax as R
 
 
+@pytest.mark.parametrize("pool", [relax.op.nn.avg_pool1d, relax.op.nn.max_pool1d])
+@pytest.mark.parametrize("width", [6, 17, tir.Var("width", "int64")])
+def test_pool1d_ceil_inference_uses_its_single_stride(pool, width):
+    bb = relax.BlockBuilder()
+    x = relax.Var("x", relax.TensorStructInfo((2, 3, width), "float32"))
+    expected_width = width // 2 + 1
+    _check_inference(
+        bb,
+        pool(x, pool_size=3, strides=2, padding=1, ceil_mode=True),
+        relax.TensorStructInfo((2, 3, expected_width), "float32"),
+    )
+
+
+@pytest.mark.parametrize("average", [False, True])
+def test_pool1d_ceil_executes_with_partial_final_window(average):
+    import numpy as np
+
+    builder = relax.BlockBuilder()
+    x = relax.Var("x", relax.TensorStructInfo((2, 3, 6), "float32"))
+    pool = relax.op.nn.avg_pool1d if average else relax.op.nn.max_pool1d
+    with builder.function("main", [x]):
+        with builder.dataflow():
+            kwargs = {"count_include_pad": True} if average else {}
+            output = builder.emit_output(pool(x, 3, 2, 1, ceil_mode=True, **kwargs))
+        builder.emit_func_output(output)
+    vm = relax.VirtualMachine(relax.build(builder.get(), "llvm"), tvm.cpu())
+    values = (np.arange(36).reshape(2, 3, 6) - 16).astype("float32")
+    expected = np.empty((2, 3, 4), "float32")
+    for output_index, start in enumerate((-1, 1, 3, 5)):
+        actual_indices = [i for i in range(start, start + 3) if 0 <= i < 6]
+        window = values[:, :, actual_indices]
+        expected[:, :, output_index] = (
+            np.sum(window, axis=-1) / (min(start + 3, 7) - start)
+            if average
+            else np.max(window, axis=-1)
+        )
+    np.testing.assert_array_equal(vm["main"](tvm.nd.array(values)).numpy(), expected)
+
+
 def test_op_correctness():
     x = relax.Var("x", R.Tensor((2, 3, 28, 28), "float32"))
     assert relax.op.nn.max_pool2d(x).op == Op.get("relax.nn.max_pool2d")
