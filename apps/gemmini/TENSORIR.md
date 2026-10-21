@@ -13,7 +13,12 @@ verified. A passing small matmul does not complete the migration. The user also
 requires exact explanations for requested operations that cannot map to the
 selected hardware and numerical contract.
 
-## Current qualification
+## Frozen migration qualification
+
+The current recipe, measured-search work and deployment limits are documented in
+[EL4_STATUS.md](EL4_STATUS.md). This section records the earlier functional
+migration freeze; its receipts must not be relabeled as new-source or full-model
+performance qualification.
 
 The migration is qualified at source revision
 `19b96df8cc366481220a8d618397b204fb5f61bd`. All 51 requested operator spellings
@@ -33,7 +38,7 @@ dtype, layout, model or performance qualification. No requested spelling remains
 an importer TODO within this scope; unsupported contracts are listed explicitly.
 
 The legacy template branch remains `gemmini/legacy-template` at the base commit.
-The current route is an untuned TVM-generated primitive backend with an explicit
+The frozen route is an untuned TVM-generated primitive backend with an explicit
 integer hardware profile. It is a fork with disclosed correctness patches and
 custom static packaging, rather than an unmodified upstream performance result.
 
@@ -78,52 +83,52 @@ Target rules provide legal transformations and intrinsic substitutions.
 | Mathematical graph simplification and fusion | Active in the normal preparation pipeline | Standard Relax passes; numerical policy stays explicit |
 | Tiling, loop traversal, reindex/layout, cache placement and producer/epilogue placement | Actual TVM Schedule operations, with replayable traces | Target rule chooses legal patterns; not every TVM transformation is exposed to search |
 | Target registration and matching | LLVM/RV64 Gemmini key/profile, independent TensorIntrin families, structural TIR matching | Explicit selected hardware profile; not device discovery or complete modeling of every RTL feature |
-| CPU-versus-Gemmini placement | Legality-driven offload, with CPU fallback on refusal | No measured profitability comparison or ordinary CPU candidate in the successful native rule's candidate set; a tiny legal DMA/add can still be slower |
-| Contraction candidates | Up to 72 parameter combinations | 2 traversals × 2 A/B load orders × 2 K chunks × 3 row groups × 3 column groups; legality can reduce or collapse the space |
+| CPU-versus-Gemmini placement | Default compilation remains legality driven; measured search exposes an ordinary CPU alternative | `include_cpu=True` retains an honest CPU candidate. Profitability has only bounded RTL-model measurements, not full-model/FireSim qualification |
+| Contraction candidates | Up to 72 default combinations; 108 with K=4 added in DSE, plus CPU | Traversal, input issue order, PE-safe K chunks and row/column groups; legality/deduplication reduce the space |
 | Movement/reduction candidates | Rectangular/divisor versus scalar strategies | Narrower space; multiple copy regions currently share one strategy choice |
 | MetaSchedule integration | PyScheduleRule + PostOrderApply + RewriteTensorize + SRAM legality postprocessor | Standard candidate generation/postprocessing works; traces and feature extraction are checked |
-| Timing builder/runner and tuning driver | Not integrated for this TensorIR target | Must lower target SRAM/addressing, link the correct ABI and measure on a qualified target; stock local x86 execution cannot measure RV64/RoCC code |
-| Cost model | No trained Gemmini TensorIR performance model | PerStoreFeature extraction works; diagnostic/synthetic labels prove APIs only. Exhaustive evaluation of a small space is also valid and does not require a learned model |
+| Timing builder/runner and tuning driver | `tune_tensorir.py` builds exact candidate ELFs, checks Spike controls and collects bounded RTL guest cycle intervals | Pinned magic-memory RTL scope, warmup/repeats and receipt checks; not FireSim timing or stock local x86 execution |
+| Cost model | XGBoost ranks standard pre-tensorization PerStoreFeature vectors by log cycles; bounded sweep is also implemented | Four-trial experiments exercise the loop. No validated cross-workload model, convergence or generalization claim |
 | Production schedule selection | Matching database record, otherwise deterministic untuned default | Compilation itself does not call tune_tir/tune_tasks or iterate over all candidates |
 | Database identity and replay | Workload plus target/profile checks | Existing mismatched profile records are refused; any changed numerical graph/schedule space needs appropriately new records |
 | Search mutations | No target mutators registered (`mutator_probs={}`) | The initial space is bounded by our rule; no claim of a broad evolutionary exploration |
 | SRAM allocation | Standard allocation placement/compaction, then checked target row mapping | Current row allocator is conservative and does not reuse different region buffers by disjoint lifetimes |
-| Bias and output fusion | Proved INT32 bias normalization; ordinary CPU epilogue placement | Bias normalization is fixed policy, not a measured profitability choice. General requantized readout fusion is absent |
+| Bias and output fusion | Proved INT32 bias normalization can be enabled/disabled; ordinary CPU epilogue placement | Outer pipeline option, not automatically jointly searched by the function tuner. General requantized readout fusion is absent |
 | Cross-operation SRAM residency | Cache reuse within a scheduled PrimFunc | No general SRAM handoff between separate call_tir functions; host writeback and subsequent reload remain |
 | Primitive command implementation | Small C ABI wrappers issue the ISA commands | TVM cannot optimize inside those wrappers. Configuration elision/coalescing and primitive-call inlining are not searched |
 | DMA/compute overlap | Correct dependency waits/completion | Software pipelining, double buffering and asynchronous overlap search are not implemented |
 | CPU fallback optimization | Standard TVM/LLVM lowering and legal producer inlining | No Gemmini-specific CPU tuning campaign; CPU gathers, division, casts and quantization remain part of end-to-end cost |
 
 The contraction knobs are host traversal `ij/ji`, A-before-B versus B-before-A
-issue order, PE-safe K chunks 8/16, and row/column cache groups 1/2/4.
+issue order, PE-safe K chunks 8/16 (also 4 in the new DSE), and row/column cache groups 1/2/4.
 The 16x16 physical array, exact arithmetic, SRAM bounds and completion rules are
 constraints, not adjustable performance knobs. Within a chosen legal parameter
 set, TVM carries out the transformations and records them; the current rule does
 not search arbitrary layouts, fusion boundaries, loop interchange permutations,
 DMA channel assignments, tail algorithms or software pipelines.
 
-The missing optimization loop is:
+The implemented bounded optimization loop is:
 
 ```mermaid
 flowchart LR
   W[Untiled workload and fixed numeric contract] --> S[Gemmini rules generate legal TVM schedules]
   S --> L[Tensorize and lower SRAM; reject illegal candidates]
-  L --> B[Target tuning builder: missing]
-  B --> R[Qualified timing runner: missing]
-  R --> M[Measured search loop: missing; learned model optional]
+  L --> B[Exact candidate ELF builder and numerical controls]
+  B --> R[Pinned RTL-model guest cycle runner]
+  R --> M[Bounded sweep or measured XGBoost ranking]
   M --> S
-  M --> D[Database API ready; measured records absent]
+  M --> D[Measured trace with profile and execution receipts]
   D --> C[Replay winning trace during compilation]
 ```
 
-The schedule/rule/postprocessing and database-replay portions work. The
-qualified target builder/runner, real timing labels, production search driver
-and measured winner are not completed. The old `gemmini_tuning.py` XGBoost/search
-code belongs to the retained template route; its existence is not evidence that
-the TensorIR route has been performance tuned. Stock MetaSchedule's
-`tir_integration.tune_tir`/`tune.tune_tasks` provide the framework to connect these
-pieces; a learned cost model predicts good candidates rather than proving
-correctness or replacing measurements.
+The current driver uses standard TuneContext/candidate generation, postprocessors,
+semantic feature extraction and ScheduleFnDatabase replay, with an explicit
+cycle-valued measurement/search loop. It does not fabricate second-valued
+TuningRecord costs or claim integration into the stock second-valued tune_tasks
+runner. The old `gemmini_tuning.py` belongs to the retained template route;
+new TensorIR evidence is in `el4-dse-v1`. A learned model ranks candidates; only
+correct, completed measurements select a winner. Whole-graph and FireSim
+profitability remain unqualified. See the newer status document for exact scope.
 
 Generic PerStoreFeature extraction also does not itself model Gemmini command,
 configuration, DMA, fence or bank costs. Those costs need measurements and may
@@ -135,9 +140,9 @@ benefit from additional target features or a calibrated analytic model.
 | --- | --- | --- |
 | Required before claiming model support | Run representative complete imported graphs with their actual dtypes, quantization, scales, layouts and shapes; report native arithmetic/DMA/CPU separately | The 51-op campaign is small-contract functional evidence, not full-model or universal dtype support |
 | Required before collecting optimization labels | Keep the existing hardware/profile and primitive/no-FSM policy pinned; choose and qualify the timing substrate and exact model recipes | Changing these changes the legal compiler and invalidates performance comparisons |
-| Required for measured DSE | Implement the MetaSchedule target builder/runner and search driver; select objective and repeatability protocol | No current measured costs, target winner or usable end-to-end tuning loop exists |
+| Required before expanding measured DSE | Broaden the working bounded driver to representative post-fusion functions and whole graphs; qualify the deployment timing profile | Primitive RTL-model cycle costs and winners now exist; they do not establish model or FireSim performance |
 | Required for useful end-to-end decisions | Include CPU staging, casts, dequantization, launch/configuration/fence costs, transfers and peak workspace in reports; compare the untuned route and preserved baseline | Fast array arithmetic alone may not improve whole-program execution |
-| Required before cost-based device placement claims | Measure compatible CPU alternatives and make placement/fusion profitability an explicit choice | Current native admission is a semantic/resource decision, not a speed comparison |
+| Required before model-wide cost-based placement claims | Expand compatible CPU alternatives and graph/fusion choices under end-to-end measurement | Current function search can choose CPU; default placement is still semantic/resource based and graph-level placement is not jointly tuned |
 | Required when adding/reordering optimization passes | Keep semantic/fusion passes before target scheduling; inspect fallback reports and retune changed workloads; rerun correctness/resource checks for the resulting compiled artifacts | More fusion or a rewritten access map can change target admission and measured behavior |
 | Required before final deployment claims | Qualify complete graph memory/ABI lifetimes, realistic sizes and numerical edge cases on the selected deployment substrate | Current static positive-span ABI, hidden-alias refusals and small simulator tests do not establish production deployment |
 | Optional performance expansion after a measured baseline | Lifetime-aware SRAM reuse, less CPU gathering/reindexing, fewer scalar DMAs, cost-based fusion, better tails, overlap/double buffering, and larger search spaces | These are implementation/performance gaps; adding a cost model alone cannot create them |
@@ -282,8 +287,9 @@ when present, otherwise a deterministic untuned schedule. The v0.19 default
 database query ignores its target argument, so the backend explicitly compares
 the returned record's target/profile before replay. The standard database test
 uses a diagnostic invented cost solely to prove selection/replay; it is never a
-target timing label. A target performance builder/runner and measured tuning
-campaign remain future work.
+target timing label. The later cycle-measured driver and bounded experiments are
+described in [EL4_STATUS.md](EL4_STATUS.md); this paragraph describes the original
+database integration test.
 
 Noncanonical exact contractions use standard `transform_block_layout`,
 `reindex`, `transform_layout`, producer inlining and `compute_at` to form matrix
@@ -308,8 +314,9 @@ The final product copy can inline into device writeback. CPU INT32/FP ReLU and
 quantization remain separate. The wrapped reduction currently uses divisor
 tiles because v0.19 `pad_einsum` does not recognize that expression; prime
 extents may therefore require many tiny commands. Cache groups that do not
-divide those extents are rejected. Bias fusion is currently a fixed policy,
-not a measured profitability decision, and no speedup is claimed.
+divide those extents are rejected. Bias preload is enabled by default and can
+now be disabled as an explicit outer pipeline choice. It has not been jointly
+tuned with graph fusion, and no bias fusion speedup is claimed.
 
 ## Hardware evidence and numerical boundaries
 
