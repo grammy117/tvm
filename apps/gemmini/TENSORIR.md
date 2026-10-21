@@ -579,3 +579,27 @@ audit at that checkpoint reproduced incorrect default integer `sum` output dtype
 `keepdim=True` shape in the existing `_sum` importer. Correct INT64 semantics
 must be restored independently of native INT8-to-INT32 reduction scheduling;
 passing the latter does not qualify the current ATen importer for those sums.
+
+The following reduction change resolves that audit for the admitted PyTorch
+dtype/shape contracts. `device-wide-sum-v1` passes seven fixtures on Spike and
+the pinned RTL, including default INT64 row sums, keepdims over multiple axes,
+a scalar INT64 result, explicit INT32/INT8 output requests, and small ordinary
+contraction/sum regressions. Wrong-oracle controls fail as intended on both
+substrates within the 60-second/300,000-cycle bounds. The primitive adapter is
+unchanged and both ELF audits contain no prohibited instructions.
+
+`unit-wide-sum-full-pinned-v1.log` passes 248 backend/app/frontend checks with
+immutable `compiler-core-v6` libraries. The final Boolean empty-reduction
+adjustment and stronger Boolean inputs are separately checked by all 49 cases
+in `unit-frontend-reduction-v5.log`; those overlap the broader suite and are
+not added to its count. `unit-core-dtype-pinned-v1.log` passes 250 general
+scheduler/index-map checks with one existing affine-analysis skip. Both
+constant-initialization cases fail on the previous immutable compiler, one
+on its stale scope flags and one on its redundant constant cast.
+
+The broader statistical legalization tests retain four older IR expectation
+failures concerning division versus reciprocal multiplication; all other 17
+checks pass. The same four fail with the unchanged prior legalizer and the same
+compiler, as recorded in `unit-statistical-baseline-v1.log`; the modified run
+is `unit-frontend-reduction-v4.log`. They are not counted as passing or repaired
+by this milestone. The full requested operator inventory remains unfinished.
