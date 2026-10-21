@@ -601,6 +601,15 @@ def lower_tensorir_schedule(
         workload_metadata = dict(zip(("m", "n", "k"), shape))
         if isinstance(matches[0][0].init.value, tir.BufferLoad):
             workload_metadata.update(operation="matmul_bias", bias_preloaded=True)
+    cpu_reductions = []
+    tir.stmt_functor.post_order_visit(
+        sch.mod["main"].body,
+        lambda node: cpu_reductions.append(node)
+        if isinstance(node, tir.Block) and node.init is not None
+        else None,
+    )
+    if cpu_reductions:
+        workload_metadata = dict(workload_metadata, cpu_reduction_blocks=len(cpu_reductions))
     device = device.with_attr("gemmini.tensorir", 1)
     device = device.with_attr("gemmini.capability_id", capabilities.fingerprint)
     device = device.with_attr("op_pattern", 8)

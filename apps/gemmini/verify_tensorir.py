@@ -90,6 +90,57 @@ def fixtures():
     from tvm import relax, te, topi
 
     result = []
+    for kind, dim in (
+        ("avg", 1),
+        ("avg", 2),
+        ("avg", 3),
+        ("crop", 2),
+        ("override", 2),
+        ("adaptive", 1),
+        ("adaptive", 2),
+        ("adaptive", 3),
+        ("long", 2),
+    ):
+        import torch
+        from tvm.relax.frontend.torch import from_exported_program
+
+        class Pool(torch.nn.Module):
+            def forward(self, x):
+                if kind == "adaptive":
+                    return getattr(torch.nn.functional, f"adaptive_avg_pool{dim}d")(x, (2,) * dim)
+                kernel = (1,) * (dim - 1) + (2 if kind == "crop" else 3,)
+                strides = (1,) * (dim - 1) + (2,)
+                padding = (0,) * (dim - 1) + (1,)
+                kwargs = {"divisor_override": 5} if kind == "override" else {}
+                return getattr(torch.nn.functional, f"avg_pool{dim}d")(
+                    x, kernel, strides, padding, ceil_mode=kind == "crop", **kwargs
+                )
+
+        spatial = (
+            tuple(5 + i for i in range(dim))
+            if kind == "adaptive"
+            else (1,) * max(dim - 2, 0) + ((2,) if dim > 1 else ()) + (3 if kind == "crop" else 4,)
+        )
+        shape = (1, 1) + spatial
+        values = (np.arange(np.prod(shape)).reshape(shape) - 12).astype(
+            "int64" if kind == "long" else "float32"
+        )
+        if kind != "long":
+            values /= 4
+        model = Pool()
+        example = torch.from_numpy(values)
+        mod = from_exported_program(
+            torch.export.export(model, (example,)), unwrap_unit_return_tuple=True
+        )
+        result.append(
+            (
+                f"pool_{kind}{dim}d",
+                mod,
+                [values],
+                model(example).numpy(),
+                "mixed" if kind in ("avg", "crop") else "host",
+            )
+        )
     for kind, dtype in (
         ("mm", "int8"),
         ("bmm", "int8"),
@@ -955,6 +1006,10 @@ def prepare(args):
         "src/tir/schedule/primitive/block_annotate.cc",
         "src/tir/schedule/primitive/loop_transformation.cc",
         "src/tir/transforms/renew_defs.cc",
+        "src/relax/op/nn/pooling.cc",
+        "src/te/operation/create_primfunc.cc",
+        "src/tir/ir/stmt_functor.cc",
+        "src/tir/ir/data_type_rewriter.cc",
         "python/tvm/topi/transform.py",
         "python/tvm/tir/function.py",
         "python/tvm/relax/transform/legalize_ops/statistical.py",
@@ -962,6 +1017,7 @@ def prepare(args):
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
         "python/tvm/relax/frontend/torch/base_fx_graph_translator.py",
         "python/tvm/relax/frontend/torch/_numeric.py",
+        "python/tvm/relax/frontend/torch/_pooling.py",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -1209,6 +1265,11 @@ def main():
                 for dtype in ("int8", "int32", "float32")
                 for mode in ("native", "folded")
             ],
+            *[f"pool_avg{dim}d" for dim in (1, 2, 3)],
+            *[f"pool_adaptive{dim}d" for dim in (1, 2, 3)],
+            "pool_crop2d",
+            "pool_override2d",
+            "pool_long2d",
         ],
     )
     execute = sub.add_parser("run")

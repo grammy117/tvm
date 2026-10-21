@@ -96,6 +96,7 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
     """Assign bounded physical rows; reject remaining CPU accesses to SRAM."""
     mod = tvm.transform.Sequential(
         [
+            tir.transform.LowerInitBlock(),
             tir.transform.PlanAndUpdateBufferAllocationLocation(),
             tir.transform.ConvertBlocksToOpaque(),
             tir.transform.CompactBufferAllocation(),

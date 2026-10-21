@@ -58,7 +58,8 @@ arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy
 guard described in README.md. That guard rejects unsupported automatic-copy
 annotations and is not a DMA optimization.
 
-The migration fixes nine generic C++ scheduler/IR issues.
+The migration includes generic C++ scheduler/IR fixes. Including the pooling
+work described below, twelve core C++ files differ from the legacy branch.
 In `decompose_reduction`, initialization reads were omitted and retained
 on the update block instead. Separate read-region analysis preserves an
 input-dependent initialization and lets subsequent cache placement see its
@@ -101,6 +102,18 @@ Target-independent constant-initialization tests exercise both the INT32 and
 INT64 producer cases, CPU execution and full trace replay. Python IndexMap
 construction also converts integer literals to the requested index dtype;
 otherwise a printed map containing a constant zero cannot replay in Python.
+
+Pooling exposes additional generic correctness defects. One-dimensional ceil
+inference must read its single stride rather than a nonexistent second entry.
+TE reductions whose axes occupy multiple dependency levels must initialize each
+output once before all reduction loops, including empty domains; initializing
+each nested block resets partial results. Physical loops use zero-based domains
+while block bindings preserve logical origins. Generic statement and index-dtype
+rewriters must reconstruct domains with `Range::FromMinExtent`, not interpret an
+extent as an endpoint. Independent CPU execution checks cover triangular and
+rectangular domains, nonzero origins, input-dependent identities, tuple outputs,
+both index widths and schedule trace replay. These repairs are independent of
+Gemmini instruction selection.
 
 `gemmini_space_generator()` is a standard MetaSchedule `PostOrderApply` space
 generator with a target-specific `PyScheduleRule`, standard `RewriteTensorize`
@@ -205,7 +218,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
 | Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | Direct arithmetic import preserves scalar promotion, alpha and explicit wrapping. Unit-alpha INT32 tensor/scalar addition uses native accumulator loads/readout; general scale/subtract/negate and wider arithmetic stay on CPU. INT8 ReLU uses exact widen/readout tile intrinsics. Exact FP16 add/sub with alpha outside +/-1 is explicitly unqualified because the pinned CPU reference rounds vector and scalar-tail intermediates differently |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; wider frontend and rounding audit remains required |
-| Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Import/CPU audit finds missing 1D/3D conversions, incorrect default padding/divisor behavior in the existing 2D importer, and a DMA scheduling failure with remaining CPU reduction initialization. One ordinary adaptive-2D CPU example passes; the remaining work is not a hardware-qualified pooling claim |
+| Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Admitted batched/unbatched frontend forms preserve padding, ceil-window, divisor and dtype contracts. Ordinary floating averaging remains CPU arithmetic; legal FP32 padding copies may use DMA. INT64 regular pooling uses modulo-sum/truncating-division mathematics on CPU. Bounded Spike/RTL fixtures cover regular/adaptive pooling in all three dimensions; host tests also exercise underscore aliases. This is not a claim of native average arithmetic |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
 | Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies expose concatenation and static positive-stride scatter regions through standard scheduling. Constant full/full_like import preserves the captured dtype; normal constant folding can eliminate them, and unfolded literal fills use the existing DMA intrinsic. Broader dtype/frontend/aliasing admission remains under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Admitted static frontend forms execute as standard metadata or INT8/INT32/FP32 mathematical copies. Internal reshapes can disappear; indexed or boundary materializations use DMA when Tensorize proves the access map. Constants and nonunit squeeze can require no device calls. Hidden storage aliases, dynamic contracts and zero-extent static-export buffers remain explicit limitations |
@@ -774,12 +787,58 @@ approximately 36 and 43 seconds. The compiler-core-v6 libraries and
 adapter-creation-v1 object are unchanged; ELF audits reject hardware loops.
 These are functional checks and supply no performance labels.
 
-The next pooling audit remains incomplete. `pooling-cpu-audit-v2.json` separates
-ordinary CPU semantics from device preparation: the existing default 2D average
-pool and divisor-override cases are numerically wrong before Gemmini selection;
-exclude-padding matches its small reference. All three device preparations
-reach allocation placement with a remaining CPU reduction initializer and fail.
-The 1D/3D average/adaptive conversions are also missing. These are frontend and
-pipeline issues to repair, separate from the integer array's lack of general
-floating pooling arithmetic. Pooling/backward admission and the final whole-scope
-audit remain required; this arithmetic checkpoint does not complete the goal.
+The subsequent `pooling-cpu-audit-v2.json` separates ordinary CPU semantics from
+device preparation: the old default 2D average pool and divisor-override cases
+are numerically wrong before Gemmini selection; exclude-padding matches its
+small reference. All three device preparations reach allocation placement with
+a remaining CPU reduction initializer and fail. The 1D/3D average/adaptive
+conversions are also missing. These are frontend and pipeline defects, separate
+from the integer array's lack of general floating pooling arithmetic.
+
+The following pooling changes repair that admission and semantic audit for the
+tested contracts. Ordinary Relax average/adaptive pooling handles dimensions
+one through three, including the underscore adaptive overloads. Batched and
+unbatched forms preserve dtype. FP16 inputs use FP32 opmath and a final cast;
+FP64 remains FP64. Standard slicing removes a ceil-mode window starting entirely
+in trailing padding, as ATen requires. That correction currently requires static
+spatial extents. Defaults preserve `count_include_pad=True`. Explicit divisors
+are applied once to the sum; an unscheduled TE definition supplies semantics
+absent from stock Relax operators. INT64 regular pools use overflow-free unsigned
+limb sums, signed wrapping and truncating division. Independent unbounded Python
+integer oracles cover overflowing windows. These definitions contain no device
+instructions or schedules.
+
+Mixed CPU reduction and native padding now runs the standard `LowerInitBlock`
+before allocation placement. That ordering change needs no new core patch.
+Schedule reports disclose retained initializer blocks in `cpu_reduction_blocks`;
+selecting a function for a padding copy does not label its averaging as native.
+Delayed-DMA tests replay Python/JSON traces and detect removal of the completion
+required before the CPU consumes the padded data.
+
+`unit-pooling-full-pinned-v1.log` passes all 538 collected backend, deployment
+and frontend checks against immutable `compiler-core-v9`. This includes 73 new
+frontend pooling cases and two backend checks with multiple subcases. Floating
+CPU comparisons use explicit tolerances; they do not establish universal
+bit-for-bit equality with every source CPU kernel. Integer checks preserve exact
+wrapping/truncation. `qualification-core-pooling-v1.json` binds the generic fixes
+and 135 passing independent checks, with failing controls on the prior compilers.
+
+`device-pooling-mixed-v1` and `device-pooling-cpu-v1` pass twelve fixture
+executions on Spike and the pinned RTL, plus wrong-oracle controls. Regular
+one/two/three-dimensional and cropped-ceil cases require native DMA movement
+while retaining CPU reductions. Explicit-divisor, adaptive and INT64 cases
+require zero device commands; ordinary contraction, sum and split fixtures
+provide regressions. Every output is compared bit-for-bit for these selected
+inputs. Positive RTL runs take approximately 36 and 40 seconds within the
+60-second/300,000-cycle bounds. All 135 distinct artifact bindings verify and
+ELF instruction audits reject hardware loops. The adapter is unchanged. These
+are functional results, not performance labels or native average arithmetic.
+
+Explicit-divisor/INT64 average-pool mathematics currently requires positive
+static spatial extents. Runtime scalar creation, broader alias/dynamic contracts,
+backward/overlap operations and the convolution frontend audit remain unfinished.
+The next `backward-next-audit-v1.json` reproduces missing importers for eleven
+source-supported dtype/operator cases and a stock average-pool backward mismatch
+with ceil mode and included padding. Those are separate frontend/generic
+legalization defects, not evidence of native gradient support. This milestone
+does not complete the full requested operator inventory.
