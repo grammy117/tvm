@@ -71,7 +71,7 @@ Stmt DataTypeLegalizer::VisitStmt_(const BlockNode* op) {
     if (iter->dom->min->dtype != dtype || iter->dom->extent->dtype != dtype) {
       IterVar new_iter = iter;
       new_iter.CopyOnWrite()->dom =
-          Range(cast(dtype, iter->dom->min), cast(dtype, iter->dom->extent));
+          Range::FromMinExtent(cast(dtype, iter->dom->min), cast(dtype, iter->dom->extent));
       return new_iter;
     } else {
       return iter;
@@ -101,7 +101,7 @@ Stmt DataTypeLegalizer::VisitStmt_(const AttrStmtNode* op) {
         ICHECK(extend.dtype().is_int() && var.dtype().is_int());
         if (var.dtype().bits() != extend.dtype().bits()) {
           DataType dtype = var.dtype();
-          dom = Range(cast(dtype, dom->min), cast(dtype, extend), dom->span);
+          dom = Range::FromMinExtent(cast(dtype, dom->min), cast(dtype, extend), dom->span);
         }
       }
       ivmap_[iv] = IterVar(dom, var, iv->iter_type, iv->thread_tag);
@@ -414,7 +414,7 @@ IterVar IndexDataTypeRewriter::VisitIterVar(const IterVar& iter_var) {
     IterVar new_iter_var = iter_var;
     IterVarNode* n = new_iter_var.CopyOnWrite();
     n->var = std::move(new_var);
-    n->dom = Range(min, extent);
+    n->dom = Range::FromMinExtent(min, extent);
     return new_iter_var;
   }
   return iter_var;

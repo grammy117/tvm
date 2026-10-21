@@ -194,7 +194,7 @@ class StmtMutator::Internal {
       if (min.same_as(iter_var->dom->min) && extent.same_as(iter_var->dom->extent)) {
         return iter_var;
       } else {
-        return IterVar(Range(min, extent), iter_var->var, iter_var->iter_type,
+        return IterVar(Range::FromMinExtent(min, extent), iter_var->var, iter_var->iter_type,
                        iter_var->thread_tag);
       }
     };

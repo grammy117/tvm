@@ -942,9 +942,14 @@ def test_nested_reduce_domain_dependency():
     ):
         T.func_attr({"tir.noalias": T.bool(True), "global_symbol": "main"})
         for i0, i1, i2 in T.grid(8, 8, 8):
+            with T.block("compute_init"):
+                v_i0_init, v_i1_init, v_i2_init = T.axis.remap("SSS", [i0, i1, i2])
+                T.reads()
+                T.writes(compute[v_i0_init, v_i1_init, v_i2_init])
+                compute[v_i0_init, v_i1_init, v_i2_init] = T.float32(0.0)
             with T.block("compute_2"):
                 v_i0, v_i1, v_i2 = T.axis.remap("SSS", [i0, i1, i2])
-                T.reads(x[v_i0, v_i1, v_i2, 0:v_i1, 0 : v_i1 - 1])
+                T.reads(compute[v_i0, v_i1, v_i2], x[v_i0, v_i1, v_i2, 0:v_i1, 0 : v_i1 - 1])
                 T.writes(compute[v_i0, v_i1, v_i2])
                 for rv in range(v_i1):
                     with T.block("compute_1"):
@@ -952,10 +957,8 @@ def test_nested_reduce_domain_dependency():
                         v_i1_1 = T.axis.spatial((v_i1, v_i1 + 1), v_i1)
                         v_i2_1 = T.axis.spatial((v_i2, v_i2 + 1), v_i2)
                         v_rv = T.axis.reduce(v_i1, rv)
-                        T.reads(x[v_i0_1, v_i1_1, v_i2_1, v_rv, 0:v_rv])
+                        T.reads(compute[v_i0_1, v_i1_1, v_i2_1], x[v_i0_1, v_i1_1, v_i2_1, v_rv, 0:v_rv])
                         T.writes(compute[v_i0_1, v_i1_1, v_i2_1])
-                        with T.init():
-                            compute[v_i0_1, v_i1_1, v_i2_1] = T.float32(0.0)
                         for rv_1 in range(v_rv):
                             with T.block("compute"):
                                 v_i0_2 = T.axis.spatial((v_i0_1, v_i0_1 + 1), v_i0_1)
@@ -963,10 +966,8 @@ def test_nested_reduce_domain_dependency():
                                 v_i2_2 = T.axis.spatial((v_i2_1, v_i2_1 + 1), v_i2_1)
                                 v_rv_1 = T.axis.reduce((v_rv, v_rv + 1), v_rv)
                                 v_rv_2 = T.axis.reduce(v_rv, rv_1)
-                                T.reads(x[v_i0_2, v_i1_2, v_i2_2, v_rv_1, v_rv_2])
+                                T.reads(compute[v_i0_2, v_i1_2, v_i2_2], x[v_i0_2, v_i1_2, v_i2_2, v_rv_1, v_rv_2])
                                 T.writes(compute[v_i0_2, v_i1_2, v_i2_2])
-                                with T.init():
-                                    compute[v_i0_2, v_i1_2, v_i2_2] = T.float32(0.0)
                                 compute[v_i0_2, v_i1_2, v_i2_2] = (
                                     compute[v_i0_2, v_i1_2, v_i2_2]
                                     + x[v_i0_2, v_i1_2, v_i2_2, v_rv_1, v_rv_2]
