@@ -144,6 +144,39 @@ def fixtures():
             else np.full((3, 4), 0x7F812345, "uint32")
         )
         result.append((name, builder.get(), [a], expected_bits.view("float32")))
+    for name, shape, widths, dtype, mode in (
+        ("reflect1d", (1, 1, 3), ((0, 0), (0, 0), (1, 1)), "int8", "reflect"),
+        ("reflect2d", (1, 1, 2, 3), ((0, 0), (0, 0), (1, 0), (1, 0)), "int32", "reflect"),
+        (
+            "reflect3d",
+            (1, 1, 2, 2, 3),
+            ((0, 0), (0, 0), (1, 0), (1, 0), (1, 0)),
+            "float32",
+            "reflect",
+        ),
+        ("edge2d", (1, 1, 2, 3), ((0, 0), (0, 0), (0, 1), (2, 0)), "float32", "edge"),
+        (
+            "edge3d",
+            (1, 1, 2, 2, 2),
+            ((0, 0), (0, 0), (1, 0), (0, 1), (2, 0)),
+            "int8",
+            "edge",
+        ),
+    ):
+        a = (
+            np.resize(bits, shape).view("float32")
+            if dtype == "float32"
+            else (np.arange(np.prod(shape)).reshape(shape) * 17 - 128).astype(dtype)
+        )
+        av = relax.Var("a", relax.TensorStructInfo(shape, dtype))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [av]):
+            with builder.dataflow():
+                output = builder.emit_output(
+                    relax.op.nn.pad(av, tuple(x for pair in widths for x in pair), pad_mode=mode)
+                )
+            builder.emit_func_output(output)
+        result.append((name, builder.get(), [a], np.pad(a, widths, mode=mode)))
     for name, m, n, k, batches, fused in (
         ("small", 3, 4, 5, 1, False),
         ("full", 16, 16, 16, 1, True),
@@ -575,6 +608,8 @@ def prepare(args):
         "apps/gemmini/matmul.h",
         "src/tir/schedule/primitive/reduction.cc",
         "src/tir/schedule/state.cc",
+        "python/tvm/relax/transform/legalize_ops/nn.py",
+        "python/tvm/relax/frontend/torch/exported_program_translator.py",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -760,6 +795,11 @@ def main():
             "copy_f32",
             "repeat_f32",
             "fill_f32",
+            "reflect1d",
+            "reflect2d",
+            "reflect3d",
+            "edge2d",
+            "edge3d",
         ],
     )
     execute = sub.add_parser("run")

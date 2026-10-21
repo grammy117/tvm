@@ -570,6 +570,29 @@ def _schedule_elementwise_candidate(func, node, kind, rank, factors, tensorize, 
     )
     sch = tir.Schedule(func, debug_mask="all")
     block = sch.get_block(node.name_hint)
+    # TOPI can conservatively infer an entire input region for a single indexed
+    # load (for example, reflected indices). State the exact per-iteration
+    # accesses through the public schedule API before placing/tensorizing caches.
+    # Retain all index-buffer reads, and never narrow differing accesses to the
+    # same buffer. v0.19's annotation wrapper requires equal block/buffer ranks.
+    reads = []
+    tir.stmt_functor.post_order_visit(
+        node.body, lambda expr: reads.append(expr) if isinstance(expr, tir.BufferLoad) else None
+    )
+    analyzer = tvm.arith.Analyzer()
+    for index, region in enumerate(node.reads):
+        loads = [load for load in reads if load.buffer.same_as(region.buffer)]
+        if not loads or len(region.buffer.shape) != len(node.iter_vars):
+            continue
+        indices = list(loads[0].indices)
+        if any(not tvm.ir.structural_equal(load.indices, indices) for load in loads[1:]):
+            continue
+        if all(
+            analyzer.can_prove(part.extent == 1) and analyzer.can_prove(part.min == point)
+            for part, point in zip(region.region, indices)
+        ):
+            continue
+        sch.annotate_buffer_access(block, index, "read", lambda *axes: indices)
     loops = sch.get_loops(block)[-rank:]
     split = [sch.split(loop, [None, factor]) for loop, factor in zip(loops, factors)]
     sch.reorder(*[pair[0] for pair in split], *[pair[1] for pair in split])

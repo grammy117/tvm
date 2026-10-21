@@ -62,6 +62,136 @@ class GemminiElementwiseTests(unittest.TestCase):
     setUp = reference.GemminiTensorIRTests.setUp
     build = reference.GemminiTensorIRTests.build
 
+    def test_reflection_and_edge_padding_use_indexed_dma_and_replay(self):
+        for mode in ("reflect", "edge"):
+            for shape in ((4,), (2, 3), (1, 2, 3), (1, 1, 2, 3), (1, 1, 2, 2, 3)):
+                for dtype in ("int8", "int32", "float32"):
+                    with self.subTest(mode=mode, shape=shape, dtype=dtype):
+                        widths = [(0, 0) if dim == 1 else (1, 1) for dim in shape]
+                        if dtype == "float32":
+                            bits = np.array(
+                                [0, 0x80000000, 0x7FC12345, 0x7F812345, 1, 0xFF800000],
+                                "uint32",
+                            )
+                            values = np.resize(bits, shape).view("float32")
+                        else:
+                            values = (np.arange(np.prod(shape)).reshape(shape) * 17 - 128).astype(
+                                dtype
+                            )
+                        expected = np.pad(values, widths, mode=mode)
+                        source = relax.Var("source", relax.TensorStructInfo(shape, dtype))
+                        builder = relax.BlockBuilder()
+                        with builder.function("main", [source]):
+                            with builder.dataflow():
+                                output = builder.emit_output(
+                                    relax.op.nn.pad(
+                                        source,
+                                        tuple(x for pair in widths for x in pair),
+                                        pad_mode=mode,
+                                    )
+                                )
+                            builder.emit_func_output(output)
+                        graph = builder.get()
+                        report = []
+                        prepared = prepare_gemmini_graph(graph, report=report)
+                        self.assertEqual(
+                            sum(r["placement"] == "gemmini" for r in report), 1, report
+                        )
+                        device = next(
+                            f for f in prepared.functions.values() if isinstance(f, tir.PrimFunc)
+                        ).with_attr("global_symbol", "main")
+                        runtime, control = self.build(tvm.IRModule({"main": device}))
+                        input_value, actual = (
+                            tvm.nd.array(values),
+                            tvm.nd.empty(expected.shape, dtype),
+                        )
+                        runtime(input_value, actual)
+                        np.testing.assert_array_equal(
+                            actual.numpy().view("uint8"), expected.view("uint8")
+                        )
+                        np.testing.assert_array_equal(
+                            input_value.numpy().view("uint8"), values.view("uint8")
+                        )
+                        self.assertGreater(control.emulator_commands(), 0)
+                        self.assertEqual(control.emulator_faults(), 0)
+                        self.assertEqual(control.emulator_pending(), 0)
+                        legalized = relax.transform.LegalizeOps()(graph)
+                        original = next(
+                            f for f in legalized.functions.values() if isinstance(f, tir.PrimFunc)
+                        )
+                        saved = tvm.ir.save_json(original)
+                        scheduled = make_elementwise_schedule(original)
+                        replay = tir.Schedule(original, debug_mask="all")
+                        scheduled.trace.apply_to_schedule(replay, remove_postproc=False)
+                        replayed = lower_tensorir_schedule(
+                            original, replay, workload_metadata={"operation": "copy_" + dtype}
+                        )
+                        tvm.ir.assert_structural_equal(
+                            replayed.scheduled_mod, scheduled.scheduled_mod
+                        )
+                        self.assertEqual(tvm.ir.save_json(original), saved)
+                        if mode == "reflect":
+                            self.assertTrue(
+                                any(
+                                    instruction.kind.name == "AnnotateBufferAccess"
+                                    for instruction in scheduled.trace.insts
+                                )
+                            )
+
+    def test_reflection_pad_metaschedule_and_registered_vm_pipeline(self):
+        from tvm import meta_schedule as ms
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator
+        from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
+
+        source = relax.Var("source", relax.TensorStructInfo((3, 4), "float32"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [source]):
+            with builder.dataflow():
+                output = builder.emit_output(
+                    relax.op.nn.pad(source, (1, 1, 2, 1), pad_mode="reflect")
+                )
+            builder.emit_func_output(output)
+        graph = builder.get()
+        bits = np.resize(np.array([0, 0x80000000, 0x7F812345, 0x7FC12345], "uint32"), (3, 4))
+        values = bits.view("float32")
+        expected = np.pad(bits, ((1, 1), (2, 1)), mode="reflect")
+        legalized = relax.transform.LegalizeOps()(graph)
+        func = next(f for f in legalized.functions.values() if isinstance(f, tir.PrimFunc))
+        context = ms.TuneContext(
+            mod=func.with_attr("global_symbol", "main"),
+            target=GemminiCapabilities().target(),
+            space_generator=gemmini_space_generator(),
+            num_threads=1,
+        )
+        legal = 0
+        for design in context.generate_design_space():
+            design.enter_postproc()
+            if not all(p.apply(design) for p in context.space_generator.postprocs):
+                continue
+            lowered = lower_tensorir_schedule(
+                context.mod["main"], design, workload_metadata={"operation": "copy_f32"}
+            )
+            runtime, control = self.build(lowered.scheduled_mod)
+            actual = tvm.nd.empty(expected.shape, "float32")
+            runtime(tvm.nd.array(values), actual)
+            np.testing.assert_array_equal(actual.numpy().view("uint32"), expected)
+            self.assertEqual(control.emulator_faults(), 0)
+            legal += 1
+        self.assertGreaterEqual(legal, 1)
+        executable = relax.build(graph, "llvm", pipeline="gemmini_build")
+        path = self.root / "reflected-vm.so"
+        executable.export_library(
+            str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11"]
+        )
+        control = ctypes.CDLL(str(path))
+        control.emulator_reset()
+        vm = relax.VirtualMachine(tvm.runtime.load_module(str(path)), tvm.cpu())
+        actual = vm["main"](tvm.nd.array(values)).numpy()
+        np.testing.assert_array_equal(actual.view("uint32"), expected)
+        self.assertGreater(control.emulator_commands(), 0)
+        self.assertEqual(control.emulator_faults(), 0)
+        self.assertEqual(control.emulator_pending(), 0)
+
     def test_int8_relu_all_values_shapes_indexed_layouts_and_trace(self):
         for shape in ((1,), (31,), (16, 16), (3, 17), (2, 3, 4)):
             with self.subTest(shape=shape):

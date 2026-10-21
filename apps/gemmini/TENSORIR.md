@@ -174,7 +174,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
+| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Multiple-source selection, immediate-value admission and overlapping updates remain under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
 
 ### Corrections to the proposed native-unit mappings
@@ -203,6 +203,19 @@ unsupported spelling, but a missing conversion is not a Gemmini CPU-fallback
 success. This backend accepts ordinary Relax/mathematical TIR; frontend gaps
 must be reported independently of native-unit legality.
 
+Padding import now handles direct `reflection_pad1d/2d/3d`,
+`replication_pad1d/2d/3d`, `constant_pad_nd` and generic `pad` by translating
+PyTorch's reversed-axis width pairs into ordinary Relax `nn.pad`. The generic
+legalizer previously ignored `pad_mode`, producing constant padding even for
+reflection/edge requests. It now uses mathematical TOPI reflection or a clamped
+TE load for edge padding. These are target-independent correctness changes,
+not Gemmini kernel selection. Reflection requires proven positive input extents
+and widths smaller than the corresponding input dimension, matching the
+single-reflection TOPI implementation. Unproved bounds retain the Relax call;
+they are an explicit legalization limitation, not a successful CPU fallback.
+Constant padding still follows its existing generic path and is not newly
+qualified as native DMA merely because its frontend spelling imports.
+
 `gemmini_elementwise.py` registers typed copy, widening and INT32 add intrinsics
 and uses standard `split`, `reorder`, `cache_write`, placement and `tensorize`.
 Prime extents can require small divisor tiles; they do not imply padded DMA or
@@ -227,6 +240,18 @@ performance winners without measurements. Both options are visible to standard
 MetaSchedule, whose tensorization postprocessor rejects illegal candidates.
 In-place copies remain refused. DMA completion also protects external output
 buffers when CPU code in the same function subsequently accesses them.
+
+For a block that performs a single indexed load per input, the DMA rule can use
+standard `Schedule.annotate_buffer_access` to state the exact point read where
+automatic region inference was conservative. All actual reads, including index
+buffer reads, are retained; differing access maps to the same buffer are never
+collapsed. The annotation and subsequent scheduling replay from the original
+mathematical body. The v0.19 Python annotation wrapper currently requires equal
+block/buffer ranks, so rank-changing accesses needing this refinement retain
+fallback. This enables reflection and edge padding through the existing typed
+copy intrinsics, with scalar DMA where larger rectangles cannot tensorize.
+There is no padding-specific C implementation, source-template generator,
+hardware-loop command or new C++ patch.
 
 Runtime scalar fills support INT8-to-INT8, INT32-to-INT32 and signed
 INT8-to-INT32 output. They use one-column, zero-stride DMA and preserve the
@@ -382,3 +407,24 @@ performance label or completes the remaining operator inventory.
 The migration remains incomplete until the inventory's remaining native
 admission, CPU/frontend explanations and final regression/target checks are
 resolved. Do not infer those from passing contraction fixtures.
+
+`device-pad-v1` adds reflection 1D/2D/3D and replication 2D/3D fixtures through
+normal Relax legalization and the structural DMA rule. Positive and wrong-oracle
+checks pass on Spike and RTL within 60 seconds and 300,000 RTL cycles. Fixtures
+mix INT8, INT32 and raw-word FP32 movement, including NaN payloads and signed
+zero, and require actual DMA commands. The existing adapter is unchanged.
+`unit-pad-native-v2.log` checks ranks one through five, all three admitted
+movement dtypes, source immutability, delayed DMA, full trace replay, standard
+MetaSchedule postprocessing and the registered VM build pipeline.
+`unit-pad-frontend-v2.log` passes 37 checks for ordinary CPU legalization,
+cropping, wide edge padding, unsafe-bound refusal and eight actual PyTorch
+exported padding forms with unequal axis widths. `unit-pad-full-v1.log` passes
+170 collected Gemmini backend/app and padding checks; the final 37-check run
+refreshes the generic/frontend tests after strengthening those axis widths.
+
+The broader `test_transform_legalize_ops_nn.py` run reports nine structural
+expectation failures, 47 passes and three skips. The same nine tests fail with
+the unchanged baseline Python legalizers and the same compiled library;
+`unit-pad-nn-regression-v1.log` and `unit-pad-nn-baseline-v1.log` retain both
+runs. These failures are not reported as passing regressions or resolved by
+this padding change.
