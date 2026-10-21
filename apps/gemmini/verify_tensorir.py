@@ -282,6 +282,32 @@ def fixtures():
             )
         ].copy()
         result.append((name, builder.get(), [a], expected))
+    for name, shape, dims, keepdims, dtype in (
+        ("sum64", (3, 17), (1,), False, None),
+        ("sum64_axes", (2, 3, 4), (1, 2), True, None),
+        ("sum64_scalar", (17,), None, False, None),
+        ("sum32_export", (3, 17), (1,), False, "int32"),
+        ("sum8_export", (3, 17), (1,), True, "int8"),
+    ):
+        import torch
+        from tvm.relax.frontend.torch import from_exported_program
+
+        class ExportedSum(torch.nn.Module):
+            def forward(self, source):
+                result_dtype = None if dtype is None else getattr(torch, dtype)
+                if dims is None:
+                    return source.sum(dtype=result_dtype)
+                return source.sum(dim=dims, keepdim=keepdims, dtype=result_dtype)
+
+        a = (np.arange(np.prod(shape)).reshape(shape) * 13 - 128).astype("int8")
+        example = torch.from_numpy(a)
+        model = ExportedSum()
+        graph = from_exported_program(
+            torch.export.export(model, (example,)), unwrap_unit_return_tuple=True
+        )
+        expected = a.astype("int64").sum(axis=dims, keepdims=keepdims).astype(dtype or "int64")
+        np.testing.assert_array_equal(expected, model(example).numpy())
+        result.append((name, graph, [a], expected))
     for name, m, n, k, batches, fused in (
         ("small", 3, 4, 5, 1, False),
         ("full", 16, 16, 16, 1, True),
@@ -557,6 +583,8 @@ def prepare(args):
             if expected.dtype == np.float32
             else "int8_t"
             if expected.dtype == np.int8
+            else "int64_t"
+            if expected.dtype == np.int64
             else "int32_t"
         )
         for arg, array in enumerate(arrays):
@@ -565,6 +593,8 @@ def prepare(args):
                 if array.dtype == np.float32
                 else "int8_t"
                 if array.dtype == np.int8
+                else "int64_t"
+                if array.dtype == np.int64
                 else "int32_t"
             )
             payload = array.view("uint32") if array.dtype == np.float32 else array
@@ -716,9 +746,12 @@ def prepare(args):
         "src/tir/schedule/primitive/decompose_padding.cc",
         "src/tir/schedule/primitive/blockize_tensorize.cc",
         "src/tir/schedule/ir_comparator.cc",
+        "src/tir/schedule/primitive/block_annotate.cc",
         "src/tir/schedule/primitive/loop_transformation.cc",
         "src/tir/transforms/renew_defs.cc",
         "python/tvm/topi/transform.py",
+        "python/tvm/tir/function.py",
+        "python/tvm/relax/transform/legalize_ops/statistical.py",
         "python/tvm/relax/transform/legalize_ops/nn.py",
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
         "python/tvm/relax/frontend/torch/base_fx_graph_translator.py",
@@ -741,7 +774,7 @@ def prepare(args):
         bindings.append(identity(source / relative))
     bundle = {
         "status": "prepared",
-        "scope": "Bounded integer fixtures; no model/performance qualification",
+        "scope": "Bounded functional fixtures; no model/performance qualification",
         "capabilities": GemminiCapabilities().fingerprint,
         "ELFs": elfs,
         "scheduling": reports,
@@ -927,6 +960,11 @@ def main():
             "scatter_f32",
             "select_i32",
             "select_f32",
+            "sum64",
+            "sum64_axes",
+            "sum64_scalar",
+            "sum32_export",
+            "sum8_export",
         ],
     )
     execute = sub.add_parser("run")

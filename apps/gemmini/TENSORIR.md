@@ -56,7 +56,7 @@ arithmetic fixes, source-preserving CPU recipes and the host-only `LowerAutoCopy
 guard described in README.md. That guard rejects unsupported automatic-copy
 annotations and is not a DMA optimization.
 
-The migration fixes seven generic C++ scheduler/IR issues.
+The migration fixes nine generic C++ scheduler/IR issues.
 In `decompose_reduction`, initialization reads were omitted and retained
 on the update block instead. Separate read-region analysis preserves an
 input-dependent initialization and lets subsequent cache placement see its
@@ -88,6 +88,17 @@ input loop origin or a single partition. `RenewDefs` preserves a domain's
 minimum/extent and the identities of externally defined buffers, including
 metadata-only references. General regressions check CPU execution, private
 allocations, dependencies and trace replay independently of the target.
+
+Exact INT64-result sum scheduling adds two composability fixes. `unsafe_set_dtype`
+uses the usual folding cast constructor for buffer stores, so an INT64 zero
+becomes an INT32 zero rather than a redundant cast that Tensorize cannot match
+after simplifying its descriptor. Tensorize refreshes the complete enclosing
+scope's cached block information and preserves its existing affine binding;
+starting at the scope's body can misclassify a tensorized block as a root.
+Target-independent constant-initialization tests exercise both the INT32 and
+INT64 producer cases, CPU execution and full trace replay. Python IndexMap
+construction also converts integer literals to the requested index dtype;
+otherwise a printed map containing a constant zero cannot replay in Python.
 
 `gemmini_space_generator()` is a standard MetaSchedule `PostOrderApply` space
 generator with a target-specific `PyScheduleRule`, standard `RewriteTensorize`
@@ -191,7 +202,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Biased matrix | `addmm` | Exact integer matmul with eligible INT32 tensor bias uses accumulator preload; shared products and unsupported epilogues retain their original mathematics. CPU activation/scaling and complete ATen/frontend admission remain separate |
 | Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
 | Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | INT32 addition uses accumulator overwrite/add loads and full readout, with separate ordinary and explicit modulo-32 contracts. INT8 ReLU uses exact widen/readout tile intrinsics. Other mappings remain under audit; CPU fallback retained |
-| Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8-to-INT32 sums use the array. The original CPU conversion/division can follow that sum. Default INT64 and arbitrary floating reductions remain CPU work; full frontend and rounding audit still required |
+| Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; wider frontend and rounding audit remains required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
 | Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies now expose concatenation and static positive-stride scatter regions through standard scheduling; their bounded target qualification is separate from the earlier padding checkpoint. Broader literal arithmetic and full frontend/aliasing admission remain under audit |
@@ -211,7 +222,7 @@ complete acceptance of every ATen overload or frontend graph.
 | `add.Scalar`, `sub.Scalar` | A zero load stride repeats a scalar down a one-column DMA rectangle. Runtime INT32 scalar-tensor addition is now supported on either side, including an explicit wrapping variant. Immediate constants and native subtraction remain separate admission work; there is no full-width negative load scaler. |
 | `mul.Scalar`, `div.Scalar`, `neg` | The available scaled small readout narrows to INT8. It is not an arbitrary FP32 or full-INT32 multiply/divide unit. Any narrower integer recipe must specify its rounding, saturation and value range before admission. |
 | `relu` | Full-width INT32 readout bypasses activation/scaling, so INT32/FP ReLU remains CPU work. Native INT8 ReLU uses a typed tile intrinsic with exact widening, identity scale and narrow readout. Its private INT32 temporary contains only widened INT8 values. |
-| `mean.dim`, `mean.default`, `sum.dim_IntList` | A registered sum intrinsic uses a ones-vector contraction for signed INT8-to-INT32 sums with K <= 16,777,216. This is not the default INT64 or floating reduction contract. Mean retains its specified CPU conversion/division; a narrowing readout scale cannot stand in for arbitrary floating mean. |
+| `mean.dim`, `mean.default`, `sum.dim_IntList` | A registered sum intrinsic uses a ones-vector contraction for signed INT8 sums with K <= 16,777,216. The prefix bound permits exact internal INT32 accumulation and an ordinary CPU widening for INT64 results. Mean retains its specified CPU conversion/division; a narrowing readout scale cannot stand in for arbitrary floating mean. |
 | `avg_pool1d/2d/3d`, adaptive average pooling | Ordinary floating inputs do not fit the integer arithmetic unit. An integer recipe must specify windows, divisors, exclude-padding/ceil behavior and rounding. The max-pool readout feature does not implement average pooling. |
 | Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. No generic backward mapping is claimed. |
 | Generic data movement | Primitive DMA handles rectangular regions with contiguous columns and one row stride. Copies preserving bits and signed widening are admitted. Index remapping, multiple sources, fill broadcasting and overlapping updates need appropriate schedules or remain CPU work. They must not be described as absent silicon features merely because the current schedule does not handle them. |
@@ -371,12 +382,26 @@ avoid padded DMA but prime extents can require scalar chunks. MetaSchedule
 exposes both divisor and scalar candidates. These are functional capabilities,
 not measured performance wins. The original CPU cast/divide can consume a
 native INT32 sum without changing its specified floating division. General
-floating inputs and INT64 accumulation still retain CPU fallback.
-Converting a proven bounded INT32 sum to INT64 output is feasible; direct
-admission of the equivalent INT64 sum remains an implementation gap. Likewise,
-known INT8 values widened to floating point may admit additional range proofs.
-Neither case is evidence that arbitrary INT64 or floating reductions fit this
-integer array.
+floating inputs and genuinely wider accumulation still retain CPU fallback.
+For an INT64 sum of signed INT8 values, the same prefix bound proves that the
+private reduction allocation can use INT32. Standard `reindex_cache_write` and
+`unsafe_set_dtype` introduce that storage choice and preserve the INT64 output
+conversion; the trace records both. The numerical proof is retained in schedule
+metadata, including database replay. Typed update descriptions retain the
+actual pure signed-widening cast chain, including explicit INT32 sum requests.
+CPU final casts preserve explicitly requested narrower output wrapping. This
+does not admit INT64 input arithmetic to the array. Known INT8 values widened
+to floating point may admit additional range proofs; those are not implemented.
+
+The PyTorch importer preserves positional/keyword keepdim, default integer
+promotion to INT64, explicit dtype conversion, global sum/mean overloads, empty
+dimension lists and scalar reductions. Explicit narrow integer sums accumulate
+in INT64 under a static prefix bound before converting to the requested output
+type. Unproved or excessive bounds are explicit import limitations. Generic
+Relax legalization expresses empty sums as zero fills and empty floating means
+as NaN fills, rather than leaving initialization inside a zero-trip loop.
+Zero-axis and scalar reductions retain identity mathematics. These frontend
+and legalization corrections are independent of accelerator selection.
 
 The shared finalizer retains a TensorIR root block around admission and device
 ownership. This lets stock Relax reshape analysis inspect prepared single-input
@@ -550,7 +575,7 @@ preservation, Python/JSON traces, ordinary VM compilation, MetaSchedule and
 CPU retention for runtime predicates or excessive partitioning.
 
 This checkpoint does not complete the operator inventory. A subsequent frontend
-audit reproduces incorrect default integer `sum` output dtypes and lost
+audit at that checkpoint reproduced incorrect default integer `sum` output dtypes and lost
 `keepdim=True` shape in the existing `_sum` importer. Correct INT64 semantics
 must be restored independently of native INT8-to-INT32 reduction scheduling;
 passing the latter does not qualify the current ATen importer for those sums.

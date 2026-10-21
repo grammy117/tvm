@@ -649,7 +649,7 @@ class ScheduleGemminiTensorIR:
 
     def transform_module(self, mod, _ctx):
         from .gemmini_elementwise import elementwise_blocks, make_elementwise_schedule
-        from .gemmini_reduction import reduction_blocks, make_reduction_schedule
+        from .gemmini_reduction import reduction_blocks, reduction_metadata, make_reduction_schedule
 
         for gv, func in list(mod.functions_items()):
             if not isinstance(func, tir.PrimFunc) or (
@@ -698,11 +698,7 @@ class ScheduleGemminiTensorIR:
                         workload_metadata=(
                             {"operation": pointwise[0][1]}
                             if pointwise
-                            else {
-                                "operation": "sum_i8_i32",
-                                "rows": reductions[0][1][0],
-                                "depth": reductions[0][1][1],
-                            }
+                            else reduction_metadata(reductions[0])
                             if reductions
                             else None
                         ),

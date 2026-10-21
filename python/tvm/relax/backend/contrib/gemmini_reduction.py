@@ -30,10 +30,39 @@ from tvm.script import tir as T
 
 from .gemmini_elementwise import _canonical_description
 from .gemmini_intrin import ACC, SPAD, register_intrinsics
+from .gemmini_regions import block_rv
+
+
+def _signed_byte_source(value, producers=None):
+    """Find pure signed widening from an INT8 load, including internal casts."""
+    inline, visited = [], set()
+    while value.dtype != "int8":
+        if (
+            isinstance(value, tir.Cast)
+            and value.dtype in ("int32", "int64")
+            and value.value.dtype in ("int8", "int32", "int64")
+            and tvm.DataType(value.value.dtype).bits <= tvm.DataType(value.dtype).bits
+        ):
+            value = value.value
+        elif isinstance(value, tir.BufferLoad) and producers is not None:
+            candidates = producers.get(value.buffer.data, [])
+            if len(candidates) != 1 or candidates[0] in visited:
+                return None, ()
+            producer = candidates[0]
+            if producer.init is not None or any(
+                axis.iter_type != tir.IterVar.DataPar for axis in producer.iter_vars
+            ):
+                return None, ()
+            inline.append(producer)
+            visited.add(producer)
+            value = producer.body.value
+        else:
+            return None, ()
+    return (value, tuple(inline)) if isinstance(value, tir.BufferLoad) else (None, ())
 
 
 def reduction_blocks(func):
-    """Find zero-init INT32 sums of signed INT8 values, including fused casts."""
+    """Find bounded INT32/INT64 sums of signed INT8 values, including fused casts."""
     producers, blocks = {}, []
 
     def collect(node):
@@ -50,7 +79,7 @@ def reduction_blocks(func):
         store, init = block.body, block.init
         value = store.value
         if (
-            store.buffer.dtype != "int32"
+            store.buffer.dtype not in ("int32", "int64")
             or not init.buffer.same_as(store.buffer)
             or not equal(init.indices, store.indices)
             or not isinstance(init.value, tir.IntImm)
@@ -61,23 +90,10 @@ def reduction_blocks(func):
             or not equal(value.a.indices, store.indices)
         ):
             continue
-        source, inline = value.b, None
-        if isinstance(source, tir.BufferLoad) and source.dtype == "int32":
-            candidates = producers.get(source.buffer.data, [])
-            if len(candidates) != 1 or candidates[0].init is not None:
-                continue
-            producer = candidates[0]
-            if any(axis.iter_type != tir.IterVar.DataPar for axis in producer.iter_vars):
-                continue
-            source, inline = producer.body.value, producer.name_hint
-        if not (
-            isinstance(source, tir.Cast)
-            and source.dtype == "int32"
-            and isinstance(source.value, tir.BufferLoad)
-            and source.value.dtype == "int8"
-        ):
+        source, inline = _signed_byte_source(value.b, producers)
+        if source is None:
             continue
-        if source.value.buffer.data.same_as(store.buffer.data):
+        if source.buffer.data.same_as(store.buffer.data):
             continue
         axes = list(block.iter_vars)
         if not axes or any(
@@ -122,11 +138,34 @@ def reduction_blocks(func):
     return result
 
 
+def _sum_update(previous, value, wide, source_casts):
+    for dtype in reversed(source_casts):
+        value = tir.Cast(dtype, value)
+    previous = tir.Cast("int64", previous) if wide else previous
+    total = previous + value
+    return tir.Cast("int32", total) if wide else total
+
+
+def reduction_metadata(match):
+    node, (rows, depth), _, _ = match
+    metadata = {"operation": "sum_i8_i32", "rows": rows, "depth": depth}
+    if node.body.buffer.dtype == "int64":
+        metadata.update(
+            output_dtype="int64",
+            accumulator_dtype="int32",
+            prefix_min=-128 * depth,
+            prefix_max=127 * depth,
+            exact_accumulator_narrowing=True,
+        )
+    return metadata
+
+
 @lru_cache(None)
-def register_reduction_intrinsics(rows, depth):
+def register_reduction_intrinsics(rows, depth, wide=False, source_casts=None):
     """A sum reference and an implementation using the existing primitive ABI."""
     if not 1 <= rows <= 16 or not 1 <= depth <= 16:
         raise ValueError("Gemmini sum tiles require dimensions in [1,16]")
+    source_casts = source_casts or (("int64",) if wide else ("int32",))
 
     @T.prim_func
     def init_desc(c: T.handle):
@@ -155,7 +194,7 @@ def register_reduction_intrinsics(rows, depth):
             for i, k in T.grid(rows, depth):
                 with T.block("sum"):
                     vi, vk = T.axis.remap("SR", [i, k])
-                    C[vi, 0] = C[vi, 0] + T.Cast("int32", A[vi, vk])
+                    C[vi, 0] = _sum_update(C[vi, 0], A[vi, vk], wide, source_casts)
 
     @T.prim_func
     def update_impl(a: T.handle, c: T.handle):
@@ -213,7 +252,8 @@ def register_reduction_intrinsics(rows, depth):
     pairs["compute"] = (update_desc, update_impl)
     result = {}
     for kind, (desc, impl) in pairs.items():
-        name = f"gemmini.sum.{kind}.{rows}x{depth}"
+        name = f"gemmini.sum.{kind}.{rows}x{depth}" + (".wide" if wide else "")
+        name += "." + "_".join(source_casts)
         tir.TensorIntrin.register(name, _canonical_description(desc), impl)
         result[kind] = name
     return result
@@ -225,12 +265,14 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
         raise ValueError("Choose immediate tensorization or MetaSchedule annotations")
     matches = reduction_blocks(func)
     if len(matches) != 1:
-        raise ValueError("Expected one bounded INT32 sum of signed INT8 values")
+        raise ValueError("Expected one bounded integer sum of signed INT8 values")
     node, (rows, depth), (spatial, reduction), inline = matches[0]
     sch = tir.Schedule(func, debug_mask="all")
-    block = sch.get_block(node.name_hint)
-    if inline:
-        sch.compute_inline(sch.get_block(inline))
+    block = block_rv(sch, node)
+    inline_blocks = [block_rv(sch, producer) for producer in inline]
+    for producer in inline_blocks:
+        sch.compute_inline(producer)
+    wide = node.body.buffer.dtype == "int64"
     extents = [int(axis.dom.extent) for axis in node.iter_vars]
     dtype = node.iter_vars[0].var.dtype
 
@@ -257,7 +299,21 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
             index_dtype=dtype,
         ),
     )
-    source = sch.get(block).body.value.b.value.buffer
+    if wide:
+        # The admission proof bounds every prefix by [-128*K, 127*K], with
+        # K <= 2**24. Narrow only the internal reduction allocation; ordinary
+        # cache writeback retains the required INT64 output conversion.
+        sch.unsafe_set_dtype(block, 0, "int32")
+    update = sch.get(block).body.value
+    update = update.value if wide else update
+    source_casts, value = [], update.b
+    while isinstance(value, tir.Cast):
+        source_casts.append(value.dtype)
+        value = value.value
+    source, _ = _signed_byte_source(update.b)
+    if source is None:
+        raise ValueError("The inlined sum no longer reads a pure widened INT8 value")
+    source = source.buffer
     source_index = next(
         i for i, region in enumerate(sch.get(block).reads) if region.buffer.same_as(source)
     )
@@ -269,9 +325,12 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
             lambda i, k: (i if rows > 1 else tir.const(0, dtype), k), index_dtype=dtype
         ),
     )
+
     # Reindex makes arbitrary input layouts explicit. Placement bounds the
     # CPU gather to the currently consumed DMA tile; external inputs never pad.
-    tile = lambda extent: 1 if scalar else max(i for i in range(1, 17) if extent % i == 0)
+    def tile(extent):
+        return 1 if scalar else max(i for i in range(1, 17) if extent % i == 0)
+
     m, k = tile(rows), tile(depth)
     sch.annotate(sch.get_block("root"), "gemmini.sum_rows", m)
     sch.annotate(sch.get_block("root"), "gemmini.sum_chunk", k)
@@ -292,7 +351,7 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
             sch.reverse_compute_at(downstream, io, preserve_unit_loops=True)
     init = sch.decompose_reduction(block, ko)
     mathematical = sch.mod
-    intrinsics = register_reduction_intrinsics(m, k)
+    intrinsics = register_reduction_intrinsics(m, k, wide, tuple(source_casts))
     for target, axes, kind in (
         (init, 1, "init"),
         (load, 2, "load_a"),
@@ -308,7 +367,7 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
             sch.tensorize(tiled, intrinsics[kind])
         elif mark_tensorize:
             sch.annotate(tiled, "meta_schedule.auto_tensorize", intrinsics[kind])
-    return sch, mathematical, {"operation": "sum_i8_i32", "rows": rows, "depth": depth}
+    return sch, mathematical, reduction_metadata(matches[0])
 
 
 def make_reduction_schedule(func, *, capabilities=None):
