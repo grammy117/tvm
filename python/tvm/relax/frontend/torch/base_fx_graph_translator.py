@@ -859,21 +859,57 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return self.block_builder.emit(relax.op.scatter_elements(x, index, src, axis=dim))
 
     def _split(self, node: fx.Node) -> relax.Var:
-        x = self.env[node.args[0]]
-        split_size = node.args[1]
-        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
+        from tvm import tir
+
+        args = self.retrieve_args(node)
+        x = args[0]
+        split_size = (
+            args[1]
+            if len(args) > 1
+            else node.kwargs.get(
+                "split_sizes",
+                node.kwargs.get("split_size_or_sections", node.kwargs.get("split_size")),
+            )
+        )
+        dim = args[2] if len(args) > 2 else node.kwargs.get("dim", 0)
         if isinstance(split_size, (list, tuple)):
             n_section = []
             for s in split_size[:-1]:
                 cum_sum = 0 if not n_section else n_section[-1]
                 n_section.append(s + cum_sum)
         else:
-            n_section = (self.shape_of(x)[dim].value + split_size - 1) // split_size
+            extent = self.shape_of(x)[dim]
+            if not isinstance(extent, tir.IntImm):
+                raise NotImplementedError("Integer split-size import requires a static axis extent")
+            if not isinstance(split_size, int) or split_size <= 0:
+                raise ValueError("Split size must be a positive integer")
+            n_section = list(range(split_size, int(extent), split_size))
         return self.block_builder.emit(relax.op.split(x, n_section, dim))
 
     def _squeeze(self, node: fx.Node) -> relax.Var:
+        from tvm import tir
+
         x = self.env[node.args[0]]
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", None)
+        if dim is not None:
+            shape = self.shape_of(x)
+            axes = [dim] if isinstance(dim, int) else list(dim)
+            if not shape:
+                if any(axis not in (0, -1) for axis in axes):
+                    raise ValueError("Squeeze axis is outside the scalar input rank")
+                return x
+            if any(
+                not isinstance(axis, int) or not -len(shape) <= axis < len(shape) for axis in axes
+            ):
+                raise ValueError("Squeeze axis is outside the input rank")
+            axes = [axis % len(shape) for axis in axes]
+            if len(set(axes)) != len(axes):
+                raise ValueError("Squeeze axes must be distinct")
+            if any(not isinstance(shape[axis], tir.IntImm) for axis in axes):
+                raise NotImplementedError("Explicit squeeze axes require static extents")
+            dim = [axis for axis in axes if int(shape[axis]) == 1]
+            if not dim:
+                return x
         return self.block_builder.emit(relax.op.squeeze(x, dim))
 
     def _stack(self, node: fx.Node) -> relax.Var:

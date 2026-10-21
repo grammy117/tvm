@@ -134,6 +134,106 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     ########## Manipulation ##########
 
+    def _diagonal(self, node: fx.Node) -> relax.Var:
+        from tvm import te, tir
+
+        args = self.retrieve_args(node)
+        x = args[0]
+        shape = self.shape_of(x)
+        if len(shape) < 2 or not all(isinstance(size, tir.IntImm) for size in shape):
+            raise NotImplementedError(
+                "Diagonal import requires a static shape with rank at least two"
+            )
+        offset = args[1] if len(args) > 1 else node.kwargs.get("offset", 0)
+        dim1 = args[2] if len(args) > 2 else node.kwargs.get("dim1", 0)
+        dim2 = args[3] if len(args) > 3 else node.kwargs.get("dim2", 1)
+        if not isinstance(offset, int) or any(
+            not isinstance(dim, int) or not -len(shape) <= dim < len(shape) for dim in (dim1, dim2)
+        ):
+            raise ValueError("Diagonal offset and axes must be valid static integers")
+        dim1, dim2 = dim1 % len(shape), dim2 % len(shape)
+        if dim1 == dim2:
+            raise ValueError("Diagonal axes must be distinct")
+        remaining = [i for i in range(len(shape)) if i not in (dim1, dim2)]
+        length = max(0, min(int(shape[dim1]) + min(offset, 0), int(shape[dim2]) - max(offset, 0)))
+
+        def compute(data):
+            def value(*indices):
+                access = [None] * len(shape)
+                for i, axis in enumerate(remaining):
+                    access[axis] = indices[i]
+                access[dim1], access[dim2] = (
+                    indices[-1] + max(-offset, 0),
+                    indices[-1] + max(offset, 0),
+                )
+                return data[tuple(access)]
+
+            return te.compute(
+                tuple(shape[i] for i in remaining) + (length,), value, name="diagonal"
+            )
+
+        return self.block_builder.emit_te(compute, x, primfunc_name_hint="diagonal")
+
+    def _as_strided(self, node: fx.Node) -> relax.Var:
+        import math
+        from tvm import te, tir
+
+        args = self.retrieve_args(node)
+        x = args[0]
+        source = node.args[0].meta.get("val")
+        if (
+            not isinstance(source, torch.Tensor)
+            or not source.is_contiguous()
+            or not isinstance(source.storage_offset(), int)
+        ):
+            raise NotImplementedError(
+                "as_strided import requires a contiguous source with a static storage offset; hidden storage aliases are not represented in Relax"
+            )
+        shape = tuple(self.shape_of(x))
+        sizes = args[1] if len(args) > 1 else node.kwargs["size"]
+        strides = args[2] if len(args) > 2 else node.kwargs["stride"]
+        offset = args[3] if len(args) > 3 else node.kwargs.get("storage_offset", None)
+        offset = source.storage_offset() if offset is None else offset
+        if len(sizes) != len(strides) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("as_strided requires matching sizes/strides and a nonnegative offset")
+        offset -= source.storage_offset()
+        if not all(isinstance(size, tir.IntImm) for size in shape) or any(
+            not isinstance(value, int) or value < 0 for value in (*sizes, *strides)
+        ):
+            raise NotImplementedError("as_strided requires static nonnegative shapes and strides")
+        empty = any(size == 0 for size in sizes)
+        last = offset + sum((size - 1) * stride for size, stride in zip(sizes, strides))
+        if not empty and (offset < 0 or last >= math.prod(int(size) for size in shape)):
+            raise NotImplementedError(
+                "as_strided cannot read storage outside the logical Relax input"
+            )
+
+        def compute(data):
+            def value(*indices):
+                if empty:
+                    return tir.const(0, data.dtype)
+                linear = offset + sum(index * stride for index, stride in zip(indices, strides))
+                access = []
+                for axis, size in enumerate(shape):
+                    divisor = math.prod(int(dim) for dim in shape[axis + 1 :])
+                    access.append(linear // divisor % int(size))
+                return data[tuple(access)]
+
+            return te.compute(tuple(sizes), value, name="as_strided")
+
+        return self.block_builder.emit_te(compute, x, primfunc_name_hint="as_strided")
+
+    def _scalar_tensor(self, node: fx.Node) -> relax.Expr:
+        args = self.retrieve_args(node)
+        value = args[0]
+        if not isinstance(value, (int, float, bool)):
+            raise NotImplementedError("scalar_tensor import currently requires a constant scalar")
+        captured = node.meta.get("val")
+        dtype = node.kwargs.get("dtype") or (
+            captured.dtype if isinstance(captured, torch.Tensor) else torch.get_default_dtype()
+        )
+        return relax.const(value, self._convert_data_type(dtype))
+
     def _pad(self, node: fx.Node, *, mode=None) -> relax.Var:
         args = self.retrieve_args(node)
         x = args[0]
@@ -158,10 +258,31 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         )
 
     def _select(self, node: fx.Node) -> relax.Var:
+        from tvm import tir
+
         x = self.env[node.args[0]]
-        dim = node.args[1]
-        index = relax.const(node.args[2], "int64")
-        return self.block_builder.emit(relax.op.take(x, index, dim))
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs["dim"]
+        index = node.args[2] if len(node.args) > 2 else node.kwargs["index"]
+        shape = self.shape_of(x)
+        if (
+            not isinstance(dim, int)
+            or not -len(shape) <= dim < len(shape)
+            or not isinstance(index, int)
+        ):
+            raise ValueError("Select requires a valid static dimension and integer index")
+        extent = shape[dim]
+        if index < 0:
+            if not isinstance(extent, tir.IntImm):
+                raise NotImplementedError("Negative select indices require a static extent")
+            index += int(extent)
+        if isinstance(extent, tir.IntImm) and not 0 <= index < int(extent):
+            raise ValueError("Select index is outside the input extent")
+        # Keep a static selection as graph-level slicing and shape metadata.
+        # This avoids introducing a runtime index tensor for a constant index.
+        selected = self.block_builder.emit(
+            relax.op.strided_slice(x, [dim], [index], [index + 1], [1])
+        )
+        return self.block_builder.emit(relax.op.squeeze(selected, dim))
 
     def _slice(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -320,9 +441,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "argmax.default": self._argmax_argmin(relax.op.argmax),
             "argmin.default": self._argmax_argmin(relax.op.argmin),
             # tensor manipulation
+            "as_strided.default": self._as_strided,
             "cat.default": self._cat,
             "concat.default": self._cat,
             "cumsum.default": self._cumsum,
+            "diagonal.default": self._diagonal,
             "constant_pad_nd.default": partial(self._pad, mode="constant"),
             "expand.default": self._expand,
             "pad.default": self._pad,
@@ -331,6 +454,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "reflection_pad2d.default": partial(self._pad, mode="reflect"),
             "reflection_pad3d.default": partial(self._pad, mode="reflect"),
             "repeat.default": self._repeat,
+            "reshape.default": self._reshape,
             "replication_pad1d.default": partial(self._pad, mode="edge"),
             "replication_pad2d.default": partial(self._pad, mode="edge"),
             "replication_pad3d.default": partial(self._pad, mode="edge"),
@@ -339,8 +463,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "slice.Tensor": self._slice,
             "slice_scatter.default": self._scatter_slice,
             "split.Tensor": self._split,
+            "split_with_sizes.default": self._split,
             "squeeze.default": self._squeeze,
             "squeeze.dim": self._squeeze,
+            "squeeze.dims": self._squeeze,
             "tile.default": self._tile,
             "transpose.int": self._transpose,
             "unsqueeze.default": lambda node: self.block_builder.emit(
@@ -353,6 +479,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "clone.default": lambda node: self.env[node.args[0]],
             "empty.memory_format": self._empty,
             "fill.Scalar": self._fill,
+            "scalar_tensor.default": self._scalar_tensor,
             "new_ones.default": self._new_ones,
             # other
             "getitem": self._getitem,

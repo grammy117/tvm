@@ -2964,7 +2964,10 @@ def test_select_slice():
         ) -> R.Tuple(R.Tensor((1, 10, 3), dtype="float32")):
             # block 0
             with R.dataflow():
-                lv: R.Tensor((3, 10, 10), dtype="float32") = R.take(x, R.const(0, "int64"), axis=0)
+                selected: R.Tensor((1, 3, 10, 10), dtype="float32") = R.strided_slice(
+                    x, [0], [0], [1], [1]
+                )
+                lv: R.Tensor((3, 10, 10), dtype="float32") = R.squeeze(selected, axis=[0])
                 lv1: R.Tensor((1, 10, 10), dtype="float32") = R.strided_slice(
                     lv,
                     (R.prim_value(0),),
@@ -2973,16 +2976,8 @@ def test_select_slice():
                     (R.prim_value(2),),
                     assume_inbound=False,
                 )
-                lv2: R.Tensor((1, 10, 10), dtype="float32") = R.strided_slice(
-                    lv1,
-                    (R.prim_value(1),),
-                    (R.prim_value(0),),
-                    (R.prim_value(9223372036854775807),),
-                    (R.prim_value(1),),
-                    assume_inbound=False,
-                )
                 lv3: R.Tensor((1, 10, 3), dtype="float32") = R.strided_slice(
-                    lv2,
+                    lv1,
                     (R.prim_value(2),),
                     (R.prim_value(0),),
                     (R.prim_value(3),),
@@ -3004,25 +2999,9 @@ def test_select_slice():
             x: R.Tensor((8, 16), dtype="float32")
         ) -> R.Tuple(R.Tensor((8, 1, 1, 16, 1), dtype="float32")):
             with R.dataflow():
-                lv: R.Tensor((8, 16), dtype="float32") = R.strided_slice(
-                    x,
-                    (R.prim_value(0),),
-                    (R.prim_value(0),),
-                    (R.prim_value(9223372036854775807),),
-                    (R.prim_value(1),),
-                    assume_inbound=False,
-                )
-                lv1: R.Tensor((8, 1, 16), dtype="float32") = R.expand_dims(lv, axis=[1])
+                lv1: R.Tensor((8, 1, 16), dtype="float32") = R.expand_dims(x, axis=[1])
                 lv2: R.Tensor((8, 1, 1, 16), dtype="float32") = R.expand_dims(lv1, axis=[2])
-                lv3: R.Tensor((8, 1, 1, 16), dtype="float32") = R.strided_slice(
-                    lv2,
-                    (R.prim_value(3),),
-                    (R.prim_value(0),),
-                    (R.prim_value(9223372036854775807),),
-                    (R.prim_value(1),),
-                    assume_inbound=False,
-                )
-                lv4: R.Tensor((8, 1, 1, 16, 1), dtype="float32") = R.expand_dims(lv3, axis=[4])
+                lv4: R.Tensor((8, 1, 1, 16, 1), dtype="float32") = R.expand_dims(lv2, axis=[4])
                 gv: R.Tuple(R.Tensor((8, 1, 1, 16, 1), dtype="float32")) = (lv4,)
                 R.output(gv)
             return gv
