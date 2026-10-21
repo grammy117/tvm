@@ -165,6 +165,258 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         lhs, rhs = self.retrieve_args(node)
         return self._matmul_values(lhs, rhs, self._captured_dtype(node))
 
+    def _amax(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        axes = args[1] if len(args) > 1 else node.kwargs.get("dim", ())
+        keepdim = args[2] if len(args) > 2 else node.kwargs.get("keepdim", False)
+        return self.block_builder.emit(relax.op.max(args[0], axis=axes or None, keepdims=keepdim))
+
+    def _rms_norm(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        data, shape = args[:2]
+        if data.struct_info.dtype != "float32":
+            raise NotImplementedError("RMSNorm currently qualifies FP32 source arithmetic")
+        weight = args[2] if len(args) > 2 else node.kwargs.get("weight")
+        epsilon = args[3] if len(args) > 3 else node.kwargs.get("eps")
+        epsilon = torch.finfo(torch.float32).eps if epsilon is None else epsilon
+        if weight is None:
+            weight = self.block_builder.emit(relax.op.ones(shape, "float32"))
+        axes = list(range(-len(shape), 0))
+        return self.block_builder.emit(
+            relax.op.nn.rms_norm(data, weight, axes=axes, epsilon=epsilon)
+        )
+
+    def _flatten(self, node: fx.Node) -> relax.Var:
+        import math
+
+        args = self.retrieve_args(node)
+        data = args[0]
+        shape = tuple(self.shape_of(data))
+        if not shape:
+            return self.block_builder.emit(relax.op.reshape(data, (1,)))
+        start = args[1] if len(args) > 1 else node.kwargs.get("start_dim", 0)
+        end = args[2] if len(args) > 2 else node.kwargs.get("end_dim", -1)
+        if not -len(shape) <= start < len(shape) or not -len(shape) <= end < len(shape):
+            raise ValueError("Flatten axes are outside the input rank")
+        start, end = start % len(shape), end % len(shape)
+        if start > end:
+            raise ValueError("Flatten start axis follows its end axis")
+        output = shape[:start] + (math.prod(shape[start : end + 1]),) + shape[end + 1 :]
+        return self.block_builder.emit(relax.op.reshape(data, output))
+
+    def _chunk(self, node: fx.Node) -> relax.Var:
+        from tvm import tir
+
+        args = self.retrieve_args(node)
+        data = args[0]
+        chunks = args[1] if len(args) > 1 else node.kwargs["chunks"]
+        axis = args[2] if len(args) > 2 else node.kwargs.get("dim", 0)
+        extent = self.shape_of(data)[axis]
+        if not isinstance(extent, tir.IntImm):
+            raise NotImplementedError("Chunk import requires a static split extent")
+        if type(chunks) is not int or chunks <= 0:
+            raise ValueError("Chunk count must be a positive integer")
+        size = (int(extent) + chunks - 1) // chunks
+        cuts = list(range(size, int(extent), size)) if size else [0] * (chunks - 1)
+        if int(extent) > 0 and int(extent) % chunks == 0:
+            cuts = chunks
+        return self.block_builder.emit(relax.op.split(data, cuts, axis))
+
+    def _batch_norm_inference(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        training = args[5] if len(args) > 5 else node.kwargs.get("training", False)
+        if training is not False or args[3] is None or args[4] is None:
+            raise NotImplementedError(
+                "BatchNorm training/statistics updates are outside inference import"
+            )
+        data, weight, bias, mean, variance = args[:5]
+        if weight is None:
+            weight = self.block_builder.emit(
+                relax.op.ones(self.shape_of(mean), data.struct_info.dtype)
+            )
+        if bias is None:
+            bias = self.block_builder.emit(
+                relax.op.zeros(self.shape_of(mean), data.struct_info.dtype)
+            )
+        momentum = args[6] if len(args) > 6 else node.kwargs.get("momentum", 0.1)
+        epsilon = args[7] if len(args) > 7 else node.kwargs.get("eps", 1e-5)
+        result = self.block_builder.emit(
+            relax.op.nn.batch_norm(
+                data, weight, bias, mean, variance, axis=1, epsilon=epsilon, momentum=momentum
+            )
+        )
+        return self.block_builder.emit(relax.TupleGetItem(result, 0))
+
+    def _where(self, node: fx.Node) -> relax.Var:
+        condition, lhs, rhs = self.retrieve_args(node)
+        dtype = self._captured_dtype(node)
+        return self.block_builder.emit(
+            relax.op.where(
+                condition, self._numeric_operand(lhs, dtype), self._numeric_operand(rhs, dtype)
+            )
+        )
+
+    def _assert_tensor_metadata(self, node: fx.Node):
+        # Export inserts these assertions for already typed internal values.
+        # Physical storage assertions are outside Relax's tensor contract.
+        args = self.retrieve_args(node)
+        value = args[0]
+        requested = dict(node.kwargs)
+        requested.update(zip(("size", "stride", "dtype"), node.args[1:]))
+        if requested.get("stride") is not None or requested.get("layout") not in (
+            None,
+            torch.strided,
+        ):
+            raise NotImplementedError(
+                "Tensor metadata assertion requires physical storage semantics"
+            )
+        if requested.get("size") is not None:
+            actual = tuple(int(size) for size in self.shape_of(value))
+            if actual != tuple(requested["size"]):
+                raise ValueError("Tensor metadata size assertion disagrees with captured type")
+        if requested.get("dtype") is not None:
+            if value.struct_info.dtype != self._convert_data_type(requested["dtype"]):
+                raise ValueError("Tensor metadata dtype assertion disagrees with captured type")
+        if requested.get("device") is not None and str(requested["device"]) != "cpu":
+            raise NotImplementedError("Tensor metadata assertion names a non-CPU source device")
+        return None
+
+    def _qdq(self, node: fx.Node, *, dequantize=False, channel=False):
+        import math
+        import numpy as np
+        from ._quantization import (
+            quantize_per_tensor,
+            dequantize_per_tensor,
+            dequantize_per_channel,
+        )
+
+        args = self.retrieve_args(node)
+        data = args[0]
+        if channel:
+            if not dequantize:
+                raise NotImplementedError("Per-channel runtime quantization is not yet qualified")
+            scales, zeros, axis, low, high, source_dtype = args[1:]
+            if scales in self._frozen_values:
+                scales = self._convert_torch_tensor_to_relax(self._frozen_values[scales])
+            if zeros in self._frozen_values:
+                zeros = self._convert_torch_tensor_to_relax(self._frozen_values[zeros])
+            if not isinstance(scales, relax.Constant) or not isinstance(zeros, relax.Constant):
+                raise NotImplementedError(
+                    "Channel Q/DQ requires frozen scale and zero-point tensors"
+                )
+            scale_values, zero_values = scales.data.numpy(), zeros.data.numpy()
+            if not np.isfinite(scale_values).all() or not (scale_values > 0).all():
+                raise ValueError("Channel scales must be finite and positive")
+            if not ((zero_values >= low) & (zero_values <= high)).all():
+                raise NotImplementedError("Channel zero points must lie in the quantized range")
+            rank = len(self.shape_of(data))
+            if not -rank <= axis < rank:
+                raise ValueError("Channel Q/DQ axis is outside the input rank")
+            axis %= rank
+            if scales.data.shape != zeros.data.shape or len(scales.data.shape) != 1:
+                raise ValueError("Channel Q/DQ parameters must be equal-size vectors")
+            if int(self.shape_of(data)[axis]) != scales.data.shape[0]:
+                raise ValueError("Channel Q/DQ parameter count disagrees with the tensor")
+            implementation, parameters = dequantize_per_channel, (scales, zeros, axis)
+        else:
+            scale, zero, low, high, source_dtype = args[1:]
+            if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+                raise ValueError("Tensor Q/DQ requires a finite positive static scale")
+            if type(zero) is not int or not low <= zero <= high:
+                raise ValueError("Tensor Q/DQ requires a zero point in the quantized range")
+            implementation = dequantize_per_tensor if dequantize else quantize_per_tensor
+            parameters = (
+                (scale, zero)
+                if dequantize
+                else (1.0 / scale, zero, low, high, self._convert_data_type(source_dtype))
+            )
+        dtype = self._convert_data_type(source_dtype)
+        if dtype not in ("int8", "uint8") or not -(1 << 7) <= low <= high <= 255:
+            raise NotImplementedError("Q/DQ currently qualifies signed/unsigned byte codes")
+        limits = np.iinfo(dtype)
+        if low < limits.min or high > limits.max:
+            raise ValueError("Q/DQ bounds exceed the declared code dtype")
+        if dequantize:
+            out_dtype = node.kwargs.get("out_dtype") or torch.float32
+            if data.struct_info.dtype != dtype or out_dtype != torch.float32:
+                raise NotImplementedError(
+                    "Q/DQ currently requires matching byte input and FP32 output"
+                )
+            if not channel and scale == 1 and zero == 0:
+                return self.block_builder.emit(relax.op.astype(data, "float32"))
+        elif data.struct_info.dtype not in ("float16", "float32"):
+            raise NotImplementedError("Q/DQ currently qualifies FP16/FP32 quantization input")
+        return self.block_builder.emit_te(implementation, data, *parameters)
+
+    def _integer_carrier_pair(self, lhs, rhs, depth):
+        """Prove exact FP32 contraction of signed-byte integer carriers.
+
+        This target-independent identity changes no scales or rounding policy.
+        Every possible prefix must fit FP32's exact integer range, including
+        arbitrary reassociation/FMA. Larger or unproved cases stay floating.
+        """
+        from tvm import tir
+
+        if not isinstance(depth, tir.IntImm) or not 0 < int(depth) <= (1 << 24) // (128 * 128):
+            return None
+        codes = []
+        for value in (lhs, rhs):
+            binding = (
+                self.block_builder.lookup_binding(value) if isinstance(value, relax.Var) else value
+            )
+            if not (
+                isinstance(binding, relax.Call)
+                and binding.op == tvm.ir.Op.get("relax.astype")
+                and binding.attrs.dtype == "float32"
+                and binding.args[0].struct_info.dtype == "int8"
+            ):
+                return None
+            codes.append(binding.args[0])
+        return codes
+
+    def _linear(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        lhs, rhs = args[:2]
+        bias = args[2] if len(args) > 2 else None
+        codes = self._integer_carrier_pair(lhs, rhs, self.shape_of(lhs)[-1])
+        if codes is None:
+            return super()._linear(node)
+        product = self.block_builder.emit(relax.op.linear(*codes, out_dtype="int32"))
+        result = self.block_builder.emit(relax.op.astype(product, "float32"))
+        return result if bias is None else self.block_builder.emit(relax.op.add(result, bias))
+
+    def _int_mm(self, node: fx.Node) -> relax.Var:
+        """Preserve ATen's signed-byte product with an INT32 result.
+
+        This is mathematical legalization, independent of accelerator selection.
+        A type-derived prefix bound admits ordinary INT32 reduction; larger
+        static reductions retain the source modulo-32 result on the CPU.
+        """
+        from tvm import tir
+
+        lhs, rhs = self.retrieve_args(node)
+        if any(value.struct_info.dtype != "int8" for value in (lhs, rhs)):
+            raise ValueError("aten._int_mm requires signed INT8 operands")
+        if any(len(self.shape_of(value)) != 2 for value in (lhs, rhs)):
+            raise ValueError("aten._int_mm requires rank-two operands")
+        if self._captured_dtype(node) != "int32":
+            raise ValueError("aten._int_mm requires an INT32 result")
+        depth = self.shape_of(lhs)[-1]
+        if not isinstance(depth, tir.IntImm):
+            raise NotImplementedError("aten._int_mm requires a static accumulation bound")
+        if int(depth) == 0:
+            shape = (self.shape_of(lhs)[0], self.shape_of(rhs)[1])
+            return self.block_builder.emit(relax.op.zeros(shape, "int32"))
+        if int(depth) * (1 << 14) <= (1 << 31) - 1:
+            return self.block_builder.emit(relax.op.matmul(lhs, rhs, out_dtype="int32"))
+        # The generic modular contraction's output dtype follows its operands.
+        # Sign extension before that contraction preserves _int_mm's wide result.
+        return self._matmul_values(
+            self._numeric_operand(lhs, "int32"),
+            self._numeric_operand(rhs, "int32"),
+            "int32",
+        )
+
     def _addmm(self, node: fx.Node) -> relax.Var:
         bias, lhs, rhs = self.retrieve_args(node)
         dtype = self._captured_dtype(node)
@@ -264,6 +516,14 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         )
         shape = data_shape[:1] + (out_channels,) + spatial
         compute_dtype = "float32" if dtype == "float16" else dtype
+        integer_carriers = None
+        if dtype == "float32" and not transpose:
+            extents = weight_shape[2:] + (data_shape[1] // groups,)
+            if all(isinstance(size, tir.IntImm) for size in extents):
+                depth = tir.IntImm("int64", math.prod(int(size) for size in extents))
+                integer_carriers = self._integer_carrier_pair(data, weight, depth)
+                if integer_carriers is not None:
+                    compute_dtype = "int32"
         if dtype == "int8":
             extents = weight_shape[2:] + (data_shape[1] // groups,)
             if not all(isinstance(size, tir.IntImm) for size in extents):
@@ -291,7 +551,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 primfunc_name_hint="modular_convolution",
             )
         else:
-            lhs, rhs = data, weight
+            lhs, rhs = integer_carriers if integer_carriers is not None else (data, weight)
             if dtype == "float16":
                 lhs = self.block_builder.emit(relax.op.astype(lhs, compute_dtype))
                 rhs = self.block_builder.emit(relax.op.astype(rhs, compute_dtype))
@@ -325,6 +585,11 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                         **kwargs,
                     )
                 )
+        if integer_carriers is not None:
+            # Bias remains the source FP32 addition; only the proved exact
+            # contraction changes representation. No bias-grid guess occurs.
+            result = self.block_builder.emit(relax.op.astype(result, "float32"))
+            compute_dtype = "float32"
         if bias is not None:
             bias = self.block_builder.emit(relax.op.reshape(bias, (1, -1) + (1,) * dim))
             if dtype in ("int32", "int64"):
@@ -1042,6 +1307,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "lt.Tensor": self._binary_op(relax.op.less, operator.lt),
             "matmul.default": self._matmul,
             "mm.default": self._matmul,
+            "_int_mm.default": self._int_mm,
+            "amax.default": self._amax,
             "max.other": self._binary_op(relax.op.maximum, max),
             "mul.Tensor": partial(self._numeric_binary, operation="multiply"),
             "mul.Scalar": partial(self._numeric_binary, operation="multiply"),
@@ -1051,6 +1318,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "sub.Scalar": partial(self._numeric_binary, operation="subtract"),
             # neural network
             "_native_batch_norm_legit_no_training.default": self._batch_norm_legit_no_training,
+            "batch_norm.default": self._batch_norm_inference,
             "adaptive_avg_pool1d.default": partial(self._adaptive_average_pool, dim=1),
             "adaptive_avg_pool2d.default": partial(self._adaptive_average_pool, dim=2),
             "adaptive_avg_pool3d.default": partial(self._adaptive_average_pool, dim=3),
@@ -1080,6 +1348,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "group_norm.default": self._group_norm,
             "layer_norm.default": self._layer_norm,
             "linear.default": self._linear,
+            "rms_norm.default": self._rms_norm,
             "max_pool2d.default": self._max_pool2d,
             "scaled_dot_product_attention.default": self._scaled_dot_product_attention,
             "unbind.int": self._unbind,
@@ -1097,10 +1366,13 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "as_strided.default": self._as_strided,
             "cat.default": self._cat,
             "concat.default": self._cat,
+            "chunk.default": self._chunk,
+            "stack.default": self._stack,
             "cumsum.default": self._cumsum,
             "diagonal.default": self._diagonal,
             "constant_pad_nd.default": partial(self._pad, mode="constant"),
             "expand.default": self._expand,
+            "flatten.using_ints": self._flatten,
             "pad.default": self._pad,
             "permute.default": self._permute,
             "reflection_pad1d.default": partial(self._pad, mode="reflect"),
@@ -1128,6 +1400,8 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "view.default": self._reshape,
             # tensor creation
             "_to_copy.default": self._to_copy,
+            "to.dtype": self._to_copy,
+            "to.dtype_layout": self._to_copy,
             "arange.start": self._arange,
             "clone.default": lambda node: self.env[node.args[0]],
             "empty.memory_format": self._empty,
@@ -1138,6 +1412,13 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "new_ones.default": self._new_ones,
             # other
             "getitem": self._getitem,
+            "where.self": self._where,
+            "where.ScalarSelf": self._where,
+            "where.ScalarOther": self._where,
+            "_assert_tensor_metadata.default": self._assert_tensor_metadata,
+            "quantize_per_tensor.default": self._qdq,
+            "dequantize_per_tensor.default": partial(self._qdq, dequantize=True),
+            "dequantize_per_channel.default": partial(self._qdq, dequantize=True, channel=True),
         }
 
     def create_input_vars(
@@ -1183,6 +1464,14 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
         # Create input variables.
         parameter_buffer_constant_vars, user_input_vars = self.create_input_vars(exported_program)
+        frozen = dict(exported_program.named_buffers()) | dict(exported_program.constants)
+        if not keep_params_as_input:
+            frozen.update(exported_program.named_parameters())
+        self._frozen_values = {
+            parameter_buffer_constant_vars[spec.arg.name]: frozen[spec.target]
+            for spec in exported_program.graph_signature.input_specs
+            if spec.target in frozen
+        }
         inputs_vars = user_input_vars.copy()
         inputs_vars.update(parameter_buffer_constant_vars)
 

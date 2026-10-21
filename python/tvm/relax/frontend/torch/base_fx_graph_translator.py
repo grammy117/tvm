@@ -117,8 +117,18 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _clamp(self, node: fx.Node) -> relax.Expr:
         args = self.retrieve_args(node)
-        a_min = args[1] if len(args) > 1 else node.kwargs["min"]
-        a_max = args[2] if len(args) > 2 else node.kwargs["max"]
+        a_min = args[1] if len(args) > 1 else node.kwargs.get("min")
+        a_max = args[2] if len(args) > 2 else node.kwargs.get("max")
+        if a_min is None and a_max is None:
+            raise ValueError("Clamp requires at least one bound")
+        if a_min is None or a_max is None:
+            bound = a_max if a_min is None else a_min
+            if not isinstance(bound, (int, float)):
+                raise ValueError("Clamp requires constant bounds")
+            op = relax.op.minimum if a_min is None else relax.op.maximum
+            return self.block_builder.emit(
+                op(args[0], relax.const(bound, args[0].struct_info.dtype))
+            )
         if not isinstance(a_min, (int, float)):
             raise ValueError(
                 f"TVM only supports constant min value for torch.clamp/clip, "
@@ -171,7 +181,21 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         if node.kwargs.get("decimals", 0) != 0:
             raise ValueError("specifying decimals for round is not supported yet")
         arg = self.env[node.args[0]]
-        return self.block_builder.emit(relax.op.round(arg))
+        if not arg.struct_info.dtype.startswith("float"):
+            return arg
+        from tvm import te, tir
+
+        def round_even(data):
+            # PyTorch rounds ties to even. Relax round uses llvm.round, which
+            # rounds ties away from zero. Source floating execution, including
+            # this intrinsic, requires the usual round-to-nearest-even mode.
+            return te.compute(
+                data.shape,
+                lambda *indices: tir.nearbyint(data[indices]),
+                name="round_half_even",
+            )
+
+        return self.block_builder.emit_te(round_even, arg)
 
     def _softmax(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -918,19 +942,14 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         args = self.retrieve_args(node)
         axis = args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
         in_args = args[0]
-        assert all(
-            a.struct_info.shape[axis] == in_args[0].struct_info.shape[axis] for a in in_args[1:]
-        ), "Expect all dim at {} to be the same, get {}".format(
-            axis, [a.struct_info.shape for a in args]
-        )
-        cat = self.block_builder.emit(relax.op.concat(in_args, axis=axis))
-        s_shape = []
-        for idx, s in enumerate(cat.struct_info.shape):
-            if idx == axis:
-                s_shape.extend([len(in_args), in_args[0].struct_info.shape[axis]])
-            else:
-                s_shape.append(s)
-        return self.block_builder.emit(relax.op.reshape(cat, s_shape))
+        if not in_args:
+            raise ValueError("Stack requires a nonempty tensor sequence")
+        rank = len(self.shape_of(in_args[0]))
+        if not isinstance(axis, int) or not -rank - 1 <= axis <= rank:
+            raise ValueError("Stack axis is outside the output rank")
+        axis %= rank + 1
+        expanded = [self.block_builder.emit(relax.op.expand_dims(value, axis)) for value in in_args]
+        return self.block_builder.emit(relax.op.concat(expanded, axis=axis))
 
     def _tile(self, node: fx.Node) -> relax.Var:
         import torch  # type: ignore
@@ -952,7 +971,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         import torch  # type: ignore
 
         x = self.env[node.args[0]]
-        if len(node.args) == 2:
+        if len(node.args) >= 2:
             if isinstance(node.args[1], torch.dtype):
                 dtype = self._convert_data_type(node.args[1], self.env)
                 return self.block_builder.emit(relax.op.astype(x, dtype))

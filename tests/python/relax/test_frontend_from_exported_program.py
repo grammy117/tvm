@@ -700,21 +700,11 @@ def test_round():
         def forward(self, input):
             return torch.round(input)
 
-    @tvm.script.ir_module
-    class expected:
-        @R.function
-        def main(
-            input_1: R.Tensor((1, 3, 10, 10), dtype="float32")
-        ) -> R.Tuple(R.Tensor((1, 3, 10, 10), dtype="float32")):
-            # block 0
-            with R.dataflow():
-                lv: R.Tensor((1, 3, 10, 10), dtype="float32") = R.round(input_1)
-                gv: R.Tuple(R.Tensor((1, 3, 10, 10), dtype="float32")) = (lv,)
-                R.output(gv)
-            return gv
-
-    example_args = (torch.randn(1, 3, 10, 10, dtype=torch.float32),)
-    verify_model(Round(), example_args, {}, expected)
+    values = torch.tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5], dtype=torch.float32)
+    mod = from_exported_program(export(Round(), args=(values,)), unwrap_unit_return_tuple=True)
+    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+    tvm.testing.assert_allclose(vm["main"](tvm.nd.array(values.numpy())).numpy(),
+                               Round()(values).numpy(), rtol=0, atol=0)
 
 
 def test_softmax():
@@ -3475,7 +3465,8 @@ def test_to_copy():
         ) -> R.Tuple(R.Tensor((1, 2, 3, 4), dtype="float32")):
             # block 0
             with R.dataflow():
-                gv: R.Tuple(R.Tensor((1, 2, 3, 4), dtype="float32")) = (x,)
+                lv: R.Tensor((1, 2, 3, 4), dtype="float32") = R.astype(x, dtype="float32")
+                gv: R.Tuple(R.Tensor((1, 2, 3, 4), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
 
