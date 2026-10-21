@@ -18,15 +18,83 @@
 
 from pathlib import Path
 import sys
+import subprocess
+import tempfile
 import unittest
 
+import numpy as np
 import tvm
 
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
-from verify_tensorir import classify_output
+from verify_tensorir import classify_output, fixture_guest
 
 
 class TensorIRResultTests(unittest.TestCase):
+    def test_guest_checks_second_output_bits_and_guards(self):
+        expected = (
+            np.array([11, -7], "int32"),
+            np.array([0x80000000, 0x7FC12345], "uint32").view("float32"),
+        )
+        declarations, checks = fixture_guest(0, [np.array([3], "int32")], expected, 0, None, "host")
+        source = (
+            r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+static unsigned computes,zeros,dmas,accumulates,acc_writes,relus;
+static void puts_htif(const char* text) { (void)text; }
+static uint64_t hash(const void* p,size_t size) {
+  const unsigned char* data=p;uint64_t value=0;
+  for(size_t i=0;i<size;++i)value=value*257+data[i];return value;
+}
+int stage_0_model_run(const void*const*,void*const*,uint8_t*,uint64_t);
+"""
+            + "\n".join(declarations)
+            + "\nint main(void){\n"
+            + "\n".join(checks)
+            + "\nreturn 0;}\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="tensorir-guest-check-") as directory:
+            root = Path(directory)
+            path = root / "guest.c"
+            path.write_text(source)
+            stub_path = root / "stub.c"
+            stub_path.write_text(r"""
+#include <stdint.h>
+int stage_0_model_run(const void*const* in,void*const* out,uint8_t* work,uint64_t size) {
+  (void)in;(void)work;(void)size;
+  ((int32_t*)out[0])[0]=11;((int32_t*)out[0])[1]=-7;
+  ((uint32_t*)out[1])[0]=0x80000000;((uint32_t*)out[1])[1]=0x7FC12345^BAD_SECOND;
+  if(BAD_GUARD)((volatile unsigned char*)out[1])[8]=0;
+  return 0;
+}
+""")
+            for oracle, second, guard, expected_code in (
+                (0, 0, 0, 0),
+                (0, 1, 0, 22),
+                (1, 0, 0, 22),
+                (0, 0, 1, 23),
+            ):
+                binary = root / f"guest-{oracle}-{second}-{guard}"
+                subprocess.run(
+                    [
+                        "cc",
+                        "-std=c11",
+                        "-O2",
+                        f"-DBAD_ORACLE={oracle}",
+                        f"-DBAD_SECOND={second}",
+                        f"-DBAD_GUARD={guard}",
+                        path,
+                        stub_path,
+                        "-o",
+                        binary,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                result = subprocess.run([binary], capture_output=True)
+                self.assertEqual(result.returncode, expected_code)
+
     def test_rtl_negative_decodes_whitespace_and_requires_exact_guest_code(self):
         observed = (
             "TENSORIR_NUMERICAL_FAILURE\n"

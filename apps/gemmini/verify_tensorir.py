@@ -116,6 +116,82 @@ def fixtures():
         ],
         "uint32",
     )
+    for name, kind, dtype in (
+        ("view_diagonal_i8", "diagonal", "int8"),
+        ("view_as_strided_i32", "as_strided", "int32"),
+        ("view_select_f32", "select", "float32"),
+        ("view_permute_i8", "permute", "int8"),
+        ("view_split_i32", "split", "int32"),
+        ("view_squeeze_i32", "squeeze", "int32"),
+        ("view_squeeze_dims_f32", "squeeze_dims", "float32"),
+        ("view_unsqueeze_i8", "unsqueeze", "int8"),
+        ("view_reshape_f32", "reshape", "float32"),
+        ("view_slice_i8", "slice", "int8"),
+        ("view_noop_i32", "noop", "int32"),
+        ("view_scalar_f32", "scalar", "float32"),
+    ):
+        import torch
+        from tvm.relax.frontend.torch import from_exported_program
+
+        class View(torch.nn.Module):
+            def forward(self, x):
+                if kind == "diagonal":
+                    return x.diagonal(1, 1, 2)
+                if kind == "as_strided":
+                    return torch.as_strided(x, (2, 2), (4, 1), 1)
+                if kind == "select":
+                    return x.select(1, -1)
+                if kind == "permute":
+                    return x.permute(2, 0, 1)
+                if kind == "split":
+                    return torch.split(x, [1, 2], dim=1)
+                if kind == "squeeze":
+                    return x.squeeze(0)
+                if kind == "squeeze_dims":
+                    return x.squeeze((0, 1))
+                if kind == "unsqueeze":
+                    return x.unsqueeze(0)
+                if kind == "reshape":
+                    return x.reshape(2, 6)
+                if kind == "slice":
+                    return torch.ops.aten.slice.Tensor(x, 1, 0, 3, 2)
+                if kind == "noop":
+                    return x.squeeze(1)
+                return torch.scalar_tensor(-0.0)
+
+        values = (
+            bits.reshape(1, 3, 4).view("float32")
+            if dtype == "float32"
+            else (np.arange(12).reshape(1, 3, 4) * 37 - 128).astype(dtype)
+        )
+        example = torch.from_numpy(values)
+        model = View()
+        graph = from_exported_program(
+            torch.export.export(model, (example,)), unwrap_unit_return_tuple=True
+        )
+        output = model(example)
+        expected = tuple(x.numpy() for x in output) if isinstance(output, tuple) else output.numpy()
+        result.append(
+            (name, graph, [values], expected, "host" if kind in ("noop", "scalar") else "gemmini")
+        )
+    x = relax.Var("x", relax.TensorStructInfo((8,), "int32"))
+    index = relax.Var("index", relax.TensorStructInfo((1,), "int64"))
+    builder = relax.BlockBuilder()
+    with builder.function("main", [x, index]):
+        with builder.dataflow():
+            viewed = builder.emit(relax.op.reshape(x, (2, 4)))
+            output = builder.emit_output(relax.op.take(viewed, index, axis=0))
+        builder.emit_func_output(output)
+    values = np.arange(8, dtype="int32") * 13 - 128
+    result.append(
+        (
+            "view_alias_i32",
+            builder.get(),
+            [values, np.array([1], "int64")],
+            values.reshape(2, 4)[[1]],
+            "host",
+        )
+    )
     for name, dtype, shape, sizes, axis in (
         ("cat_i8", "int8", (3, 3), (3, 4, 1), 1),
         ("cat_i32", "int32", (3, 3), (3, 2, 1), 0),
@@ -545,8 +621,92 @@ def fixtures():
     return result
 
 
-def prepare(args):
+def fixture_guest(index, arrays, expected, workspace, operation, placement="gemmini"):
+    """Check every flat output independently, including tuples and host-only cases."""
     import numpy as np
+
+    def flatten(value):
+        if isinstance(value, (tuple, list)):
+            return [array for item in value for array in flatten(item)]
+        return [np.asarray(value)]
+
+    def payload(value):
+        array = np.asarray(value)
+        ctype = {
+            "int8": "int8_t",
+            "int32": "int32_t",
+            "int64": "int64_t",
+            "float32": "uint32_t",
+            "bool": "uint8_t",
+        }.get(str(array.dtype))
+        if ctype is None or not array.size:
+            raise ValueError("Unsupported or empty verification tensor")
+        data = array.view("uint32") if array.dtype == np.float32 else array
+        return ctype, ",".join(str(int(x)) for x in data.flat)
+
+    guest, checks = [], []
+    for arg, array in enumerate(arrays):
+        ctype, values = payload(array)
+        guest.append(
+            f"static const {ctype} in_{index}_{arg}[] __attribute__((aligned(64)))={{{values}}};"
+        )
+    outputs = flatten(expected)
+    for number, array in enumerate(outputs):
+        ctype, values = payload(array)
+        guest.append(f"static const {ctype} expected_{index}_{number}[]={{{values}}};")
+        guest.append(
+            f"static struct {{ uint8_t head[64]; {ctype} data[{array.size}]; uint8_t tail[64]; }} out_{index}_{number} __attribute__((aligned(64)));"
+        )
+    guest.append(f"static uint8_t work_{index}[{max(workspace, 1)}] __attribute__((aligned(64)));")
+    pointers = ",".join(f"in_{index}_{arg}" for arg in range(len(arrays)))
+    results = ",".join(f"out_{index}_{number}.data" for number in range(len(outputs)))
+    checks.extend(
+        [
+            f"const void* inputs_{index}[]={{{pointers}}}; void* outputs_{index}[]={{{results}}};",
+            f"unsigned before_{index}=computes, zero_before_{index}=zeros;",
+            f"unsigned dma_before_{index}=dmas, add_before_{index}=accumulates;",
+            f"unsigned write_before_{index}=acc_writes, relu_before_{index}=relus;",
+        ]
+    )
+    for number in range(len(outputs)):
+        checks.append(f"memset(&out_{index}_{number},0x6d,sizeof(out_{index}_{number}));")
+    for arg in range(len(arrays)):
+        checks.append(
+            f"uint64_t hash_{index}_{arg}=hash(in_{index}_{arg},sizeof(in_{index}_{arg}));"
+        )
+    if placement == "host":
+        primitive_check = f"if(computes!=before_{index} || dmas!=dma_before_{index} || zeros!=zero_before_{index})return 21;"
+    elif operation == "matmul_bias":
+        primitive_check = f"if(computes==before_{index} || acc_writes==write_before_{index} || zeros!=zero_before_{index})return 21;"
+    elif operation and operation != "sum_i8_i32":
+        primitive_check = f"if(dmas==dma_before_{index})return 21;"
+    else:
+        primitive_check = f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
+    if operation is not None and operation.startswith("add_i32"):
+        primitive_check += f"if(accumulates==add_before_{index})return 21;"
+    if operation == "relu_i8":
+        primitive_check += f"if(relus==relu_before_{index})return 21;"
+    checks.extend(
+        [
+            f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index},{workspace})) return 20;",
+            primitive_check,
+        ]
+    )
+    for number, array in enumerate(outputs):
+        checks.append(
+            f'for(unsigned i=0;i<{array.size};++i)if((uint64_t)(int64_t)out_{index}_{number}.data[i]!=((uint64_t)(int64_t)expected_{index}_{number}[i]^BAD_ORACLE)){{puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}'
+        )
+        checks.append(
+            f"for(unsigned i=0;i<64;++i)if(out_{index}_{number}.head[i]!=0x6d || out_{index}_{number}.tail[i]!=0x6d)return 23;"
+        )
+    for arg in range(len(arrays)):
+        checks.append(
+            f"if(hash_{index}_{arg}!=hash(in_{index}_{arg},sizeof(in_{index}_{arg})))return 24;"
+        )
+    return guest, checks
+
+
+def prepare(args):
     from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
     from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
     from baremetal import export_graphs
@@ -566,101 +726,43 @@ def prepare(args):
     if len(cases) != len(set(args.cases)) or not cases:
         raise ValueError("Unknown or empty verification case selection")
     modules, reports = {}, {}
-    for name, mod, _, _ in cases:
+    for case in cases:
+        name, mod = case[:2]
+        placement = case[4] if len(case) > 4 else "gemmini"
         report = []
         options = {"col_tiles": 2, "reduction_chunk": 8} if name == "reuse" else None
         modules[name] = prepare_gemmini_graph(mod, report=report, schedule_options=options)
-        if sum(row["placement"] == "gemmini" for row in report) != 1:
+        if sum(row["placement"] == "gemmini" for row in report) != (
+            0 if placement == "host" else 1
+        ):
             raise ValueError("Fixture did not use the structural accelerator rule: " + name)
         reports[name] = report
     package = out / "package"
     manifest = export_graphs(modules, package, memory_limit_bytes=16 << 20)
     guest = [GUEST, '#include "package/model.h"']
     checks = []
-    for index, (name, _, arrays, expected) in enumerate(cases):
-        output_ctype = (
-            "uint32_t"
-            if expected.dtype == np.float32
-            else "int8_t"
-            if expected.dtype == np.int8
-            else "int64_t"
-            if expected.dtype == np.int64
-            else "int32_t"
-        )
-        for arg, array in enumerate(arrays):
-            ctype = (
-                "uint32_t"
-                if array.dtype == np.float32
-                else "int8_t"
-                if array.dtype == np.int8
-                else "int64_t"
-                if array.dtype == np.int64
-                else "int32_t"
-            )
-            payload = array.view("uint32") if array.dtype == np.float32 else array
-            values = ",".join(str(int(x)) for x in payload.flat)
-            guest.append(
-                f"static const {ctype} in_{index}_{arg}[] __attribute__((aligned(64)))={{{values}}};"
-            )
-        expected_payload = expected.view("uint32") if expected.dtype == np.float32 else expected
-        values = ",".join(str(int(x)) for x in expected_payload.flat)
-        guest.append(f"static const {output_ctype} expected_{index}[]={{{values}}};")
-        size = expected.size
-        workspace = manifest["stages"][name]["workspace_bytes"]
-        guest.append(
-            f"static struct {{ uint8_t head[64]; {output_ctype} data[{size}]; uint8_t tail[64]; }} out_{index} __attribute__((aligned(64)));"
-        )
-        guest.append(
-            f"static uint8_t work_{index}[{max(workspace, 1)}] __attribute__((aligned(64)));"
-        )
-        pointers = ",".join(f"in_{index}_{arg}" for arg in range(len(arrays)))
-        checks.extend(
-            [
-                f'puts_htif("TENSORIR_CASE {name}\\n");',
-                f"const void* inputs_{index}[]={{{pointers}}}; void* outputs_{index}[]={{out_{index}.data}};",
-                f"memset(&out_{index},0x6d,sizeof(out_{index}));",
-                f"unsigned before_{index}=computes, zero_before_{index}=zeros;",
-                f"unsigned dma_before_{index}=dmas, add_before_{index}=accumulates;",
-                f"unsigned write_before_{index}=acc_writes;",
-                f"unsigned relu_before_{index}=relus;",
-            ]
-        )
-        for arg in range(len(arrays)):
-            checks.append(
-                f"uint64_t hash_{index}_{arg}=hash(in_{index}_{arg},sizeof(in_{index}_{arg}));"
-            )
+    for index, case in enumerate(cases):
+        name, _, arrays, expected = case[:4]
+        placement = case[4] if len(case) > 4 else "gemmini"
         operation = next(
-            row["metadata"].get("operation")
-            for row in reports[name]
-            if row["placement"] == "gemmini"
+            (
+                row["metadata"].get("operation")
+                for row in reports[name]
+                if row["placement"] == "gemmini"
+            ),
+            None,
         )
-        if operation == "matmul_bias":
-            primitive_check = (
-                f"if(computes==before_{index} || acc_writes==write_before_{index}"
-                f" || zeros!=zero_before_{index})return 21;"
-            )
-        elif operation and operation != "sum_i8_i32":
-            primitive_check = f"if(dmas==dma_before_{index})return 21;"
-        else:
-            primitive_check = (
-                f"if(computes==before_{index} || zeros==zero_before_{index})return 21;"
-            )
-        if operation is not None and operation.startswith("add_i32"):
-            primitive_check += f"if(accumulates==add_before_{index})return 21;"
-        if operation == "relu_i8":
-            primitive_check += f"if(relus==relu_before_{index})return 21;"
-        checks.extend(
-            [
-                f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index},{workspace})) return 20;",
-                primitive_check,
-                f'for(unsigned i=0;i<{size};++i)if((int64_t)out_{index}.data[i]!=(int64_t)expected_{index}[i]+BAD_ORACLE){{puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}',
-                f"for(unsigned i=0;i<64;++i)if(out_{index}.head[i]!=0x6d || out_{index}.tail[i]!=0x6d)return 23;",
-            ]
+        declarations, case_checks = fixture_guest(
+            index,
+            arrays,
+            expected,
+            manifest["stages"][name]["workspace_bytes"],
+            operation,
+            placement,
         )
-        for arg in range(len(arrays)):
-            checks.append(
-                f"if(hash_{index}_{arg}!=hash(in_{index}_{arg},sizeof(in_{index}_{arg})))return 24;"
-            )
+        guest.extend(declarations)
+        checks.append(f'puts_htif("TENSORIR_CASE {name}\\n");')
+        checks.extend(case_checks)
     guest.append(
         "int main(void){\n"
         + "\n".join(checks)
@@ -782,6 +884,7 @@ def prepare(args):
         "bindings": bindings,
         "case_count": len(cases),
         "cases": [case[0] for case in cases],
+        "placements": {case[0]: case[4] if len(case) > 4 else "gemmini" for case in cases},
     }
     (out / "bundle.json").write_text(json.dumps(bundle, indent=2) + "\n")
     print(json.dumps({"status": "prepared", "bundle": str(out / "bundle.json")}))
@@ -965,6 +1068,19 @@ def main():
             "sum64_scalar",
             "sum32_export",
             "sum8_export",
+            "view_diagonal_i8",
+            "view_as_strided_i32",
+            "view_select_f32",
+            "view_permute_i8",
+            "view_split_i32",
+            "view_squeeze_i32",
+            "view_squeeze_dims_f32",
+            "view_unsqueeze_i8",
+            "view_reshape_f32",
+            "view_slice_i8",
+            "view_noop_i32",
+            "view_scalar_f32",
+            "view_alias_i32",
         ],
     )
     execute = sub.add_parser("run")

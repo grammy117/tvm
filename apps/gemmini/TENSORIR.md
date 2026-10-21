@@ -17,6 +17,8 @@ selected hardware and numerical contract.
 
 1. Ordinary Relax `LegalizeOps`, pattern annotation, constant folding and
    supported `FuseOps`/`FuseTIR` retain mathematical computations.
+   Standard `RewriteDataflowReshape` and `DeadCodeElimination` then remove
+   eligible internal reshape copies and unused functions before device matching.
    `CanonicalizeGemminiBias` can then expose a proven bias-initialized integer
    reduction, separately from scheduling, retaining both mathematical forms.
 2. `ScheduleGemminiTensorIR` recognizes contractions by their buffer accesses,
@@ -206,7 +208,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Window/divisor/padding semantics and native admission still required |
 | Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
 | Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies now expose concatenation and static positive-stride scatter regions through standard scheduling; their bounded target qualification is separate from the earlier padding checkpoint. Broader literal arithmetic and full frontend/aliasing admission remain under audit |
-| Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Audit view versus materialization and static-export ABI; do not count host metadata as accelerator arithmetic |
+| Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Admitted static frontend forms execute as standard metadata or INT8/INT32/FP32 mathematical copies. Internal reshapes can disappear; indexed or boundary materializations use DMA when Tensorize proves the access map. Constants and nonunit squeeze can require no device calls. Hidden storage aliases, dynamic contracts and zero-extent static-export buffers remain explicit limitations |
 
 ### Corrections to the proposed native-unit mappings
 
@@ -226,7 +228,7 @@ complete acceptance of every ATen overload or frontend graph.
 | `avg_pool1d/2d/3d`, adaptive average pooling | Ordinary floating inputs do not fit the integer arithmetic unit. An integer recipe must specify windows, divisors, exclude-padding/ceil behavior and rounding. The max-pool readout feature does not implement average pooling. |
 | Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. No generic backward mapping is claimed. |
 | Generic data movement | Primitive DMA handles rectangular regions with contiguous columns and one row stride. Copies preserving bits and signed widening are admitted. Index remapping, multiple sources, fill broadcasting and overlapping updates need appropriate schedules or remain CPU work. They must not be described as absent silicon features merely because the current schedule does not handle them. |
-| Views and metadata | Reshape-like operations may disappear or become host metadata when consumers can accept the layout. Permute, diagonal, slicing and `as_strided` are not automatically free under the static exporter's compact-buffer ABI. Materialization and alias semantics must be audited; host metadata is not accelerator arithmetic. |
+| Views and metadata | Reshape-like operations may disappear or become host metadata when consumers can accept the layout. Permute, diagonal, slicing and `as_strided` may need materialization under the compact-buffer ABI. `as_strided` admits contiguous sources and rebases storage offsets only when all reads remain within the logical input. Unsupported hidden storage access is an importer representation limit, not a missing DMA feature. Host metadata is not accelerator arithmetic. |
 
 The existing v0.19 Torch exported-program translator also has an incomplete
 direct ATen conversion table. Prior frontend decompositions may remove an
@@ -407,6 +409,39 @@ The shared finalizer retains a TensorIR root block around admission and device
 ownership. This lets stock Relax reshape analysis inspect prepared single-input
 functions during normal `relax.build`, instead of requiring a special pipeline
 to avoid that analysis. No core compiler modification is needed.
+
+View and metadata admission now uses the ordinary frontend and Relax pipeline.
+Nonunit explicit squeeze axes retain the input, negative select indices are
+normalized and statically checked, and select uses ordinary slice/squeeze
+operators without a runtime index tensor. Split sizes use their actual cuts,
+including integer split sizes that do not evenly divide the extent. Diagonal
+and admitted as-strided expressions are target-independent TE index maps;
+their frontend definitions contain no scheduling or hardware decisions.
+Constant scalar_tensor uses its captured dtype. Existing exporter-era expected
+IR for select/slice is refreshed for current PyTorch's removal of no-op slices.
+
+Standard RewriteDataflowReshape can turn internal copy loops into reshape
+metadata. DeadCodeElimination removes their unused PrimFuncs before scheduling,
+so an unused function cannot be counted as accelerator placement. Static export
+accepts same-byte-extent, same-dtype compact reshape aliases and extends each
+backing allocation's liveness through all view consumers and returned aliases.
+Views do not allocate intermediate storage. Caller-owned return slots still
+require copies when returning an input, a constant, or an aliased workspace
+value. Programs with only metadata/constants therefore need no operator calls.
+The stock build driver rejects an empty IRModule; for these zero-operator
+programs only, packaging asks the standard LLVM target codegen for an empty
+object container. There is no replacement math or scheduling in that bridge.
+
+Vector-to-matrix copy/widen descriptors expose zero-stride row broadcast to
+Tensorize. Ordinary rectangular or scalar candidates remain available through
+MetaSchedule; indexed/permuted shapes can use scalar DMA when a rectangle does
+not match. This removes a previous rank-changing copy limitation without a
+whole-operation library call or new C++ patch. As-strided sources must be
+contiguous, their storage offsets are rebased to the logical Relax input, and
+all actual reads must stay within that input. Hidden storage access and dynamic
+shape/offset contracts are refused explicitly. Zero-extent tensors can execute
+in ordinary VM tests but remain outside the static exporter's positive-size ABI.
+The scalar_tensor importer currently admits constant scalars only.
 
 ## Verification tools
 
@@ -603,3 +638,39 @@ checks pass. The same four fail with the unchanged prior legalizer and the same
 compiler, as recorded in `unit-statistical-baseline-v1.log`; the modified run
 is `unit-frontend-reduction-v4.log`. They are not counted as passing or repaired
 by this milestone. The full requested operator inventory remains unfinished.
+
+`device-views-indexed-v1` and `device-views-metadata-v1` qualify thirteen new
+view/frontend fixtures plus small contraction and INT64-sum regressions. The
+fixtures exercise all eleven requested view/metadata spellings in their admitted
+static forms. Diagonal, as-strided, negative-index select, permutation, slicing,
+split, unit squeeze, unsqueeze and boundary reshape materializations require
+actual DMA. Nonunit squeeze and constant scalar output issue no operator calls;
+an internal reshape alias consumed by a runtime-index CPU gather also issues no
+device commands. Positive and wrong-oracle checks pass on Spike and the pinned
+RTL, with positive RTL runs of approximately 31 and 44 seconds under the
+60-second/300,000-cycle bounds. The adapter and immutable `compiler-core-v6`
+libraries are unchanged; final ELF audits contain no prohibited instructions.
+
+The guest verifier now checks every output independently, including both split
+results, and checks guards surrounding each result. FP32 comparisons preserve
+raw payloads. Separate host fault injection proves that a wrong second output
+and a corrupted second-output guard are detected, independently of the general
+wrong-oracle control. These are functional checks, not performance labels.
+
+`unit-views-full-pinned-v2.log` passes 297 backend/app/frontend checks, and the
+disjoint `unit-views-exported-graph-v1.log` passes fifteen exported-graph checks.
+The preceding broader run had one duplicate-intrinsic registration failure;
+canonicalizing optional registration arguments fixes its cache key, and the
+complete final run passes. The checks include independent PyTorch references,
+input bit preservation, Python/JSON trace replay, standard MetaSchedule
+postprocessing, CPU fallback after reshape elimination, returned-view backing
+lifetimes and zero-operator/static-constant export. The existing baseline-only
+NN/statistical expectation failures described above remain outside this suite.
+
+This does not complete every view/alias contract: dynamic shapes/offsets,
+hidden storage reads, noncontiguous as-strided sources and zero-sized static
+export buffers remain explicit limitations. Constant scalar_tensor is admitted;
+runtime scalar construction still needs a representable frontend contract.
+The next creation-op audit reproduces unsupported `aten.full.default` and
+`aten.full_like.default` import. Those are frontend gaps, not missing hardware
+fill capabilities, and do not count as successful CPU fallback.
