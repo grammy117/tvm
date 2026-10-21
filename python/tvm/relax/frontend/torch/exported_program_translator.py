@@ -191,6 +191,127 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     ########## Neural Network ##########
 
+    def _pool_input(self, node, dim):
+        x = self.retrieve_args(node)[0]
+        rank = len(self.shape_of(x))
+        if rank not in (dim + 1, dim + 2):
+            raise ValueError("Pooling input rank does not match its spatial dimensions")
+        unbatched = rank == dim + 1
+        if unbatched:
+            x = self.block_builder.emit(relax.op.expand_dims(x, 0))
+        dtype = x.struct_info.dtype
+        if dtype == "float16":
+            x = self.block_builder.emit(relax.op.astype(x, "float32"))
+        return x, dtype, unbatched
+
+    def _average_pool(self, node: fx.Node, *, dim: int) -> relax.Var:
+        from tvm import tir
+        import math
+        from ._pooling import average_pool, output_extent
+
+        args = self.retrieve_args(node)
+        x, dtype, unbatched = self._pool_input(node, dim)
+
+        def argument(index, name, default):
+            return args[index] if len(args) > index else node.kwargs.get(name, default)
+
+        def dimensions(value):
+            result = [value] * dim if isinstance(value, int) else list(value)
+            result = result * dim if len(result) == 1 else result
+            if len(result) != dim or any(not isinstance(v, int) for v in result):
+                raise ValueError("Pooling parameters require one integer per spatial axis")
+            return tuple(result)
+
+        kernel = dimensions(argument(1, "kernel_size", None))
+        stride_arg = argument(2, "stride", None)
+        strides = kernel if stride_arg is None or stride_arg == [] else dimensions(stride_arg)
+        padding = dimensions(argument(3, "padding", 0))
+        ceil = argument(4, "ceil_mode", False)
+        include = argument(5, "count_include_pad", True)
+        divisor = argument(6, "divisor_override", None) if dim > 1 else None
+        if any(k <= 0 or s <= 0 or p < 0 for k, s, p in zip(kernel, strides, padding)):
+            raise ValueError("Pooling requires positive kernels/strides and nonnegative padding")
+        if divisor is not None and (not isinstance(divisor, int) or divisor == 0):
+            raise ValueError("Average pooling divisor must be a nonzero static integer")
+        if dtype == "int64" or (divisor is not None and (ceil or divisor != math.prod(kernel))):
+            result = self.block_builder.emit_te(
+                average_pool,
+                x,
+                kernel,
+                strides,
+                padding,
+                ceil,
+                include,
+                divisor,
+                primfunc_name_hint="average_pool",
+            )
+        else:
+            op = getattr(relax.op.nn, f"avg_pool{dim}d")
+            result = self.block_builder.emit(
+                op(
+                    x,
+                    pool_size=kernel,
+                    strides=strides,
+                    padding=padding,
+                    ceil_mode=ceil,
+                    count_include_pad=True if divisor is not None else include,
+                    layout={1: "NCW", 2: "NCHW", 3: "NCDHW"}[dim],
+                )
+            )
+            if ceil:
+                spatial = tuple(self.shape_of(x))[-dim:]
+                if not all(isinstance(size, tir.IntImm) for size in spatial):
+                    raise NotImplementedError(
+                        "Ceil-mode pooling requires static spatial extents for the ATen final-window rule"
+                    )
+                desired = [
+                    output_extent(int(size), k, s, p, True)
+                    for size, k, s, p in zip(spatial, kernel, strides, padding)
+                ]
+                actual = tuple(self.shape_of(result))[-dim:]
+                if any(
+                    not isinstance(size, tir.IntImm) or int(size) != extent
+                    for size, extent in zip(actual, desired)
+                ):
+                    result = self.block_builder.emit(
+                        relax.op.strided_slice(
+                            result, list(range(2, dim + 2)), [0] * dim, desired, [1] * dim
+                        )
+                    )
+        if dtype == "float16":
+            result = self.block_builder.emit(relax.op.astype(result, dtype))
+        if unbatched:
+            result = self.block_builder.emit(relax.op.squeeze(result, 0))
+        return result
+
+    def _adaptive_average_pool(self, node: fx.Node, *, dim: int) -> relax.Var:
+        args = self.retrieve_args(node)
+        x, dtype, unbatched = self._pool_input(node, dim)
+        if not dtype.startswith("float"):
+            raise NotImplementedError(
+                "Adaptive average pooling import requires a floating CPU contract"
+            )
+        size = args[1] if len(args) > 1 else node.kwargs.get("output_size")
+        if isinstance(size, int):
+            size = (size,) * dim
+        elif size is not None:
+            size = tuple(
+                extent if value is None else value
+                for value, extent in zip(size, tuple(self.shape_of(x))[-dim:])
+            )
+        result = self.block_builder.emit(
+            getattr(relax.op.nn, f"adaptive_avg_pool{dim}d")(
+                x,
+                size,
+                layout={1: "NCW", 2: "NCHW", 3: "NCDHW"}[dim],
+            )
+        )
+        if dtype == "float16":
+            result = self.block_builder.emit(relax.op.astype(result, dtype))
+        if unbatched:
+            result = self.block_builder.emit(relax.op.squeeze(result, 0))
+        return result
+
     def _batch_norm_legit_no_training(self, node: fx.Node) -> relax.Var:
         import numpy as np
 
@@ -575,9 +696,15 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "sub.Scalar": partial(self._numeric_binary, operation="subtract"),
             # neural network
             "_native_batch_norm_legit_no_training.default": self._batch_norm_legit_no_training,
-            "adaptive_avg_pool2d.default": self._adaptive_avg_pool2d,
+            "adaptive_avg_pool1d.default": partial(self._adaptive_average_pool, dim=1),
+            "adaptive_avg_pool2d.default": partial(self._adaptive_average_pool, dim=2),
+            "adaptive_avg_pool3d.default": partial(self._adaptive_average_pool, dim=3),
+            "_adaptive_avg_pool2d.default": partial(self._adaptive_average_pool, dim=2),
+            "_adaptive_avg_pool3d.default": partial(self._adaptive_average_pool, dim=3),
             "addmm.default": self._addmm,
-            "avg_pool2d.default": self._avg_pool2d,
+            "avg_pool1d.default": partial(self._average_pool, dim=1),
+            "avg_pool2d.default": partial(self._average_pool, dim=2),
+            "avg_pool3d.default": partial(self._average_pool, dim=3),
             "baddbmm.default": self._baddbmm,
             "bmm.default": self._matmul,
             "conv_transpose1d.default": self._conv_transpose1d,
