@@ -182,16 +182,26 @@ inline Tensor pool_grad_impl(const Tensor& out_grad, const Tensor& x,
                           (pad_w_idx - kernel_width) / stride_width + 1);
 
           PrimExpr divide_factor;  // number of pooled elements
-          if (count_include_pad) {
+          if (count_include_pad && !ceil_mode) {
             divide_factor = kernel_height * kernel_width;
           } else {
             PrimExpr h_start = out_idx[height_axis] * stride_height - pad_top;
             PrimExpr w_start = out_idx[width_axis] * stride_width - pad_left;
 
-            PrimExpr h_end = min(h_start + kernel_height, height);
-            PrimExpr w_end = min(w_start + kernel_width, width);
-            h_start = max(h_start, make_const(h_start.dtype(), 0));
-            w_start = max(w_start, make_const(w_start.dtype(), 0));
+            // Ceil mode may extend a window beyond the declared trailing
+            // padding. Those extra positions are not part of its divisor.
+            PrimExpr h_limit = height;
+            PrimExpr w_limit = width;
+            if (count_include_pad) {
+              h_limit += padding_size[2];
+              w_limit += padding_size[3];
+            }
+            PrimExpr h_end = min(h_start + kernel_height, h_limit);
+            PrimExpr w_end = min(w_start + kernel_width, w_limit);
+            if (!count_include_pad) {
+              h_start = max(h_start, make_const(h_start.dtype(), 0));
+              w_start = max(w_start, make_const(w_start.dtype(), 0));
+            }
             divide_factor =
                 max((h_end - h_start) * (w_end - w_start), make_const(h_end.dtype(), 1));
           }
