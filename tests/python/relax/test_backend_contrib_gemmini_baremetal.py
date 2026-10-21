@@ -120,6 +120,63 @@ class StaticGraphTests(unittest.TestCase):
         outs = (ctypes.c_void_p * len(outputs))(*(array.ctypes.data for array in outputs))
         return loaded.model_run(ins, outs, workspace.ctypes.data, workspace.nbytes if size is None else size)
 
+    def test_view_only_program_has_no_operator_calls_or_workspace(self):
+        x = relax.Var("x", relax.TensorStructInfo((2, 3), "int32"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [x]):
+            with builder.dataflow():
+                first = builder.emit(relax.op.reshape(x, (3, 2)))
+                second = builder.emit(relax.op.reshape(first, (6,)))
+                output = builder.emit_output(relax.Tuple([first, second, x]))
+            builder.emit_func_output(output)
+        report, loaded, inputs, outputs, workspace = self.compile(builder.get())
+        self.assertFalse(report["calls"])
+        self.assertEqual(report["workspace_bytes"], 0)
+        self.assertEqual(len(report["views"]), 2)
+        self.assertEqual(report["memory_preflight"]["completion"]["live_tensor_bytes"], 24)
+        inputs[0][:] = np.arange(6).reshape(2, 3) - 4
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace, size=0), 0)
+        for actual in outputs:
+            np.testing.assert_array_equal(actual.flat, inputs[0].flat)
+        aliases = [inputs[0].reshape(outputs[0].shape), *outputs[1:]]
+        self.assertEqual(self.invoke(loaded, inputs, aliases, workspace), -2)
+
+    def test_constant_only_program_keeps_scalar_bits_and_zero_input_abi(self):
+        scalar = relax.const(np.array(-0.0, "float32"))
+        vector = relax.const(np.array([-2147483648, 7, 2147483647], "int32"))
+        function = relax.Function([], relax.Tuple([scalar, vector]))
+        report, loaded, inputs, outputs, workspace = self.compile(tvm.IRModule({"main": function}))
+        self.assertFalse(report["calls"])
+        self.assertFalse(inputs)
+        self.assertEqual(report["workspace_bytes"], 0)
+        self.assertEqual(loaded.model_run(None, (ctypes.c_void_p * 2)(*(a.ctypes.data for a in outputs)), None, 0), 0)
+        self.assertEqual(int(outputs[0].reshape(1).view("uint32")[0]), 0x80000000)
+        np.testing.assert_array_equal(outputs[1], [-2147483648, 7, 2147483647])
+
+    def test_returned_view_retains_backing_storage_until_completion(self):
+        x = relax.Var("x", relax.TensorStructInfo((8,), "int32"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [x]):
+            with builder.dataflow():
+                backing = builder.emit(x + relax.const(1, "int32"))
+                view = builder.emit(relax.op.reshape(backing, (2, 4)))
+                branch1 = builder.emit(x * relax.const(2, "int32"))
+                branch2 = builder.emit(x * relax.const(3, "int32"))
+                result = builder.emit(branch1 + branch2)
+                output = builder.emit_output(relax.Tuple([view, result]))
+            builder.emit_func_output(output)
+        graph = relax.transform.RewriteDataflowReshape()(relax.transform.LegalizeOps()(builder.get()))
+        plan = plan_graph(graph)
+        self.assertEqual(len(plan["views"]), 1)
+        self.assertEqual(plan["views"][0].storage.last_use, len(plan["calls"]))
+        report, loaded, inputs, outputs, workspace = self.compile(graph)
+        self.assertEqual(len(report["calls"]), 4)
+        self.assertEqual(len(report["views"]), 1)
+        inputs[0][:] = np.arange(8) - 4
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+        np.testing.assert_array_equal(outputs[0], (inputs[0] + 1).reshape(2, 4))
+        np.testing.assert_array_equal(outputs[1], inputs[0] * 5)
+
     def test_stage_bundle_shares_constants_and_links_distinct_entrypoints(self):
         modules = {"prefill": graph(), "decode": graph(shape=(1, 3)), "private": graph(shape=(1, 3), weight_offset=1)}
         before = {name: mod.script(show_meta=True) for name, mod in modules.items()}

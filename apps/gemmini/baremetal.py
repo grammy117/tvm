@@ -54,13 +54,21 @@ class Tensor:
     last_use: int = -1
     offset: int = 0
     value: object = None
+    alias_of: object = None
+
+    @property
+    def storage(self):
+        return self if self.alias_of is None else self.alias_of.storage
 
     @property
     def nbytes(self):
         return math.prod(self.shape) * (2 if self.dtype == "bfloat16" else np.dtype(self.dtype).itemsize)
 
     def metadata(self):
-        return {"name": self.name, "shape": list(self.shape), "dtype": self.dtype, "bytes": self.nbytes, "origin": self.origin, "offset": self.offset, "birth": self.birth, "last_use": self.last_use}
+        record = {"name": self.name, "shape": list(self.shape), "dtype": self.dtype, "bytes": self.nbytes, "origin": self.origin, "offset": self.offset, "birth": self.birth, "last_use": self.last_use}
+        if self.alias_of is not None:
+            record["alias_of"] = self.storage.name
+        return record
 
 
 def _tensor(info, name, origin, birth=-1):
@@ -120,9 +128,10 @@ def _allocate_workspace(tensors):
 def plan_graph(mod):
     """Validate the graph's raw-pointer ABI and derive a reusable storage plan."""
     function = mod["main"]
-    if not isinstance(function, relax.Function) or not isinstance(function.body, relax.SeqExpr):
+    if not isinstance(function, relax.Function):
         raise ValueError("require a straight-line Relax main function")
     values, inputs, constants, tensors, calls, functions = {}, [], [], [], [], {}
+    views = []
     for index, param in enumerate(function.params):
         tensor = _tensor(param.struct_info, f"input_{index}", "input")
         values[param] = tensor
@@ -154,7 +163,13 @@ def plan_graph(mod):
         tensors.append(tensor)
         return tensor
 
-    for block in function.body.blocks:
+    def mark_use(tensor, index):
+        tensor.last_use = max(tensor.last_use, index)
+        tensor.storage.last_use = max(tensor.storage.last_use, index)
+
+    blocks = function.body.blocks if isinstance(function.body, relax.SeqExpr) else []
+    result_expr = function.body.body if isinstance(function.body, relax.SeqExpr) else function.body
+    for block in blocks:
         if not isinstance(block, (relax.BindingBlock, relax.DataflowBlock)):
             raise ValueError("unsupported graph binding block")
         for binding in block.bindings:
@@ -163,6 +178,20 @@ def plan_graph(mod):
             call = binding.value
             if not isinstance(call, relax.Call):
                 values[binding.var] = resolve(call)
+                continue
+            if call.op == tvm.ir.Op.get("relax.reshape"):
+                if len(call.args) != 2 or not isinstance(call.args[1], relax.ShapeExpr):
+                    raise ValueError("export requires static reshape metadata")
+                source = resolve(call.args[0])
+                if not isinstance(source, Tensor):
+                    raise ValueError("reshape requires one tensor value")
+                view = _tensor(binding.var.struct_info, f"view_{len(views)}", "view", len(calls))
+                if view.dtype != source.dtype or view.nbytes != source.nbytes:
+                    raise ValueError("reshape must preserve dtype and tensor byte extent")
+                view.alias_of = source.storage
+                mark_use(source, len(calls))
+                views.append(view)
+                values[binding.var] = view
                 continue
             if call.op != tvm.ir.Op.get("relax.call_tir") or len(call.args) != 2:
                 raise ValueError("export requires legalized buffer-only call_tir operations")
@@ -203,16 +232,16 @@ def plan_graph(mod):
                         raise ValueError("PrimFunc external-buffer storage alignment exceeds the storage guarantee")
             tir.stmt_functor.post_order_visit(primitive.body, check_alignment)
             for tensor in actual_inputs:
-                tensor.last_use = len(calls)
+                mark_use(tensor, len(calls))
             values[binding.var] = result
             functions[gv] = primitive.with_attr("global_symbol", symbol)
             calls.append((symbol, actual_inputs, actual_outputs))
-    outputs = _flatten(resolve(function.body.body))
-    if not outputs or not calls:
-        raise ValueError("require a nonempty tensor program and output")
+    outputs = _flatten(resolve(result_expr))
+    if not outputs:
+        raise ValueError("require a nonempty tensor output")
     unique_outputs = set(outputs)
     for index, tensor in enumerate(outputs):
-        tensor.last_use = len(calls)
+        mark_use(tensor, len(calls))
         # Duplicate returns and input/constant returns are copied at completion.
         if tensor.origin == "workspace":
             tensor.origin = "output"
@@ -223,7 +252,7 @@ def plan_graph(mod):
     for tensor in constants:
         tensor.offset = constants_bytes
         constants_bytes = _aligned(constants_bytes + tensor.nbytes)
-    return {"inputs": inputs, "outputs": outputs, "constants": constants, "tensors": tensors, "calls": calls, "functions": functions, "workspace_bytes": workspace_bytes, "constants_bytes": constants_bytes}
+    return {"inputs": inputs, "outputs": outputs, "constants": constants, "tensors": tensors, "views": views, "calls": calls, "functions": functions, "workspace_bytes": workspace_bytes, "constants_bytes": constants_bytes}
 
 
 def _memory_preflight(plan, memory_limit_bytes):
@@ -256,7 +285,7 @@ def _memory_preflight(plan, memory_limit_bytes):
             "live_workspace_aligned_bytes": sum(_aligned(t.nbytes) for t in workspace) + _aligned(private),
             "operator_workspace_bytes": private,
         })
-    completion = list(dict.fromkeys(plan["outputs"]))
+    completion = list(dict.fromkeys(t.storage for t in plan["outputs"]))
     return {
         "scope": "explicit tensor storage only; excludes ELF sections, operator stack, startup and platform reservations",
         "memory_limit_bytes": memory_limit_bytes,
@@ -264,10 +293,11 @@ def _memory_preflight(plan, memory_limit_bytes):
         "per_call": per_call,
         "completion": {"live_tensors": [t.name for t in completion], "live_tensor_bytes": sum(t.nbytes for t in completion)},
         "peak_live_tensor_bytes": max([entry["live_tensor_bytes"] for entry in per_call] + [sum(t.nbytes for t in completion)]),
-        "peak_live_workspace_bytes": max(entry["live_workspace_bytes"] for entry in per_call),
-        "peak_live_workspace_aligned_bytes": max(entry["live_workspace_aligned_bytes"] for entry in per_call),
+        "peak_live_workspace_bytes": max((entry["live_workspace_bytes"] for entry in per_call), default=0),
+        "peak_live_workspace_aligned_bytes": max((entry["live_workspace_aligned_bytes"] for entry in per_call), default=0),
         "largest_intermediates": [t.metadata() for t in sorted((t for t in plan["tensors"] if t.origin == "workspace"), key=lambda t: (-t.nbytes, t.name))[:10]],
-        "output_bindings": [{"index": index, "tensor": t.name, "storage": t.origin,
+        "output_bindings": [{"index": index, "tensor": t.name, "storage": t.storage.origin,
+                             "backing_tensor": t.storage.name,
                              "copy_required": t.origin != "output" or t.offset != index}
                             for index, t in enumerate(plan["outputs"])],
     }
@@ -373,6 +403,7 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         _write_constants(plan["constants"], plan["constants_bytes"], constant_path)
 
     def address(tensor):
+        tensor = tensor.storage
         if tensor.origin == "input":
             return f"inputs[{plan['inputs'].index(tensor)}]"
         if tensor.origin == "output":
@@ -399,7 +430,7 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         "static int model_overlap(const void *a, uint64_t an, const void *b, uint64_t bn) { return an && bn && (uintptr_t)a < (uintptr_t)b + bn && (uintptr_t)b < (uintptr_t)a + an; }",
         f"int32_t {prefix}model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes) {{",
         "  model_last_error = 0;",
-        "  if (!inputs || !outputs) return -1;",
+        "  if (!outputs" + (" || !inputs" if plan["inputs"] else "") + ") return -1;",
         f"  if (workspace_bytes < UINT64_C({plan['workspace_bytes']})) return -1;",
     ])
     if plan["workspace_bytes"]:
@@ -426,7 +457,16 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
     lines.extend(["  return 0;", "}"])
     (output_dir / "model.c").write_text("\n".join(lines) + "\n")
     primitive_mod = tvm.IRModule(plan["functions"]).with_attr("executor", tvm.relay.backend.Executor("aot", {"unpacked-api": True, "interface-api": "c"}))
-    module = tvm.build(primitive_mod, target=target)
+    if plan["functions"]:
+        module = tvm.build(primitive_mod, target=target)
+    else:
+        # The ordinary build driver rejects an empty IRModule. There are no
+        # operators to lower in a constant/view-only graph; ask the standard
+        # LLVM target codegen for its empty object container instead.
+        selected = tvm.target.Target(target)
+        if selected.kind.name != "llvm":
+            raise ValueError("Static export requires an LLVM target")
+        module = tvm.get_global_func("target.build.llvm")(primitive_mod, selected)
     llvm_ir = module.get_source("ll")
     (output_dir / "operators.ll").write_text(llvm_ir)
     # The pinned LLVM backend may emit null callback globals instead of ordinary
@@ -448,6 +488,7 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         "operator_workspace_offset": plan.get("operator_workspace_offset", 0),
         "inputs": [tensor.metadata() for tensor in plan["inputs"]], "outputs": [tensor.metadata() for tensor in plan["outputs"]],
         "constants": [tensor.metadata() for tensor in plan["constants"]], "intermediates": [tensor.metadata() for tensor in plan["tensors"]],
+        "views": [tensor.metadata() for tensor in plan["views"]],
         "calls": [{"symbol": name, "inputs": [t.name for t in args], "outputs": [t.name for t in results]} for name, args, results in plan["calls"]],
         "constants_sha256": _file_sha256(constant_path), "full_model_qualified": False, "timing_qualified": False,
     }

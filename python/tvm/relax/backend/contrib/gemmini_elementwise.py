@@ -106,9 +106,10 @@ def _copy_pair(
     output_scope,
     symbol,
     source_scalar=False,
+    source_rank=None,
 ):
     shape = (cols,) if rank == 1 else (rows, cols)
-    source_shape = () if source_scalar else shape
+    source_shape = () if source_scalar else shape[-source_rank:] if source_rank else shape
     factor = cols if rank == 1 else 1
     alignment = (
         {"buffer_dim_align": [[0, rank - 2, 16, 0]]}
@@ -158,7 +159,9 @@ def _copy_pair(
                 for i, j in T.grid(rows, cols):
                     with T.block("copy"):
                         vi, vj = T.axis.remap("SS", [i, j])
-                        B[vi, vj] = T.Cast(output_dtype, _read(A, (vi, vj)))
+                        B[vi, vj] = T.Cast(
+                            output_dtype, _read(A, (vj,) if source_rank == 1 else (vi, vj))
+                        )
 
     @T.prim_func
     def impl(a: T.handle, b: T.handle):
@@ -185,7 +188,7 @@ def _copy_pair(
                     B.access_ptr("w"),
                     T.uint32(rows),
                     T.uint32(cols),
-                    _dma_stride(A, factor),
+                    T.int64(0) if source_rank == 1 and rank == 2 else _dma_stride(A, factor),
                     _dma_stride(B, factor),
                 )
             )
@@ -193,9 +196,13 @@ def _copy_pair(
     return desc, impl
 
 
-@lru_cache(None)
-def register_elementwise_intrinsics(kind, rows, cols, rank=2):
+def register_elementwise_intrinsics(kind, rows, cols, rank=2, source_rank=None):
     """Describe primitive rectangles independently of graph/operator names."""
+    return _register_elementwise_intrinsics(kind, rows, cols, rank, source_rank)
+
+
+@lru_cache(None)
+def _register_elementwise_intrinsics(kind, rows, cols, rank, source_rank):
     if kind not in (
         "copy_i8",
         "copy_i32",
@@ -217,6 +224,12 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
         rank == 1 and rows != 1
     ):
         raise ValueError("Invalid Gemmini DMA rectangle")
+    if source_rank is not None and (
+        source_rank != 1
+        or rank != 2
+        or kind not in ("copy_i8", "copy_i32", "copy_f32", "widen_i8_i32")
+    ):
+        raise ValueError("Rank-changing DMA supports a vector source and matrix tile")
     scalar_a, scalar_b = kind.endswith("_scalar_a"), kind.endswith("_scalar_b")
     fill = kind.startswith("fill_")
     if (fill or scalar_a or scalar_b) and cols != 1:
@@ -337,6 +350,7 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
             scope,
             source_symbol,
             source_scalar=fill,
+            source_rank=source_rank,
         )
     store = _copy_pair(
         rows,
@@ -351,6 +365,8 @@ def register_elementwise_intrinsics(kind, rows, cols, rank=2):
     result = {"scope": scope}
     for name, (desc, impl) in (("op", op), ("store", store)):
         key = f"gemmini.tir.{kind}.{rank}d.{rows}x{cols}.{name}"
+        if source_rank is not None:
+            key += f".source{source_rank}d"
         tir.TensorIntrin.register(key, _canonical_description(desc), impl)
         result[name] = key
     return result
@@ -738,8 +754,19 @@ def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensori
         bits = struct.pack("!d" if literal.dtype == "float32" else "!q", literal.value)
         intrinsics["op"] = register_literal_intrinsic(rows, cols, rank, literal.dtype, bits)
     else:
+        source = node.body.value.value if kind == "widen_i8_i32" else node.body.value
+        source_rank = (
+            1
+            if kind in ("copy_i8", "copy_i32", "copy_f32", "widen_i8_i32")
+            and isinstance(source, tir.BufferLoad)
+            and len(source.buffer.shape) == 1
+            and rank == 2
+            else None
+        )
         intrinsics = (
-            None if kind == "relu_i8" else register_elementwise_intrinsics(kind, rows, cols, rank)
+            None
+            if kind == "relu_i8"
+            else register_elementwise_intrinsics(kind, rows, cols, rank, source_rank)
         )
     block = block_rv(sch, node)
     # TOPI can conservatively infer an entire input region for a single indexed

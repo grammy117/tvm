@@ -754,6 +754,8 @@ def prepare_gemmini_tensorir_graph(
                 relax.transform.CanonicalizeBindings(),
                 relax.transform.FuseOps(),
                 relax.transform.FuseTIR(),
+                relax.transform.RewriteDataflowReshape(),
+                relax.transform.DeadCodeElimination(),
             ]
         )
     mod = tvm.transform.Sequential(passes)(mod)
