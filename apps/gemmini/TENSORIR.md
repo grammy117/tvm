@@ -65,19 +65,94 @@ numeric constraints; it does not discover a device or make every op native.
 The custom rule chooses legal framework transformations. TVM does not infer
 Gemmini scheduling from a target name alone.
 
-| Decision | TVM mechanisms now used | Fixed policy or remaining exploration |
-| --- | --- | --- |
-| Graph simplification and fusion | LegalizeOps, FoldConstant, FuseOps/FuseTIR, reshape analysis and DCE | Source numerical policy is preserved; no implicit quantization |
-| Tiling, traversal, cache reuse and layout | Actual Schedule instructions and complete replayable traces | Target rules expose legal candidates; the default is untuned |
-| CPU epilogue placement | compute_inline/reverse_compute_at and ordinary buffer planning | Independent producers may inline; non-inlineable CPU reductions stay outside the tile |
-| Accelerator selection | Structural TIR matching and type/range/resource proofs | Unsupported work retains CPU lowering with a reason |
-| Primitive semantics and SRAM mapping | TensorIntrin plus target memory lowering | ISA, exact rounding, alignment, capacity, ownership and completion are correctness constraints |
-| Design-space exploration | Standard MetaSchedule space, postprocessors and target/profile-checked database replay | No qualified timing runner or measured tuning campaign; FireSim/device measurements are future work |
-| DMA/compute overlap | Explicit legal transfers and required completion | Software pipelining/double buffering are not implemented |
+## Scheduler and design-space exploration status
 
-The source dtype and output recipe remain mathematical constraints. A full-width
-integer result cannot be replaced with a saturating INT8 readout merely to fuse
-an epilogue. Functional RTL wall times are not performance labels.
+`prepare_gemmini_graph(..., optimize=True)` already runs ordinary legalization,
+constant folding, binding canonicalization, FuseOps/FuseTIR, eligible reshape
+elimination and dead-code elimination before target scheduling. There is no
+later switch that makes TVM independently invent the Gemmini implementation.
+Target rules provide legal transformations and intrinsic substitutions.
+
+| Component / decision | Current status | Who chooses; remaining limit |
+| --- | --- | --- |
+| Mathematical graph simplification and fusion | Active in the normal preparation pipeline | Standard Relax passes; numerical policy stays explicit |
+| Tiling, loop traversal, reindex/layout, cache placement and producer/epilogue placement | Actual TVM Schedule operations, with replayable traces | Target rule chooses legal patterns; not every TVM transformation is exposed to search |
+| Target registration and matching | LLVM/RV64 Gemmini key/profile, independent TensorIntrin families, structural TIR matching | Explicit selected hardware profile; not device discovery or complete modeling of every RTL feature |
+| CPU-versus-Gemmini placement | Legality-driven offload, with CPU fallback on refusal | No measured profitability comparison or ordinary CPU candidate in the successful native rule's candidate set; a tiny legal DMA/add can still be slower |
+| Contraction candidates | Up to 72 parameter combinations | 2 traversals × 2 A/B load orders × 2 K chunks × 3 row groups × 3 column groups; legality can reduce or collapse the space |
+| Movement/reduction candidates | Rectangular/divisor versus scalar strategies | Narrower space; multiple copy regions currently share one strategy choice |
+| MetaSchedule integration | PyScheduleRule + PostOrderApply + RewriteTensorize + SRAM legality postprocessor | Standard candidate generation/postprocessing works; traces and feature extraction are checked |
+| Timing builder/runner and tuning driver | Not integrated for this TensorIR target | Must lower target SRAM/addressing, link the correct ABI and measure on a qualified target; stock local x86 execution cannot measure RV64/RoCC code |
+| Cost model | No trained Gemmini TensorIR performance model | PerStoreFeature extraction works; diagnostic/synthetic labels prove APIs only. Exhaustive evaluation of a small space is also valid and does not require a learned model |
+| Production schedule selection | Matching database record, otherwise deterministic untuned default | Compilation itself does not call tune_tir/tune_tasks or iterate over all candidates |
+| Database identity and replay | Workload plus target/profile checks | Existing mismatched profile records are refused; any changed numerical graph/schedule space needs appropriately new records |
+| Search mutations | No target mutators registered (`mutator_probs={}`) | The initial space is bounded by our rule; no claim of a broad evolutionary exploration |
+| SRAM allocation | Standard allocation placement/compaction, then checked target row mapping | Current row allocator is conservative and does not reuse different region buffers by disjoint lifetimes |
+| Bias and output fusion | Proved INT32 bias normalization; ordinary CPU epilogue placement | Bias normalization is fixed policy, not a measured profitability choice. General requantized readout fusion is absent |
+| Cross-operation SRAM residency | Cache reuse within a scheduled PrimFunc | No general SRAM handoff between separate call_tir functions; host writeback and subsequent reload remain |
+| Primitive command implementation | Small C ABI wrappers issue the ISA commands | TVM cannot optimize inside those wrappers. Configuration elision/coalescing and primitive-call inlining are not searched |
+| DMA/compute overlap | Correct dependency waits/completion | Software pipelining, double buffering and asynchronous overlap search are not implemented |
+| CPU fallback optimization | Standard TVM/LLVM lowering and legal producer inlining | No Gemmini-specific CPU tuning campaign; CPU gathers, division, casts and quantization remain part of end-to-end cost |
+
+The contraction knobs are host traversal `ij/ji`, A-before-B versus B-before-A
+issue order, PE-safe K chunks 8/16, and row/column cache groups 1/2/4.
+The 16x16 physical array, exact arithmetic, SRAM bounds and completion rules are
+constraints, not adjustable performance knobs. Within a chosen legal parameter
+set, TVM carries out the transformations and records them; the current rule does
+not search arbitrary layouts, fusion boundaries, loop interchange permutations,
+DMA channel assignments, tail algorithms or software pipelines.
+
+The missing optimization loop is:
+
+```mermaid
+flowchart LR
+  W[Untiled workload and fixed numeric contract] --> S[Gemmini rules generate legal TVM schedules]
+  S --> L[Tensorize and lower SRAM; reject illegal candidates]
+  L --> B[Target tuning builder: missing]
+  B --> R[Qualified timing runner: missing]
+  R --> M[Measured search loop: missing; learned model optional]
+  M --> S
+  M --> D[Database API ready; measured records absent]
+  D --> C[Replay winning trace during compilation]
+```
+
+The schedule/rule/postprocessing and database-replay portions work. The
+qualified target builder/runner, real timing labels, production search driver
+and measured winner are not completed. The old `gemmini_tuning.py` XGBoost/search
+code belongs to the retained template route; its existence is not evidence that
+the TensorIR route has been performance tuned. Stock MetaSchedule's
+`tir_integration.tune_tir`/`tune.tune_tasks` provide the framework to connect these
+pieces; a learned cost model predicts good candidates rather than proving
+correctness or replacing measurements.
+
+Generic PerStoreFeature extraction also does not itself model Gemmini command,
+configuration, DMA, fence or bank costs. Those costs need measurements and may
+benefit from additional target features or a calibrated analytic model.
+
+### Remaining work before optimization campaigns and a deployment compiler
+
+| Priority / purpose | Concrete remaining work | Why it matters |
+| --- | --- | --- |
+| Required before claiming model support | Run representative complete imported graphs with their actual dtypes, quantization, scales, layouts and shapes; report native arithmetic/DMA/CPU separately | The 51-op campaign is small-contract functional evidence, not full-model or universal dtype support |
+| Required before collecting optimization labels | Keep the existing hardware/profile and primitive/no-FSM policy pinned; choose and qualify the timing substrate and exact model recipes | Changing these changes the legal compiler and invalidates performance comparisons |
+| Required for measured DSE | Implement the MetaSchedule target builder/runner and search driver; select objective and repeatability protocol | No current measured costs, target winner or usable end-to-end tuning loop exists |
+| Required for useful end-to-end decisions | Include CPU staging, casts, dequantization, launch/configuration/fence costs, transfers and peak workspace in reports; compare the untuned route and preserved baseline | Fast array arithmetic alone may not improve whole-program execution |
+| Required before cost-based device placement claims | Measure compatible CPU alternatives and make placement/fusion profitability an explicit choice | Current native admission is a semantic/resource decision, not a speed comparison |
+| Required when adding/reordering optimization passes | Keep semantic/fusion passes before target scheduling; inspect fallback reports and retune changed workloads; rerun correctness/resource checks for the resulting compiled artifacts | More fusion or a rewritten access map can change target admission and measured behavior |
+| Required before final deployment claims | Qualify complete graph memory/ABI lifetimes, realistic sizes and numerical edge cases on the selected deployment substrate | Current static positive-span ABI, hidden-alias refusals and small simulator tests do not establish production deployment |
+| Optional performance expansion after a measured baseline | Lifetime-aware SRAM reuse, less CPU gathering/reindexing, fewer scalar DMAs, cost-based fusion, better tails, overlap/double buffering, and larger search spaces | These are implementation/performance gaps; adding a cost model alone cannot create them |
+| Separate hardware-feature expansion | Primitive WS scheduling, max-pool readout, proved scaled/requantized readout, or a separately allowed/labeled hardware-loop library arm | Supported RTL features are not automatically registered compiler capabilities; each needs semantics, intrinsics, schedules and target checks |
+
+Dynamic shapes/hidden storage aliases, unsupported payload types, exact FP16
+rounding refusals and source-CPU gaps remain explicit coverage limits. The fork
+also retains custom static packaging, a scalar-offset compatibility bridge and
+the generic correctness patches described below. No new core optimization pass
+or numeric recipe should be treated as performance validated merely because the
+existing functional inventory is green.
+
+Fair comparisons also need the same input quantization, rounding, layouts and
+ISA policy. A hardware-loop/library arm would be a separately labeled change
+of implementation policy; raw FP32 DMA must not count as native FP32 arithmetic.
 
 ## Implemented architecture
 
@@ -242,6 +317,29 @@ Facts were inspected in the selected local Chipyard/Gemmini source and matching
 generated parameter header. `GemminiCapabilities` binds the target model to its
 profile digest; it is an explicit compiler profile, not hardware discovery.
 
+The hardware profile is not a complete RTL performance model. The following
+distinction matters when deciding which optimizations are still missing.
+
+| Selected RTL capability | What this backend exposes today | Missing or fixed policy |
+| --- | --- | --- |
+| Signed INT8 inputs/weights, 20-bit PE output, INT32 accumulator; 16x16 array | Exact bounded integer contraction/sum TensorIntrins | No native floating or wider-input arithmetic; CPU quantize/dequantize remains explicit |
+| 256-KiB scratchpad, 64-KiB accumulator; 4 SPAD banks / 2 accumulator banks | Scoped caches, layout/alignment, capacity checks and physical row mapping | No bank-aware cost model or lifetime reuse of separate region SRAM buffers |
+| Both output-stationary and weight-stationary dataflows | Primitive OS only | WS primitives are a backend gap; WS is not inherently equivalent to using a hardware-loop command |
+| INT8 mvin floating scale with round-near-even and INT8 saturation | Identity scaling and exact signed widening in admitted paths | General scaled-load semantics/intrinsics are not exposed |
+| No INT32 accumulator-load scaler (`mvin_scale_acc_args=None`) | Unscaled overwrite/add | Cannot assume native full-width alpha/-1 scaling |
+| Full-width accumulator readout | INT32 values and raw FP32 bits | Full-width path bypasses activation/scaling; it is not FP32 arithmetic |
+| Narrow scaled/activated INT8 readout | Exact identity-scale INT8 ReLU only | General requantization, clipping/rounding equivalence and profitable fusion are not implemented |
+| Max-pool store path enabled | Not registered by this backend | A potential native max-pool feature; does not implement average pooling |
+| Integer training-convolution and loop-convolution features enabled | Mathematical CPU gradients or admitted integer contractions | These are integer-array features, not a floating training unit. No direct use here; LOOP_WS/LOOP_CONV remains forbidden by policy |
+| Optional normalization hardware | `has_normalizations=false` in the selected default configuration | Do not infer native layernorm/softmax/GELU from other Gemmini configurations |
+| DMA queues/bandwidth and three mvin channels | Explicit A/B/accumulator command streams and correct waits | Queue-depth/bandwidth facts are not used by a measured cost model; overlap/channel assignment are not searched |
+
+These facts were read from the selected `Configs.scala`, `GemminiConfigs.scala`,
+`AccumulatorScale.scala` and `StoreController.scala`, not inferred from the
+Gemmini project name. Scale is configured per command stream and can be changed
+between transfers; the missing current vector-scale/FP32-result lowering should
+not be described as a universal tensor-wide silicon restriction.
+
 | Source | SHA256 | Relevant facts |
 | --- | --- | --- |
 | `gemmini/Configs.scala` | `178c21ac741c89c08158efa71fb34da35d27b75bd50bde5116a5e19178f8391b` | INT8 inputs, INT32 accumulator, 20-bit PE output, 16x16 array, both dataflows, 256-KiB scratchpad, 64-KiB accumulator; no accumulator-load scaler |
@@ -281,87 +379,213 @@ copy rules. This adds data movement, not floating accelerator arithmetic.
 
 ## Full requested operator inventory
 
-The following 51 operator spellings retain the user's full requested scope.
-Every spelling has bounded target evidence at its documented contract. The
-family table describes admission; the per-op final-contract table below records
-what actually executed. Broader restrictions remain separate from op coverage.
+**Where execution happened:** the same RV64 Rocket program ran inside Spike and
+inside the pinned GemminiRocketConfig Verilator testbench. Rocket executes every
+CPU fallback, stages data, issues accelerator commands and waits for completion.
+The Gemmini columns below identify the tensor arithmetic or data movement
+performed by the accelerator. Host command issue is common to every native path.
+No physical FPGA/board or FireSim run is claimed.
 
-| Family | Requested operations | Current migration state |
-| --- | --- | --- |
-| Matrix | `mm`, `bmm` | Direct ATen import preserves the captured dtype. INT8 products use a proven wider sum and explicit output conversion, with native array scheduling where legal. INT32/INT64 input arithmetic retains exact modular CPU reductions. Integer reduction extents require static admission; general floating matmul remains CPU work |
-| Biased matrix | `addmm` | Eligible mathematical INT8-to-INT32 products with INT32 tensor bias use native accumulator preload. Direct ATen addmm preserves its dtype, alpha/beta, broadcasting and wrapping; INT8 results can use an array contraction followed by CPU casts/bias. Direct ATen INT8 bias is not thereby claimed to be preloaded |
-| Convolution | `convolution`, `convolution_backward` | Direct and named forward one/two/three-dimensional imports preserve admitted dtype, groups, strides, dilation, transpose and output padding. Bounded INT8 products use native array contractions with explicit output conversion. Full-width INT32/INT64 modulo math remains CPU work. FP32/FP64 gradients compose the stock Relax 2D adjoint where available and ordinary TE contractions otherwise; their floating arithmetic remains CPU work. Static shape, tensor-return and source dtype restrictions are detailed below |
-| Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | Direct arithmetic import preserves scalar promotion, alpha and explicit wrapping. INT32 tensor/scalar addition and known integer scalar subtraction use native accumulator loads/readout. The latter folds a negated constant in the source modulo ring, independently of target selection. General runtime scaling/tensor subtraction/negation and wider arithmetic stay on CPU. INT8 ReLU is native. Exact FP16 add/sub alpha outside +/-1 remains explicitly unqualified |
-| Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; broader unproved bounds/types remain explicit admission limits |
-| Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Admitted batched/unbatched frontend forms preserve padding, ceil-window, divisor and dtype contracts. Ordinary floating averaging remains CPU arithmetic; legal FP32 padding copies may use DMA. INT64 regular pooling uses modulo-sum/truncating-division mathematics on CPU. Final Spike/RTL fixtures exercise all six requested spellings, including underscore aliases |
-| Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Admitted static batched/unbatched contracts now import to stock Relax gradients or unscheduled mathematical TE gathers/reductions. Tested FP16/FP32/FP64 gradients and overlap sums stay on CPU. Regular INT64 pool gradients preserve exact modulo accumulation and truncating division; Boolean col2im uses logical overlap. Bounded target fixtures require zero accelerator commands for their arithmetic |
-| Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Static scatter/concat regions use standard scheduling. Creation preserves dtype and may fold away; unfolded literal and runtime fills are independently qualified. Other dtype/alias/dynamic contracts have explicit limits |
-| Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Admitted static frontend forms execute as standard metadata or INT8/INT32/FP32 mathematical copies. Internal reshapes can disappear; indexed or boundary materializations use DMA when Tensorize proves the access map. Constants and nonunit squeeze can require no device calls. Hidden storage aliases, dynamic contracts and zero-extent static-export buffers remain explicit limitations |
+**What PASS means:** all 51 requested spellings execute correctly at the listed
+small, static contracts. It does not mean 51 native arithmetic implementations.
+There are nine requested contracts with Gemmini arithmetic, 21 with Gemmini
+movement, four with Gemmini movement beside CPU arithmetic, twelve with CPU
+arithmetic, and five folded/elided or copied by the static return ABI.
+The final guest checks distinguish array compute, DMA-only work and CPU work.
+No quantization is inserted automatically to improve these counts.
+The report fields `placement="gemmini"` and `native_functions` count functions
+containing selected accelerator regions. Such a function can also contain CPU
+reduction blocks: FP32 average pooling and convolution backward are examples.
+They must not be interpreted as counts of fully native arithmetic operators.
 
 ### Qualified contracts for all 51 spellings
 
-Each row has actual ATen-source capture, mathematical lowering, static export,
-queued-DMA host execution, and positive Spike/Verilator execution. The dtype
-column describes the final target fixture; it is not a universal dtype claim.
-Exact input/output shapes, source overloads, schedule metadata, artifact hashes
-and the four execution receipts for each row are recorded in
-[`operator-support-inventory-v1.json`](../../../tensorir-dev/operator-support-inventory-v1.json).
-The reproducible fixtures live in [`operator_contracts.py`](operator_contracts.py).
-Multiple input/output entries can include ABI fixture arguments or tuple returns.
+The dtype column is the final campaign's actual fixture dtype, not every
+supported source overload. C1-C6 below describe the implemented native contract
+or why CPU work remains. Exact shapes, source overloads and receipts are in
+[`operator-support-inventory-v1.json`](../../../tensorir-dev/operator-support-inventory-v1.json);
+[`operator_contracts.py`](operator_contracts.py) reproduces the captures.
 
-| Requested spelling | Fixture input → output dtype | Execution | Reason or boundary |
-| --- | --- | --- | --- |
-| `mm` | int8 → int8 | Array arithmetic + CPU conversion/epilogue as needed | Signed INT8 products use INT32 array accumulation, followed by the captured INT8 output conversion on CPU. Floating/wide-input matmul is not silently quantized. |
-| `bmm` | int8 → int8 | Array arithmetic + CPU conversion/epilogue as needed | The array contraction is repeated per batch; the captured INT8 result is restored on CPU. |
-| `addmm` | int8 → int8 | Array arithmetic + CPU conversion/epilogue as needed | This ATen INT8-bias contract uses a native product plus exact CPU conversion/bias. Separate mathematical INT32-bias preload is qualified by the bias_prefix fixture. |
-| `convolution` | int8 → int8 | Array arithmetic + CPU conversion/epilogue as needed | A bounded signed INT8 forward contraction is scheduled natively with explicit output conversion and bias semantics. Other admitted dtypes retain CPU arithmetic. |
-| `add.Tensor` | int32 → int32 | INT32 accumulator arithmetic | Full-width INT32 accumulator overwrite/add/readout preserves the explicitly wrapping contract without a load scaler. |
-| `add.Scalar` | int32 → int32 | INT32 accumulator arithmetic | A known INT32 scalar is broadcast and added through accumulator DMA; wrapping is explicit. |
-| `sub.Scalar` | int32 → int32 | INT32 accumulator arithmetic | A known integer offset is folded into its negated constant modulo the result dtype. The ordinary addition rule then uses accumulator DMA; no runtime negative scaler is assumed. |
-| `sub.Tensor` | int32 → int32 | CPU arithmetic | The full-width accumulator load scaler is absent. General runtime negation/subtraction cannot be replaced by saturating INT8 scaling. |
-| `mul.Scalar` | int32 → int32 | CPU arithmetic | General full-width wrapping multiplication is CPU work. Scaled small readout narrows/saturates to INT8 and does not implement this INT32 contract. |
-| `div.Scalar` | int32 → float32 | CPU arithmetic | This source contract returns FP32 division. Narrow scaled readout does not produce an arbitrary floating result. |
-| `neg` | int32 → int32 | CPU arithmetic | Full-width runtime negation is CPU work. Saturating INT8 scale -1 differs at -128 and no INT32 load scaler is configured. |
-| `mean.dim` | float32 → float32 | CPU arithmetic | The admitted source input is FP32. The integer array has no floating reduction/output unit. An explicit integer sum followed by CPU conversion/division is separately supported; no automatic floating exactness proof or quantization is assumed. |
-| `mean.default` | float32 → float32 | CPU arithmetic | The admitted global mean is FP32 and stays CPU work; a narrowing per-tensor readout scale is not an arbitrary floating mean. |
-| `avg_pool1d` | float32 → float32 | Native movement + CPU arithmetic | The FP32 window reduction/division stays CPU work. Legal padding copies use raw DMA; max-pool readout does not implement average pooling. |
-| `avg_pool2d` | float32 → float32 | Native movement + CPU arithmetic | The FP32 window reduction/division stays CPU work with correct padding/divisor/ceil semantics. Native movement does not label the arithmetic as native. |
-| `avg_pool3d` | float32 → float32 | Native movement + CPU arithmetic | The FP32 window reduction/division stays CPU work. Only legal bit-preserving padding movement tensorizes. |
-| `adaptive_avg_pool1d` | float32 → float32 | CPU arithmetic | FP32 variable-window sums and division are CPU work; the integer array cannot consume arbitrary FP32 values. |
-| `_adaptive_avg_pool2d` | float32 → float32 | CPU arithmetic | FP32 adaptive averaging is CPU work with actual window boundaries, not hardware max-pooling or saturating readout. |
-| `_adaptive_avg_pool3d` | float32 → float32 | CPU arithmetic | FP32 adaptive averaging is CPU work with actual variable windows and dtype preservation. |
-| `convolution_backward` | float32 → float32, float32, float32 | Native movement + CPU arithmetic | The source gradients are FP32. Their arithmetic stays CPU work; only independent raw FP32 movement tensorizes. The integer array cannot implement unquantized floating gradients. |
-| `avg_pool2d_backward` | float32 → float32 | CPU arithmetic | FP32 window deltas and overlap sums remain CPU arithmetic. Accumulate-on-load updates local INT32 rows, not arbitrary host FP32 scatter-add destinations. |
-| `_adaptive_avg_pool2d_backward` | float32 → float32 | CPU arithmetic | The FP32 gradient contract requires variable-window division and overlap sums. Its mathematical gather/reduction stays CPU work. |
-| `col2im` | float32 → float32 | CPU arithmetic | The FP32 overlap sum remains CPU arithmetic. Rectangular DMA and local accumulator addition do not provide general host floating scatter-add. |
-| `clone` | int8 → int8 | Elided constant/metadata or return-slot copy | The pure functional clone is elided in Relax; the compact static ABI copies an input-backed result into the caller-owned return slot. Native bit-copy capability is separately present. |
-| `fill.Scalar` | int32 → int32 | Elided constant/metadata or return-slot copy | The known scalar fill folds to constant data. Runtime tensor-scalar and unfolded literal fills are separately qualified through DMA. |
-| `full` | int32 → int32 | Elided constant/metadata or return-slot copy | The constant creation folds under ordinary TVM optimization. The unfolded literal DMA path is independently qualified. |
-| `full_like` | int32 → int32 | Elided constant/metadata or return-slot copy | Captured shape/dtype creation folds to constant data; this does not conceal an opaque creation kernel. |
-| `scalar_tensor` | float32 → float32 | Elided constant/metadata or return-slot copy | The admitted constant scalar is metadata/constant data with no device operator. Runtime scalar construction remains outside this importer contract. |
-| `repeat` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `cat` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `slice_scatter` | int32 → int32 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `select_scatter` | float32 → float32 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `constant_pad_nd` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `_to_copy` | int8 → int32 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `reflection_pad1d` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `reflection_pad2d` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `replication_pad2d` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `reflection_pad3d` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `replication_pad3d` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `as_strided` | int32 → int32 | Native movement; index/staging work may remain | Admitted bounded reads from contiguous logical input storage materialize through DMA. Hidden storage reads, noncontiguous sources and dynamic offsets remain explicit limits. |
-| `diagonal` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `permute` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `select.int` | float32 → float32 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `slice.Tensor` | int8 → int8 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `split_with_sizes` | int32 → int32, int32 | Native movement; index/staging work may remain | Bit-preserving movement is scheduled through rectangular or scalar DMA where the access map is proved. CPU staging/index work is retained when required; no floating arithmetic is inferred. |
-| `squeeze.dim` | int32 → int32 | Native movement; index/staging work may remain | A boundary materialization uses DMA under the compact ABI; eligible internal reshape-like values can instead become metadata. |
-| `squeeze.dims` | float32 → float32 | Native movement; index/staging work may remain | Admitted axes preserve values/dtype and materialize through raw FP32 DMA at this boundary. Internal metadata elimination remains available. |
-| `unsqueeze` | int8 → int8 | Native movement; index/staging work may remain | This boundary copy uses DMA; ordinary internal shape-only aliases can disappear. |
-| `view` | int8 → int8 | Native movement; index/staging work may remain | The compact boundary result materializes through DMA; internal same-byte-extent reshapes can be metadata with backing-allocation liveness preserved. |
-| `relu` | int8 → int8 | INT8 readout ReLU | INT8 values widen exactly into an owned accumulator tile and use identity-scale narrow ReLU readout. Full-width INT32/FP ReLU remains CPU work. |
-| `sum.dim_IntList` | int8 → int64 | Array arithmetic + CPU conversion/epilogue as needed | A prefix-bounded signed INT8 sum uses a ones-vector array contraction, then restores the default INT64 output with a CPU cast. General floating/wider-input sums retain CPU work. |
+#### Arithmetic and linear maps (25)
+
+| Requested spelling | Actual fixture dtype | Work on Gemmini | Remaining Rocket CPU / compiler work | Native contract or CPU reason |
+| --- | --- | --- | --- | --- |
+| `mm` | int8 → int8 | Array: INT8 products, INT32 accumulation | Restore source INT8 result with a wrapping cast; staging where needed | C1: INT8 operands only; no implicit floating quantization |
+| `bmm` | int8 → int8 | Array contraction per batch | Batch/command loops; source INT8 output cast and necessary staging | C1: same integer contract for each admitted batch |
+| `addmm` | int8 → int8 | Array product; no bias preload in this ATen INT8 fixture | Exact INT8 output/bias semantics | C1: separate INT32-bias preload is implemented and tested by bias_prefix; this INT8 bias is not preloaded |
+| `convolution` | int8 → int8 | Array products for an INT8 forward contraction | Window/layout staging, bias and source INT8 output conversion | C1: signed INT8 contraction; no LOOP_CONV; other admitted dtypes keep CPU arithmetic |
+| `convolution_backward` | float32 → float32, float32, float32 | DMA copies/zero regions only; no array arithmetic | All FP32 gradient products, reductions and bias gradient | C6: unquantized FP32 gradients cannot use this integer array; two selected functions contain movement, not native gradient arithmetic |
+| `add.Tensor` | int32 → int32 | Accumulator overwrite/add/full-width readout | Address/control work; no CPU output-tensor add | C2: INT32 unscaled addition; explicit modular reference where wrapping is required |
+| `sub.Tensor` | int32 → int32 | None | INT32 tensor subtraction | C2: no full-width negative load scaler or registered general subtraction lowering; this is not a claim that every emulation is impossible |
+| `add.Scalar` | int32 → int32 | Accumulator add of a broadcast INT32 constant | Materialize the scalar; address/control work | C2: known scalar folds to the source INT32 modulo contract; runtime scalar tensors also have a separately tested path |
+| `sub.Scalar` | int32 → int32 | Accumulator add of the negated constant | Fold the known offset modulo INT32; materialize scalar | C2: constant subtraction is supported; arbitrary runtime tensor subtraction is not inferred from this |
+| `mul.Scalar` | int32 → int32 | None | Full-width INT32 multiplication | C2/C6: scaled narrow readout saturates to INT8 and is not this wrapping INT32 operation |
+| `div.Scalar` | int32 → float32 | None | INT32-to-FP32 conversion and FP32 division | C6: hardware scaled readout does not return arbitrary FP32 values |
+| `neg` | int32 → int32 | None | Full-width INT32 negation | C2/C6: no INT32 load scaler; INT8 saturating -1 scale also disagrees with wrapping negation at -128 |
+| `relu` | int8 → int8 | DMA signed widening, then identity-scale narrow ReLU readout | Address/control work; no CPU output-tensor ReLU | C3: exact INT8-to-INT8 ReLU; INT32/FP ReLU is not provided by full-width readout |
+| `mean.dim` | float32 → float32 | None | All FP32 reduction and division | C4/C6: FP32 input; explicit integer sum plus CPU divide is a different admitted graph, not an automatic conversion of this mean |
+| `avg_pool1d` | float32 → float32 | Raw FP32 padding fill/copy DMA only | All window sums and division | C6: max-pool hardware is not average pooling; numerical padding/divisor rules remain CPU |
+| `avg_pool2d` | float32 → float32 | Raw FP32 padding fill/copy DMA only | All window sums and division | C6: no native FP32 average arithmetic; preserve ceil/padding/divisor semantics |
+| `avg_pool3d` | float32 → float32 | Raw FP32 padding fill/copy DMA only | All window sums and division | C6: movement tensorization does not make the reduction native |
+| `adaptive_avg_pool1d` | float32 → float32 | None | FP32 variable-window sums and division | C6: integer array cannot consume arbitrary FP32 values |
+| `_adaptive_avg_pool2d` | float32 → float32 | None | FP32 variable-window sums and division | C6: variable windows and FP32 result are not implemented by narrow scaled readout |
+| `_adaptive_avg_pool3d` | float32 → float32 | None | FP32 variable-window sums and division | C6: floating averaging stays CPU; the exact underscore overload is tested |
+| `avg_pool2d_backward` | float32 → float32 | None | FP32 division and overlap accumulation | C6: local INT32 accumulate-on-load is not host FP32 scatter-add |
+| `_adaptive_avg_pool2d_backward` | float32 → float32 | None | FP32 variable-window division and overlap accumulation | C6: same dtype/scatter boundary; no native gradient claim |
+| `col2im` | float32 → float32 | None | FP32 overlap gather/reduction | C6: rectangular DMA has no general host floating scatter-add; other admitted CPU contracts are described below |
+| `mean.default` | float32 → float32 | None | All FP32 global reduction and division | C4/C6: floating mean is not a narrowing readout scale |
+| `sum.dim_IntList` | int8 → int64 | Array sum using an INT8 ones vector and INT32 accumulator | Input reindex staging; restore requested INT64 output/layout | C4: signed INT8 values, K <= 2^24; floating/wider-input sums stay CPU |
+
+#### Data movement and creation (15)
+
+| Requested spelling | Actual fixture dtype | Work on Gemmini | Remaining Rocket CPU / compiler work | Native contract or CPU reason |
+| --- | --- | --- | --- | --- |
+| `clone` | int8 → int8 | None in this fixture | Compiler elides functional clone; CPU ABI copy returns an input-backed result | C5: a real materialized INT8/INT32/FP32 copy has a native DMA path; clone itself is not counted as an accelerator call here |
+| `repeat` | int8 → int8 | DMA copies of the selected source elements | Index/control and any required staging | C5: registered INT8/INT32/FP32 payload types; rectangular or scalar DMA |
+| `cat` | int8 → int8 | DMA copies of proved source regions | Region bounds/index/control work | C5: static region partition; runtime predicates or excessive/unproved regions keep CPU math |
+| `slice_scatter` | int32 → int32 | DMA copies for base and updated regions | Static slice/index/control work | C5: functional new output, static bounds, positive steps; no in-place/hidden-alias guarantee |
+| `select_scatter` | float32 → float32 | Raw FP32 DMA for selected regions | Index/control and any required staging | C5: bit transport only; no floating addition or scatter-add |
+| `fill.Scalar` | int32 → int32 | None in this constant fixture | Compile-time constant plus ABI return copy | C5: runtime scalar-buffer and unfolded literal DMA fills are separately tested |
+| `full` | int32 → int32 | None in this constant fixture | Compile-time constant plus ABI return copy | C5: separate unfolded INT32 and FP32 creation fixtures require actual DMA |
+| `full_like` | int32 → int32 | None in this constant fixture | Captured shape/dtype creation folds; ABI return copy | C5: folding is compiler work, not native fill execution; primitive fill support exists independently |
+| `constant_pad_nd` | int8 → int8 | DMA broadcast fill plus interior copy | Boundary/cropping calculation and command control | C5: admitted INT8/INT32/FP32 literals; preserve exact floating bits |
+| `reflection_pad1d` | int8 → int8 | DMA remapping of reflected elements | Index/control work | C5: positive static extents and reflection widths below the input extent; scalar DMA may be used |
+| `reflection_pad2d` | int8 → int8 | DMA remapping of reflected elements | Index/control work | C5: same reflection bounds on each admitted axis |
+| `reflection_pad3d` | int8 → int8 | DMA remapping of reflected elements | Index/control work | C5: same static reflection contract; no performance claim for scalar DMA |
+| `replication_pad2d` | int8 → int8 | DMA remapping of edge elements | Clamped index/control work | C5: admitted static edge padding; payload types follow the copy intrinsics |
+| `replication_pad3d` | int8 → int8 | DMA remapping of edge elements | Clamped index/control work | C5: same admitted static edge-padding contract |
+| `_to_copy` | int8 → int32 | DMA signed INT8-to-INT32 widening and full-width store | Address/control work | C5: exact signed extension, not generic conversion or floating dequantization |
+
+#### Views and metadata (11)
+
+| Requested spelling | Actual fixture dtype | Work on Gemmini | Remaining Rocket CPU / compiler work | Native contract or CPU reason |
+| --- | --- | --- | --- | --- |
+| `as_strided` | int32 → int32 | DMA materialization of bounded selected elements | Index/control work | C5: contiguous logical input, in-bounds reads and admitted static offset; hidden backing storage is refused |
+| `diagonal` | int8 → int8 | DMA materialization of diagonal elements | Index/control work | C5: proved static access map; scalar DMA may be required |
+| `permute` | int8 → int8 | DMA materialization of permuted elements | Index/control and any required staging | C5: compact external buffers require a materialized output; not necessarily a free view |
+| `scalar_tensor` | float32 → float32 | None | Compile-time constant scalar; ABI return copy | C5: constant scalar only in this importer; runtime scalar construction is unqualified |
+| `select.int` | float32 → float32 | Raw FP32 DMA materialization | Normalized select index and control work | C5: negative indices are checked/normalized; raw FP32 transport has no floating arithmetic |
+| `slice.Tensor` | int8 → int8 | DMA materialization of selected elements | Slice/index/control work | C5: admitted static access map; arbitrary dynamic/alias contracts are not implied |
+| `split_with_sizes` | int32 → int32, int32 | DMA into two compact output buffers | Split bounds/index/control work | C5: actual requested split cuts; other admitted internal views can avoid copying |
+| `squeeze.dim` | int32 → int32 | DMA return-boundary materialization | Shape/control work | C5: eligible internal reshape becomes metadata; this external compact return is copied |
+| `squeeze.dims` | float32 → float32 | Raw FP32 DMA return-boundary materialization | Shape/control work | C5: internal metadata elimination remains available; no FP32 arithmetic |
+| `unsqueeze` | int8 → int8 | DMA return-boundary materialization | Shape/control work | C5: internal same-byte-extent aliases can disappear |
+| `view` | int8 → int8 | DMA return-boundary materialization | Shape/control work | C5: internal compact aliases can become metadata with backing-buffer liveness preserved |
+
+### Native contracts and quantization
+
+**C1 — Integer contraction (`mm`, `bmm`, admitted forward convolution).**
+The native reference is `sum(int32(a_i8) * int32(b_i8))`, with INT32 output
+inside the accelerator schedule. Both operands must be signed INT8 values in
+the actual mathematical IR. Matmul/normalized-convolution matching currently
+requires a positive static reduction extent `K <= 131071`; this conservative
+bound protects INT32 prefixes for arbitrary signed bytes. Each PE reduction
+chunk is at most 16 products, protecting the 20-bit PE result, and the INT32
+accumulator combines chunks. These are numeric admission rules, not tuning knobs
+that a cost model may violate. Layout, alias and SRAM resource proofs also apply.
+
+The final direct ATen fixtures return INT8. Their output cast/bias semantics run
+on the CPU because wrapping source conversion is not saturating hardware
+readout. Ordinary INT8-to-INT32 mathematical products can use full-width DMA
+writeback directly. The separate INT32-bias preload path requires a private,
+unshared product and a proved broadcast/bijective INT32 bias addition; its
+normalization makes necessary modulo-32 semantics explicit. An INT8 bias in an
+ATen INT8-output addmm/conv fixture is not silently relabeled as that preload.
+
+FP16/BF16/FP32/FP64, UINT8 and INT32/INT64 operands do not become INT8 inputs
+through target selection. Wider admitted integer source contracts retain their
+exact CPU mathematics. To accelerate an originally floating model, the input
+graph must already express an explicitly accepted quantization recipe. The
+backend does not choose scales, zero points, calibration, acceptable error or
+reassociate floating operations to manufacture a native match. The hardware
+computes products of raw signed bytes; affine zero-point corrections, if the
+recipe needs them, must remain explicit and semantically correct.
+
+Quantize/dequantize and epilogues are separate work. Full-width INT32 readout
+does not perform scale, activation or FP32 dequantization. Narrow readout uses
+floating scaling/rounding and INT8 saturation; it is not general INT32 arithmetic,
+FP32 output, or an automatically equivalent integer-shift requantizer. General
+scaled-readout intrinsics and rounding-equivalence proofs are not implemented.
+The scale is configured for a store stream, not supplied as an independent
+scale vector for each lane. It can in principle be reconfigured between stores;
+that does not make current per-token/per-channel FP32 dequantization native.
+
+**C2 — INT32 accumulator addition.**
+Native overwrite/add/full-width-readout supports coefficient-one INT32 tensor
+addition and admitted scalar-tensor broadcast. Explicit widen/add/narrow
+references preserve modular source results; plain TVM addition retains its
+defined no-overflow contract. Known scalar subtraction can fold to addition of
+a negated constant in the source modulo ring. The source fixture uses constant
+17; INT8/INT32/INT64 boundary constants are separately checked on the host.
+Runtime scalar tensors have a separate native INT32 add path; non-buffer
+primitive scalar ABIs are not admitted by that intrinsic.
+
+There is no INT32 accumulator-load scaler in this hardware configuration.
+General `alpha` multiplication, runtime tensor subtraction, full-width negation
+or multiplication needs separate CPU math or an additional lowering algorithm.
+The INT8 load scaler rounds and saturates back to INT8; for example `-(-128)`
+cannot implement wrapping INT8 negation. These facts reject the originally
+proposed direct scaling mappings, not every possible multi-instruction emulation.
+
+**C3 — Exact INT8 ReLU.**
+The implementation widens signed INT8 exactly into a private INT32 accumulator
+tile and uses ReLU plus identity-scale narrow readout. Results lie in `[0,127]`,
+so the hardware narrowing preserves the specified result. All 256 input values
+are checked. The descriptor implements INT8-to-INT8 ReLU, not general INT32 or
+floating ReLU, and not a generic fused requantization epilogue.
+
+**C4 — INT8 sum, with an explicit CPU result conversion.**
+Native sum uses an INT8 ones-vector contraction. Its prefixes are bounded by
+`[-128*K,127*K]`, permitting exact INT32 accumulation for `K <= 2^24`.
+Default ATen integer sum returns INT64, restored by a CPU cast after writeback.
+Scalar/multiple-axis/keepdim output forms can also require CPU layout copies.
+Current scheduling stages reindexed input tiles on the CPU, even for some
+contiguous inputs, and broadcasts a CPU-created scalar one for the intrinsic.
+General floating or wider-input sums stay CPU. Explicit integer sum followed
+by floating conversion/division is possible; automatically replacing FP32 mean
+with that different mathematical recipe is not implemented or assumed exact.
+
+**C5 — Copy, fill, widening, region remapping and views.**
+Registered payloads are INT8, INT32 and raw FP32. FP32 DMA preserves payload
+bits (including NaNs and signed zero) without FP arithmetic. Signed INT8-to-INT32
+widening is a distinct supported conversion. Runtime scalar-buffer fills and
+unfolded literals use broadcast DMA; constant creation may instead disappear
+through FoldConstant. A known scalar may be materialized on the CPU without
+the CPU filling the output tensor. Other conversions are not implied.
+
+The current intrinsics expose rectangles of up to 16 rows/columns, contiguous
+columns and an admitted row stride. Indexed layouts can degrade to one-element
+DMA; correctness does not establish profitability. Concatenation/scatter needs
+proved static source regions; in-place copies, hidden aliases and runtime data
+predicates are not covered by those region schedules. Region analysis has
+compiler budgets of 128 regions and 65,536 positions for a nonlinear one-axis
+predicate. Reflection bounds, positive extents and static access proofs apply.
+Unsupported INT16/FP16/BF16/INT64 copy intrinsics are a backend coverage gap,
+not proof that the hardware could never transport their bytes.
+
+Internal compact reshape-like aliases can become metadata with no copy.
+Indexed layouts or caller-owned compact return slots can require materialization;
+the chart reports what happened at those boundaries. `as_strided` needs a
+contiguous logical source and all reads within that input, without hidden
+backing-storage access. Static export requires positive buffer spans; its
+current contracts do not cover arbitrary dynamic shapes/offsets or aliases.
+
+**C6 — Floating reductions, pooling, overlap and gradients.**
+The tested FP32 convolution gradients, means, pooling and overlap sums execute
+their arithmetic on Rocket. Some independent FP32 padding/initialization/copy
+regions use DMA, which is reported separately. Max-pool readout does not compute
+average pooling. Local INT32 accumulator addition is not arbitrary host FP32
+scatter-add. Window bounds, ceil mode, divisors, floating rounding and source
+dtype remain part of the CPU mathematical definition.
+
+Additional host contracts cover FP16/FP64 and, where the source operator admits
+them, INT64 modular pooling and Boolean overlap. This is not complete dtype
+coverage on the target. FP16 convolution backward is unqualified because the
+pinned source CPU lacks that implementation; BF16/complex convolution, arbitrary
+dynamic adjoints and None-valued static-export returns are outside the tested
+contracts. Exact FP16 add/sub with alpha outside +/-1 is explicitly refused
+where source CPU vector/tail rounding differs. These are separate source or
+compiler qualification limits, not missing floating Gemmini instructions.
 
 ### Corrections to the proposed native-unit mappings
 
@@ -596,6 +820,66 @@ all actual reads must stay within that input. Hidden storage access and dynamic
 shape/offset contracts are refused explicitly. Zero-extent tensors can execute
 in ordinary VM tests but remain outside the static exporter's positive-size ABI.
 The scalar_tensor importer currently admits constant scalars only.
+
+## Spike and Verilator results
+
+Source freeze: `19b96df8cc366481220a8d618397b204fb5f61bd`; no executable source
+changed for this documentation clarification. Twelve bundles contain 59 unique
+fixtures: all 51 requested spellings plus eight primitive/numeric regressions.
+Every fixture executes in a positive run on both simulators. Each bundle also
+has one deliberately wrong-oracle run per simulator, for 24 positive and 24
+negative-control invocations. A negative control exits at the first incorrect
+comparison; it is not 59 independent per-op negative executions.
+
+The guest checks exact output words at these chosen contracts, unchanged inputs,
+buffer guards and required/forbidden primitive categories. FP host regressions
+elsewhere use documented tolerances. Final ELF scans reject hardware loops.
+Each run has a 60-second wall deadline; RTL additionally has a 300,000-cycle
+**limit**, which is not a measured cycle count. The selected Verilator setup
+uses a functional magic-memory testbench; neither physical-board execution nor
+FireSim nor realistic-memory performance is claimed.
+
+The numbers below are **host wall seconds per whole simulator invocation**,
+including guest startup and exit. They are investigation/test costs, not Gemmini
+latency labels. A CPU-only bundle still passes Verilator by executing on Rocket.
+"rejected" means the wrong expected output was detected as intended, not that
+the operator failed its positive test. Click a bundle for exact case names,
+compilation commands, scheduling reports and artifact bindings; its directory
+also contains all four result receipts and logs.
+
+| Bundle | Fixtures | What executed | Spike correct / host wall | Verilator correct / host wall | Spike wrong oracle | Verilator wrong oracle |
+| --- | --- | --- | --- | --- | --- | --- |
+| [01: matrix](../../../tensorir-dev/device-inventory-01-v1/bundle.json) | 7 | 4 INT8 array contractions + 3 INT32 accumulator adds | PASS / 0.035 s | PASS / 35.61 s | rejected / 0.011 s | rejected / 14.36 s |
+| [02: cpu-arithmetic](../../../tensorir-dev/device-inventory-02-v1/bundle.json) | 6 | 6 CPU-only arithmetic/reduction contracts; zero Gemmini compute | PASS / 0.011 s | PASS / 36.68 s | rejected / 0.011 s | rejected / 12.74 s |
+| [03: pooling](../../../tensorir-dev/device-inventory-03-v1/bundle.json) | 6 | 6 averages; CPU math, with padding DMA in regular pools | PASS / 0.011 s | PASS / 41.58 s | rejected / 0.011 s | rejected / 13.75 s |
+| [04: gradients](../../../tensorir-dev/device-inventory-04-v1/bundle.json) | 4 | 4 gradient/overlap ops; CPU math, with DMA in conv backward | PASS / 0.011 s | PASS / 36.95 s | rejected / 0.011 s | rejected / 21.12 s |
+| [05: folded](../../../tensorir-dev/device-inventory-05-v1/bundle.json) | 5 | 5 folded/elided creation/clone/scalar results; ABI copies | PASS / 0.010 s | PASS / 30.03 s | rejected / 0.011 s | rejected / 13.19 s |
+| [06: movement](../../../tensorir-dev/device-inventory-06-v1/bundle.json) | 6 | 6 native movement/signed-widening ops | PASS / 0.010 s | PASS / 35.82 s | rejected / 0.011 s | rejected / 12.16 s |
+| [07: padding-small](../../../tensorir-dev/device-inventory-07-v1/bundle.json) | 3 | 3 reflection/edge padding DMA ops | PASS / 0.011 s | PASS / 23.32 s | rejected / 0.011 s | rejected / 13.82 s |
+| [08: padding-3d](../../../tensorir-dev/device-inventory-08-v1/bundle.json) | 2 | 2 three-dimensional padding DMA ops | PASS / 0.012 s | PASS / 24.78 s | rejected / 0.013 s | rejected / 14.81 s |
+| [09: views-indexed](../../../tensorir-dev/device-inventory-09-v1/bundle.json) | 6 | 6 indexed-view materializations via DMA | PASS / 0.011 s | PASS / 36.39 s | rejected / 0.011 s | rejected / 12.56 s |
+| [10: views-shapes](../../../tensorir-dev/device-inventory-10-v1/bundle.json) | 4 | 4 shape-view return materializations via DMA | PASS / 0.011 s | PASS / 24.49 s | rejected / 0.011 s | rejected / 13.59 s |
+| [11: native-numerics](../../../tensorir-dev/device-inventory-11-v1/bundle.json) | 5 | ReLU + sum requests; exhaustive ReLU, raw FP32 bits, INT32-bias preload extras | PASS / 0.011 s | PASS / 34.28 s | rejected / 0.011 s | rejected / 15.30 s |
+| [12: transport-regressions](../../../tensorir-dev/device-inventory-12-v1/bundle.json) | 5 | 5 extras: unfolded/runtime fills, NaN transport and INT64-result array sum | PASS / 0.011 s | PASS / 42.02 s | rejected / 0.011 s | rejected / 13.88 s |
+
+Preparation of the twelve bundles took 304.40 host seconds in
+the recorded prepare process. Positive simulator runs totaled
+0.156 s on Spike and 401.96 s on Verilator;
+negative controls totaled 0.133 s and 171.28 s,
+respectively. All 48 simulator invocations together took
+573.53 host seconds, excluding preparation and host regressions.
+The focused host suite separately recorded 908 passes in 600.20 seconds.
+
+Per-op target cycles, DMA byte counts, command counts, array utilization and
+end-to-end model latency were not recorded in this campaign. There are no
+energy or monetary cost measurements. Guest primitive counters enforce
+execution categories but are not exported as performance profiles. Synthetic
+costs used in database/API tests are not measurements. None of the table's wall
+times should feed the tuning cost model.
+
+The factual tables and underlying receipt hashes are retained in
+[`operator-execution-review-v2.json`](../../../tensorir-dev/operator-execution-review-v2.json).
+Original qualification and simulator receipts are preserved unchanged.
 
 ## Verification tools
 
