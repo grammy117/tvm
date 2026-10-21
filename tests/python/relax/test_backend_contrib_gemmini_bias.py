@@ -118,6 +118,28 @@ class GemminiBiasTests(unittest.TestCase):
         self.assertFalse(proof["applied"])
         self.assertIn("shared", proof["reason"])
 
+    def test_small_bias_broadcast_cpu_alternative_exports_without_runtime_allocator(self):
+        import sys
+        sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
+        from baremetal import export_graph
+
+        normalized, proof = fold_bias(biased_workload(4, 4, 8, (4,)))
+        self.assertTrue(proof["applied"])
+        buffers = [normalized.buffer_map[param] for param in normalized.params]
+        builder = relax.BlockBuilder()
+        gv = builder.add_func(normalized.with_attr("global_symbol", "product"), "product")
+        inputs = [relax.Var(f"input_{i}", relax.TensorStructInfo(buf.shape, buf.dtype))
+                  for i, buf in enumerate(buffers[:-1])]
+        with builder.function("main", inputs):
+            with builder.dataflow():
+                result = builder.emit_output(relax.call_tir(gv, inputs,
+                    out_sinfo=relax.TensorStructInfo(buffers[-1].shape, "int32")))
+            builder.emit_func_output(result)
+        folder = self.root / "cpu-static"
+        report = export_graph(builder.get(), folder, target="llvm")
+        self.assertFalse(report["runtime_workspace_allocator_required"])
+        self.assertNotIn("TVMBackendAllocWorkspace", (folder / "operators.ll").read_text())
+
     def test_bias_schedules_replay_and_execute_with_delayed_dma(self):
         for m, n, k, bias_shape, batches in (
             (3, 4, 5, (4,), None),
@@ -250,10 +272,10 @@ class GemminiBiasTests(unittest.TestCase):
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 72)
+        self.assertEqual(len(designs), 3)  # One output tile: groups/order do not add reuse.
         # Check both traversal orders and the largest A/B reuse groups through
         # the normal tensorization and memory legality postprocessors.
-        for design in (designs[0], designs[8], designs[35], designs[-1]):
+        for design in designs:
             design.enter_postproc()
             self.assertTrue(
                 all(postproc.apply(design) for postproc in context.space_generator.postprocs)

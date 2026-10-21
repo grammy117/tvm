@@ -39,6 +39,7 @@ EMULATOR = r"""
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <math.h>
 static int8_t sp[16384][16];
 static int32_t acc[1024][16];
 static unsigned char loaded[16384][16], initialized[1024][16];
@@ -109,6 +110,17 @@ static void flush(void) {
         check(initialized[x.c+i][j] && v>=-128 && v<=127);
         int8_t value=wrong?v:(v<0?0:v);store(&p[i*x.stride+j],&value,1);
       }
+    } else if(x.op==9) {
+      check(x.c+x.m<=1024 && x.stride>=x.n);
+      union {uint32_t bits;float value;} scale={.bits=x.a};
+      int8_t* p=x.dst;
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
+        check(initialized[x.c+i][j]);
+        float rounded=nearbyintf((float)acc[x.c+i][j]*scale.value);
+        int32_t value=rounded>127?127:rounded < -128?-128:(int32_t)rounded;
+        if(x.b && value<0)value=0;
+        int8_t output=value;store(&p[i*x.stride+j],&output,1);
+      }
     }
   }
   for(unsigned i=store_count;i>0;--i) {
@@ -146,6 +158,9 @@ void tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,
 }
 void tvm_gemmini_dma_out(int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
   push((struct command){.op=3,.dst=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
+}
+void tvm_gemmini_dma_scaled_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,uint32_t scale,int32_t relu,int32_t wait) {
+  push((struct command){.op=9,.dst=p,.c=c,.m=m,.n=n,.stride=stride,.a=scale,.b=relu});if(wait)flush();
 }
 void tvm_gemmini_dma_acc_write(const int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
   push((struct command){.op=4,.src=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
@@ -498,11 +513,11 @@ class GemminiTensorIRTests(unittest.TestCase):
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 72)
-        self.assertEqual(len({str(design.trace) for design in designs}), 72)
+        self.assertEqual(len(designs), 15)  # No over-padding groups or duplicate unit-axis order.
+        self.assertEqual(len({str(design.trace) for design in designs}), len(designs))
         candidates = [ms.search_strategy.MeasureCandidate(design, []) for design in designs]
         features = ms.feature_extractor.PerStoreFeature().extract_from(context, candidates)
-        self.assertEqual(len(features), 72)
+        self.assertEqual(len(features), len(designs))
         self.assertTrue(
             all(np.isfinite(feature.numpy()).all() and feature.numpy().size for feature in features)
         )
@@ -538,9 +553,12 @@ class GemminiTensorIRTests(unittest.TestCase):
 
         bad = func.with_body(tir.stmt_functor.ir_transform(func.body, None, remove_wait))
         runtime, _ = self.build(tvm.IRModule({"main": bad}))
-        a = ((np.arange(17 * 33).reshape(17, 33) * 13) % 256 - 128).astype("int8")
-        b = ((np.arange(33 * 19).reshape(33, 19) * 7) % 256 - 128).astype("int8")
-        output = tvm.nd.empty((17, 19), "int32")
+        # Distinct inputs prevent an uninitialized staging read from matching
+        # a preceding positive test's recycled allocation by accident.
+        rng = np.random.default_rng(6379)
+        a = rng.integers(-128, 128, (17, 33), dtype="int8")
+        b = rng.integers(-128, 128, (33, 19), dtype="int8")
+        output = tvm.nd.array(np.full((17, 19), 0x6D6D6D6D, "int32"))
         runtime(tvm.nd.array(a), tvm.nd.array(b), output)
         with self.assertRaises(AssertionError):
             np.testing.assert_array_equal(output.numpy(), a.astype("int64") @ b.astype("int64"))

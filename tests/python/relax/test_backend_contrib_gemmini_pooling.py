@@ -83,7 +83,7 @@ class GemminiPoolingTests(unittest.TestCase):
                 )
                 report = []
                 prepared = prepare_gemmini_graph(graph, report=report)
-                native = kind in ("regular", "crop")
+                native = False  # Automatic payload-copy offload is disabled.
                 self.assertEqual(
                     sum(r["placement"] == "gemmini" for r in report), int(native), report
                 )

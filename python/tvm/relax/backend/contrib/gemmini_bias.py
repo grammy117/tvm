@@ -213,7 +213,10 @@ def fold_bias(func):
     name = "gemmini_bias_broadcast"
     while name in names:
         name += "_"
-    broadcast = tir.decl_buffer(product.body.buffer.shape, "int32", name=name)
+    # CPU alternatives use the same mathematical function. Empty scope is not
+    # the CPU global/stack allocation contract in LowerTVMBuiltin and can cause
+    # even a tiny temporary to request TVM's runtime workspace allocator.
+    broadcast = tir.decl_buffer(product.body.buffer.shape, "int32", name=name, scope="global")
     try:
         definition = _broadcast_statement(
             statements[consumers[0]], epilogue, bias, value, broadcast
@@ -286,13 +289,70 @@ class CanonicalizeGemminiBias:
         for gv, func in list(mod.functions_items()):
             if not isinstance(func, tir.PrimFunc):
                 continue
-            normalized, note = fold_bias(func)
+            aligned = _align_bias_layout(func)
+            normalized, note = fold_bias(aligned)
+            if note is None or not note.get("applied"):
+                normalized = func
+            elif not aligned.same_as(func):
+                note["before_ir"] = tvm.ir.save_json(tvm.IRModule({"main": func}))
+                note["layout_normalized"] = True
             if note is not None:
                 self.report[gv.name_hint] = note
             if not normalized.same_as(func):
                 self.references[gv.name_hint] = func
                 mod.update_func(gv, normalized)
         return mod
+
+
+def _align_bias_layout(func):
+    """Use scheduling APIs to match bias addition after a bijective output view."""
+    from .gemmini_tensorir import contraction_block
+
+    matches = contraction_block(func)
+    if len(matches) != 1:
+        return func
+    sch = tir.Schedule(func, debug_mask="all")
+    product = sch.get_block(matches[0][0].name_hint)
+    parameters = {buffer.data for buffer in func.buffer_map.values()}
+    try:
+        while True:
+            consumers = sch.get_consumers(product)
+            if len(consumers) != 1:
+                return func
+            consumer = consumers[0]
+            node = sch.get(consumer)
+            if (
+                isinstance(node.body, tir.BufferStore)
+                and isinstance(node.body.value, tir.BufferLoad)
+                and node.body.buffer.data not in parameters
+            ):
+                sch.compute_inline(consumer)
+                continue
+            break
+        addition = _addition(node.body.value) if isinstance(node.body, tir.BufferStore) else None
+        if addition is None:
+            return func
+        output = sch.get(product).body.buffer
+        load = next(
+            (
+                value
+                for value in addition[:2]
+                if isinstance(value, tir.BufferLoad) and value.buffer.same_as(output)
+            ),
+            None,
+        )
+        if load is None:
+            return func
+        if tvm.ir.structural_equal(
+            node.body.buffer.shape, output.shape
+        ) and tvm.ir.structural_equal(node.body.indices, load.indices):
+            return sch.mod["main"]
+        index_map = tir.IndexMap([axis.var for axis in node.iter_vars], load.indices, None)
+        sch.transform_block_layout(consumer, index_map)
+        sch.reindex(consumer, ("write", 0))
+        return sch.mod["main"]
+    except (ValueError, tir.schedule.ScheduleError):
+        return func
 
 
 def _bias_kind(node, cols):
@@ -323,14 +383,25 @@ def _bias_kind(node, cols):
         return "matrix"
     if cols == 1 and not depends(value.indices):
         return "scalar"
+    for axis, index in enumerate(value.indices):
+        if (
+            tvm.ir.structural_equal(index, j)
+            and not depends(value.indices[:axis] + value.indices[axis + 1 :])
+            and all(
+                isinstance(size, tir.IntImm) and int(size) == 1
+                for size in value.buffer.shape[axis + 1 :]
+            )
+        ):
+            return ("channel_vector", len(value.indices), axis)
     return None
 
 
 @lru_cache(None)
 def register_bias_intrinsic(rows, cols, kind):
+    channel = isinstance(kind, tuple) and len(kind) == 3 and kind[0] == "channel_vector"
     if (
         any(type(value) is not int or not 1 <= value <= 16 for value in (rows, cols))
-        or kind not in ("matrix", "vector", "scalar")
+        or (not channel and kind not in ("matrix", "vector", "scalar"))
         or (kind == "scalar" and cols != 1)
     ):
         raise ValueError("Invalid Gemmini bias DMA rectangle")
@@ -339,7 +410,24 @@ def register_bias_intrinsic(rows, cols, kind):
             rows, cols, 2, "int32", "int32", "global", ACC, "tvm_gemmini_dma_acc_write"
         )
     else:
-        shape = (cols,) if kind == "vector" else ()
+        if channel:
+            _, rank, axis = kind
+            shape = tuple(cols if index == axis else 1 for index in range(rank))
+            dstrides = [
+                tir.Var(f"stride_{index}", "int64") if index < axis else tir.IntImm("int64", 1)
+                for index in range(rank)
+            ]
+
+            def indices(column):
+                return tuple(
+                    column if index == axis else tir.const(0, column.dtype) for index in range(rank)
+                )
+        else:
+            shape = (cols,) if kind == "vector" else ()
+            dstrides = _strides(len(shape))
+
+            def indices(column):
+                return (column,) if shape else ()
 
         @T.prim_func
         def desc(d: T.handle, c: T.handle):
@@ -347,7 +435,7 @@ def register_bias_intrinsic(rows, cols, kind):
                 d,
                 shape,
                 "int32",
-                strides=_strides(len(shape)),
+                strides=dstrides,
                 offset_factor=1,
             )
             C = T.match_buffer(
@@ -364,7 +452,7 @@ def register_bias_intrinsic(rows, cols, kind):
                 for i, j in T.grid(rows, cols):
                     with T.block("bias"):
                         vi, vj = T.axis.remap("SS", [i, j])
-                        C[vi, vj] = _read(D, (vj,))
+                        C[vi, vj] = _read(D, indices(vj))
 
         @T.prim_func
         def impl(d: T.handle, c: T.handle):
@@ -372,7 +460,7 @@ def register_bias_intrinsic(rows, cols, kind):
                 d,
                 shape,
                 "int32",
-                strides=_strides(len(shape)),
+                strides=dstrides,
                 offset_factor=1,
             )
             C = T.match_buffer(
@@ -399,7 +487,8 @@ def register_bias_intrinsic(rows, cols, kind):
                     )
                 )
 
-    name = f"gemmini.bias.{kind}.{rows}x{cols}"
+    suffix = f"channel_r{kind[1]}_a{kind[2]}" if channel else kind
+    name = f"gemmini.bias.{suffix}.{rows}x{cols}"
     tir.TensorIntrin.register(name, _canonical_description(desc), impl)
     return name
 

@@ -249,6 +249,19 @@ void tvm_gemmini_dma_relu_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t
   if (wait) tvm_gemmini_end();
 }
 
+void tvm_gemmini_dma_scaled_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols,
+                               int64_t stride, uint32_t scale_bits, int32_t relu, int32_t wait) {
+  /* Compiler admission proves the source RNE/saturation expression for every
+   * INT32 input and supplies a positive finite tensor-wide FP32 scale. */
+  union { uint32_t bits; float value; } scale = {.bits = scale_bits};
+  uint32_t address = accumulator_address(row, 0) & ~(1U << (ADDR_LEN - 3));
+  gemmini_extended_config_st((uint64_t)stride, relu ? RELU : NO_ACTIVATION, scale.value);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvout(dst, address, cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
 int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, int64_t m, int64_t n, int64_t k,
                                 int64_t a_stride, int64_t b_stride, int64_t c_stride) {
   int32_t admission = tvm_gemmini_validate_matmul_i8_i32(a, b, c, m, n, k, a_stride, b_stride, c_stride);

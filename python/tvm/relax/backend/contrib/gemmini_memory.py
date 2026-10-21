@@ -166,6 +166,7 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
             "tvm_gemmini_dma_out",
             "tvm_gemmini_dma_spad_out",
             "tvm_gemmini_dma_relu_out",
+            "tvm_gemmini_dma_scaled_out",
         )
         if not output and symbol not in (
             "tvm_gemmini_dma_a",
@@ -233,6 +234,10 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
                     stride,
                     tir.IntImm("int32", int(host_wait(src))),
                 )
+            if symbol == "tvm_gemmini_dma_scaled_out":
+                row, dst, height, width, _, stride, scale, relu = args
+                return tir.call_extern("void", symbol, dst, row, height, width, stride, scale, relu,
+                                       tir.IntImm("int32", int(host_wait(dst, output=True))))
             if symbol in (
                 "tvm_gemmini_dma_out",
                 "tvm_gemmini_dma_spad_out",

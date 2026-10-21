@@ -98,7 +98,7 @@ def generate_candidates(func, *, capabilities=None, rule_options=None):
     capabilities = capabilities or GemminiCapabilities()
     options = dict(rule_options or {})
     options.setdefault("include_cpu", True)
-    options.setdefault("chunks", (4, 8, 16))
+    options.setdefault("chunks", (16, 8, 4))
     context = ms.TuneContext(
         mod=func,
         target=capabilities.target(),
@@ -184,6 +184,7 @@ class CycleRanker:
                 "seed": self.seed,
                 "nthread": 1,
                 "tree_method": "hist",
+                "min_child_weight": 0,
             },
             xgb.DMatrix(features, label=labels),
             num_boost_round=32,
@@ -195,6 +196,44 @@ class CycleRanker:
         if self.model is None:
             raise ValueError("The cycle ranker has no measured training data")
         return self.model.predict(xgb.DMatrix(np.stack([x.features for x in candidates])))
+
+
+class TrialFailure(RuntimeError):
+    """An isolated build/run failure; completed trials remain usable."""
+
+    def __init__(self, message, *, evidence=None):
+        super().__init__(message)
+        self.evidence = evidence
+
+
+def _is_default(candidate):
+    p = candidate.parameters
+    return candidate.placement == "gemmini" and all(
+        p.get(key) == value
+        for key, value in (
+            ("order", "ij"),
+            ("load_order", "ab"),
+            ("row_tiles", 1),
+            ("col_tiles", 1),
+        )
+    )
+
+
+def with_required_baselines(rule_options):
+    """Keep the real untuned default even when a caller restricts its grid."""
+    options = dict(rule_options or {})
+    defaults = {
+        "orders": ("ij", "ji"),
+        "load_orders": ("ab",),
+        "chunks": (16, 8, 4),
+        "row_tiles": (1, 2, 4),
+        "col_tiles": (1, 2, 4),
+    }
+    for key, values in defaults.items():
+        requested = tuple(options.get(key, values))
+        options[key] = tuple(dict.fromkeys((values[0], *requested)))
+    options["include_cpu"] = True
+    return options
 
 
 def search(
@@ -209,6 +248,8 @@ def search(
     capabilities=None,
     rule_options=None,
     diagnostic=False,
+    on_record=None,
+    resume_records=(),
 ):
     """Measure legal candidates; select only a numerically checked observation.
 
@@ -226,30 +267,85 @@ def search(
         raise ValueError("Time budget must be finite and positive")
     capabilities = capabilities or GemminiCapabilities()
     start = time.monotonic()
+    rule_options = with_required_baselines(rule_options)
     candidates = generate_candidates(func, capabilities=capabilities, rule_options=rule_options)
     rng = np.random.default_rng(seed)
     order = list(map(int, rng.permutation(len(candidates))))
     cpu = [i for i, candidate in enumerate(candidates) if candidate.placement == "cpu"]
-    order = cpu + [i for i in order if i not in cpu]
+    defaults = [i for i, candidate in enumerate(candidates) if _is_default(candidate)]
+    default = (
+        max(defaults, key=lambda i: candidates[i].parameters.get("reduction_chunk", 0))
+        if defaults
+        else None
+    )
+    baselines = cpu + ([default] if default is not None else [])
+    order = baselines + [i for i in order if i not in baselines]
     observations, records = {}, []
+    attempted = set()
     measurement_profile = None
     ranker = CycleRanker(seed)
+    by_id = {candidate.id: i for i, candidate in enumerate(candidates)}
+    for row in resume_records:
+        if row["candidate_id"] not in by_id:
+            raise ValueError("Resumed trial is absent from the current legal space")
+        index = by_id[row["candidate_id"]]
+        if index in attempted:
+            raise ValueError("Duplicate resumed candidate")
+        attempted.add(index)
+        if row.get("status") != "failed":
+            cost = _validate_measurement(
+                row["measurement"], profile=capabilities.fingerprint, diagnostic=diagnostic
+            )
+            profile = row["measurement"]["measurement_profile"]
+            if measurement_profile is not None and profile != measurement_profile:
+                raise ValueError("Cannot resume different measurement profiles")
+            measurement_profile = profile
+            observations[index] = cost
+        records.append(row)
     while len(records) < min(max_trials, len(candidates)):
         if time_budget_seconds is not None and time.monotonic() - start >= time_budget_seconds:
             if not records:
                 raise TimeoutError("Time budget exhausted before the first measurement")
             break
-        remaining = [index for index in order if index not in observations]
+        remaining = [index for index in order if index not in attempted]
         predicted = None
-        if strategy == "ml" and len(observations) >= warmup:
+        ranking = None
+        if remaining[0] in baselines:
+            index, selection = remaining[0], "required_baseline"
+        elif strategy == "ml" and len(observations) >= warmup:
             ranker.fit(candidates, observations)
             estimates = ranker.predict([candidates[index] for index in remaining])
+            if not np.isfinite(estimates).all():
+                raise ValueError("Nonfinite cost model predictions")
             offset = int(np.argmin(estimates))
             index, predicted = remaining[offset], float(estimates[offset])
+            ties = int(np.isclose(estimates, estimates[offset], rtol=0, atol=1e-6).sum())
+            ranking = {
+                "distinct_predictions": len(np.unique(estimates)),
+                "best_tie_count": ties,
+                "prediction_span": float(np.ptp(estimates)),
+            }
+            selection = "ml_ranked" if ties == 1 else "ml_tie_exploration"
         else:
-            index = remaining[0]
+            index, selection = remaining[0], "seeded_exploration" if strategy == "ml" else "sweep"
         candidate = candidates[index]
-        record = measure(candidate)
+        attempted.add(index)
+        try:
+            record = measure(candidate)
+        except TrialFailure as error:
+            row = {
+                "candidate_id": candidate.id,
+                "placement": candidate.placement,
+                "parameters": candidate.parameters,
+                "status": "failed",
+                "error": str(error),
+                "evidence": error.evidence,
+                "selection": selection,
+            }
+            records.append(row)
+            if on_record is not None:
+                on_record(row)
+            continue
         cycles = _validate_measurement(
             record, profile=capabilities.fingerprint, diagnostic=diagnostic
         )
@@ -266,8 +362,15 @@ def search(
                 "median_cycles": cycles,
                 "predicted_log_cycles_before_measurement": predicted,
                 "measurement": record,
+                "status": "passed",
+                "selection": selection,
+                "ranking": ranking,
             }
         )
+        if on_record is not None:
+            on_record(records[-1])
+    if not observations:
+        raise TrialFailure("No candidate completed correctness and timing checks")
     winner = min(observations, key=observations.get)
     return SearchResult(
         tvm.IRModule({"main": func}),
@@ -278,6 +381,11 @@ def search(
             "strategy": strategy,
             "candidate_count": len(candidates),
             "trials": len(records),
+            "successful_trials": len(observations),
+            "failed_trials": len(records) - len(observations),
+            "baseline_candidate_ids": [candidates[index].id for index in baselines],
+            "baseline_complete": all(index in observations for index in baselines),
+            "space_exhausted": len(attempted) == len(candidates),
             "wall_seconds": time.monotonic() - start,
             "seed": seed,
             "rule_options": dict(rule_options or {}),
@@ -346,9 +454,21 @@ def load_result(document, func, *, capabilities=None, diagnostic=False):
     if not tvm.ir.structural_equal(workload["main"], func):
         raise ValueError("Saved search belongs to another mathematical workload")
     summary, records = document["summary"], document["records"]
-    candidates = generate_candidates(
-        func, capabilities=capabilities, rule_options=summary["rule_options"]
-    )
+    if summary["strategy"] == "metaschedule":
+        from .gemmini_search import restore_candidate
+
+        candidates = [
+            restore_candidate(
+                func,
+                document["winner"]["trace"],
+                capabilities=capabilities,
+                rule_options=summary["rule_options"],
+            )
+        ]
+    else:
+        candidates = generate_candidates(
+            func, capabilities=capabilities, rule_options=summary["rule_options"]
+        )
     winner = next(
         (
             candidate
@@ -361,6 +481,8 @@ def load_result(document, func, *, capabilities=None, diagnostic=False):
         raise ValueError("Saved winner is absent from the current legal schedule space")
     costs = {}
     for row in records:
+        if row.get("status") == "failed":
+            continue
         cost = _validate_measurement(
             row["measurement"], profile=capabilities.fingerprint, diagnostic=diagnostic
         )

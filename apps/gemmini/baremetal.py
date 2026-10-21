@@ -457,6 +457,11 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
     lines.extend(["  return 0;", "}"])
     (output_dir / "model.c").write_text("\n".join(lines) + "\n")
     primitive_mod = tvm.IRModule(plan["functions"]).with_attr("executor", tvm.relay.backend.Executor("aot", {"unpacked-api": True, "interface-api": "c"}))
+    if tvm.target.Target(target).kind.name == "llvm":
+        from tvm.tir.transform.rounding import lower_bounded_rne
+        for gv, func in list(primitive_mod.functions.items()):
+            lowered, _ = lower_bounded_rne(func)
+            primitive_mod.update_func(gv, lowered)
     if plan["functions"]:
         module = tvm.build(primitive_mod, target=target)
     else:

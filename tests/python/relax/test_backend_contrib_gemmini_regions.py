@@ -53,7 +53,7 @@ class GemminiRegionTests(unittest.TestCase):
 
     def check_copy(self, original, values, expected):
         saved = tvm.ir.save_json(original)
-        result = make_elementwise_schedule(original)
+        result = make_elementwise_schedule(original, scalar=True)
         replay = tir.Schedule(original, debug_mask="all")
         result.trace.apply_to_schedule(replay, remove_postproc=False)
         verify_trace_roundtrip(replay, original)
@@ -158,7 +158,7 @@ class GemminiRegionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "runtime data"):
             make_elementwise_schedule(func)
         report = []
-        fallback = ScheduleGemminiTensorIR(report=report)(tvm.IRModule({"main": func}))
+        fallback = ScheduleGemminiTensorIR(report=report, offload_copies=True)(tvm.IRModule({"main": func}))
         tvm.ir.assert_structural_equal(fallback["main"], func)
         self.assertEqual(report[0]["placement"], "cpu")
         self.assertIn("runtime data", report[0]["reason"])
@@ -169,7 +169,7 @@ class GemminiRegionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "region compilation budget"):
             make_elementwise_schedule(func)
         report = []
-        fallback = ScheduleGemminiTensorIR(report=report)(tvm.IRModule({"main": func}))
+        fallback = ScheduleGemminiTensorIR(report=report, offload_copies=True)(tvm.IRModule({"main": func}))
         tvm.ir.assert_structural_equal(fallback["main"], func)
         self.assertEqual(report[0]["placement"], "cpu")
         context = ms.TuneContext(
@@ -210,7 +210,8 @@ class GemminiRegionTests(unittest.TestCase):
                         torch.export.export(model, examples), unwrap_unit_return_tuple=True
                     )
                     report = []
-                    prepared = prepare_gemmini_graph(graph, report=report)
+                    prepared = prepare_gemmini_graph(graph, report=report, offload_copies=True,
+                                                     movement_strategy="scalar")
                     self.assertEqual(
                         sum(row["placement"] == "gemmini" for row in report), 1, report
                     )
@@ -301,7 +302,8 @@ class GemminiRegionTests(unittest.TestCase):
                     ].copy()
                     graph = padding_graph(shape, dtype, widths, value)
                     report = []
-                    prepared = prepare_gemmini_graph(graph, report=report)
+                    prepared = prepare_gemmini_graph(graph, report=report, offload_copies=True,
+                                                     movement_strategy="scalar")
                     self.assertEqual(sum(r["placement"] == "gemmini" for r in report), 1, report)
                     device = next(
                         f for f in prepared.functions.values() if isinstance(f, tir.PrimFunc)

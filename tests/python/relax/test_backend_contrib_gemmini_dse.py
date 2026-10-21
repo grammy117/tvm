@@ -20,6 +20,7 @@ import unittest
 import json
 import subprocess
 import sys
+from unittest.mock import patch
 
 import numpy as np
 import tvm
@@ -127,6 +128,7 @@ assert report[0]['placement'] == 'gemmini', report
         self.assertEqual(result.winner.placement, "cpu")
         self.assertEqual(result.summary["measurement_scope"], "diagnostic")
         self.assertEqual(len(result.records), 2)
+        self.assertIn(16, result.summary["rule_options"]["chunks"])
         with result.database() as database:
             record = database.query_tuning_record(
                 tvm.IRModule({"main": func}), caps.target(), "main"
@@ -153,7 +155,12 @@ assert report[0]['placement'] == 'gemmini', report
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 73)
+        self.assertGreater(len(designs), 1)
+        # Groups beyond ceil(M/16), ceil(N/16) only add padded work.
+        for design in designs:
+            attrs = design.get(design.get_block("root")).annotations
+            self.assertLessEqual(int(attrs.get("gemmini.row_tiles", 1)), 2)
+            self.assertLessEqual(int(attrs.get("gemmini.col_tiles", 1)), 2)
         cpu = next(
             design
             for design in designs
@@ -211,3 +218,116 @@ assert report[0]['placement'] == 'gemmini', report
                 vm["main"](tvm.nd.array(av), tvm.nd.array(bv), tvm.nd.array(dv)).numpy(),
                 av.astype("int64") @ bv.astype("int64") + dv,
             )
+
+    def test_default_is_measured_before_exploration_and_cannot_be_regressed(self):
+        from tvm.relax.backend.contrib.gemmini_dse import search
+
+        caps = GemminiCapabilities()
+        seen = []
+
+        def measured(candidate):
+            seen.append(candidate)
+            default = candidate.parameters.get("reduction_chunk") == 16
+            return {
+                "metric": "target_cycles",
+                "engine": "diagnostic",
+                "capability_fingerprint": caps.fingerprint,
+                "measurement_profile": "baseline-test",
+                "correctness": "passed",
+                "samples": [10 if default else 100] * 3,
+            }
+
+        result = search(reference.workload(8, 8, 16), measured, max_trials=100, diagnostic=True)
+        self.assertEqual(seen[0].placement, "cpu")
+        self.assertEqual(
+            seen[1].parameters,
+            {
+                "order": "ij",
+                "load_order": "ab",
+                "reduction_chunk": 16,
+                "row_tiles": 1,
+                "col_tiles": 1,
+            },
+        )
+        self.assertEqual(result.winner.id, seen[1].id)
+        self.assertTrue(result.summary["space_exhausted"])
+        self.assertTrue(result.summary["baseline_complete"])
+        self.assertEqual(len(seen), 4)
+
+    def test_failed_trials_are_durable_and_resume_does_not_repeat_completed_work(self):
+        from tvm.relax.backend.contrib.gemmini_dse import TrialFailure, search
+
+        caps = GemminiCapabilities()
+        journal = []
+        calls = []
+
+        def measured(candidate):
+            calls.append(candidate.id)
+            if len(calls) == 2:
+                raise TrialFailure("bounded runner timeout", evidence={"receipt": "test-only"})
+            return {
+                "metric": "target_cycles",
+                "engine": "diagnostic",
+                "capability_fingerprint": caps.fingerprint,
+                "measurement_profile": "failure-test",
+                "correctness": "passed",
+                "samples": [100] * 3,
+            }
+
+        func = reference.workload(8, 8, 16)
+        first = search(func, measured, max_trials=3, on_record=journal.append, diagnostic=True)
+        self.assertEqual(len(journal), 3)
+        self.assertEqual(journal[1]["status"], "failed")
+        self.assertEqual(first.summary["failed_trials"], 1)
+        resumed = search(func, measured, max_trials=100, resume_records=journal, diagnostic=True)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(set(calls)), 4)
+        self.assertEqual(resumed.summary["trials"], 4)
+
+    def test_constant_predictions_are_labeled_exploration(self):
+        from tvm.relax.backend.contrib.gemmini_dse import search
+
+        caps = GemminiCapabilities()
+
+        def measured(candidate):
+            return {
+                "metric": "target_cycles",
+                "engine": "diagnostic",
+                "capability_fingerprint": caps.fingerprint,
+                "measurement_profile": "ties-test",
+                "correctness": "passed",
+                "samples": [100] * 3,
+            }
+
+        with (
+            patch("tvm.relax.backend.contrib.gemmini_dse.CycleRanker.fit"),
+            patch(
+                "tvm.relax.backend.contrib.gemmini_dse.CycleRanker.predict",
+                side_effect=lambda candidates: np.ones(len(candidates)),
+            ),
+        ):
+            result = search(
+                reference.workload(17, 19, 33),
+                measured,
+                strategy="ml",
+                warmup=2,
+                max_trials=3,
+                diagnostic=True,
+            )
+        row = result.records[2]
+        self.assertEqual(row["selection"], "ml_tie_exploration")
+        self.assertEqual(row["ranking"]["distinct_predictions"], 1)
+        self.assertGreater(row["ranking"]["best_tie_count"], 1)
+
+    def test_copies_default_to_cpu_and_require_explicit_policy(self):
+        x = relax.Var("x", relax.TensorStructInfo((2, 16), "float32"))
+        builder = relax.BlockBuilder()
+        with builder.function("main", [x]):
+            with builder.dataflow():
+                y = builder.emit_output(relax.op.permute_dims(x))
+            builder.emit_func_output(y)
+        report = []
+        prepare_gemmini_graph(builder.get(), report=report)
+        self.assertTrue(report)
+        self.assertTrue(all(row["placement"] == "cpu" for row in report))
+        self.assertIn("opt-in", report[0]["reason"])

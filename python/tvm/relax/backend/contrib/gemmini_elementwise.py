@@ -648,7 +648,7 @@ def elementwise_blocks(func):
         else:
             return
         # Tensorize proves the access map below. Copies may use sliced,
-        # repeated or permuted indices, with scalar DMA as a legal fallback.
+        # repeated or permuted indices. Scalar DMA is an explicit experiment.
         if any(load.buffer.data.same_as(output.data) for load in loads):
             return
         scalar_inputs = [index for index, load in enumerate(loads) if not load.buffer.shape]
@@ -672,14 +672,18 @@ def elementwise_blocks(func):
     return matches
 
 
-def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=False):
+def schedule_elementwise(
+    func, *, tensorize=True, mark_tensorize=False, scalar=False
+):
     """Let Tensorize prove native rectangular access maps without padded DMA."""
     if tensorize and mark_tensorize:
         raise ValueError("Choose immediate tensorization or MetaSchedule annotations")
     if not elementwise_blocks(func):
         raise ValueError("Expected supported exact pointwise blocks")
     failure = None
-    for use_scalar in [scalar, True] if tensorize and not scalar else [scalar]:
+    # Scalar DMA is an explicit experimental schedule, never an automatic
+    # placement fallback after rectangular tensorization fails.
+    for use_scalar in [scalar]:
         try:
             sch = tir.Schedule(func, debug_mask="all")
             inline_index_constants(sch)
@@ -728,7 +732,7 @@ def schedule_elementwise(func, *, tensorize=True, mark_tensorize=False, scalar=F
                     raise ValueError("TVM Tensorize could not prove the selected DMA rectangles")
                 # v0.19 RewriteTensorize logs a failed replacement but still
                 # returns true. Apply the same target legality check as DSE
-                # before accepting this candidate or trying scalar DMA.
+                # before accepting this candidate.
                 from .gemmini_memory import lower_memory
 
                 lower_memory(sch.mod)
@@ -818,11 +822,11 @@ def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensori
     return {"operation": kind, "tile_rows": rows, "tile_cols": cols}
 
 
-def make_elementwise_schedule(func, *, capabilities=None):
+def make_elementwise_schedule(func, *, capabilities=None, scalar=False):
     """Finalize native DMA scheduling through the common scope/ABI lowering."""
     from .gemmini_tensorir import lower_tensorir_schedule
 
-    sch, mathematical, metadata = schedule_elementwise(func)
+    sch, mathematical, metadata = schedule_elementwise(func, scalar=scalar)
     return lower_tensorir_schedule(
         func, sch, mathematical=mathematical, workload_metadata=metadata, capabilities=capabilities
     )

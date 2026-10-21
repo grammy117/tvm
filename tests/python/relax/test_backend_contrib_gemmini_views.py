@@ -152,10 +152,10 @@ class GemminiViewTests(unittest.TestCase):
                     )
                     report = []
                     prepared = prepare_gemmini_graph(graph, report=report)
-                    expect_device = kind not in ("squeeze_nonunit", "scalar")
+                    expect_no_call = kind in ("squeeze_nonunit", "scalar")
                     self.assertEqual(
                         sum(row["placement"] == "gemmini" for row in report),
-                        int(expect_device),
+                        0,
                         report,
                     )
                     manifest, outputs, library = self.static_run(prepared, [values])
@@ -169,10 +169,8 @@ class GemminiViewTests(unittest.TestCase):
                             output.reshape(-1).view("uint8"),
                             np.ascontiguousarray(value).reshape(-1).view("uint8"),
                         )
-                    if expect_device:
-                        self.assertGreater(library.emulator_commands(), 0)
-                    else:
-                        self.assertEqual(library.emulator_commands(), 0)
+                    self.assertEqual(library.emulator_commands(), 0)
+                    if expect_no_call:
                         self.assertFalse(manifest["calls"])
 
     def test_stock_reshape_elision_preserves_alias_input_to_cpu_fallback(self):

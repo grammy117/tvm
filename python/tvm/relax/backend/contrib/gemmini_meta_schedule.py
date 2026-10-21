@@ -23,6 +23,7 @@ target memory and measure on the explicitly selected target.
 """
 
 import itertools
+import random
 
 from tvm import meta_schedule as ms, tir
 from tvm.meta_schedule.utils import derived_object
@@ -42,11 +43,12 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         self,
         capabilities=None,
         orders=("ij", "ji"),
-        load_orders=("ab", "ba"),
-        chunks=(8, 16),
+        load_orders=("ab",),
+        chunks=(16, 8, 4),
         row_tiles=(1, 2, 4),
         col_tiles=(1, 2, 4),
         include_cpu=False,
+        sample_groups=False,
     ):
         self.capabilities = capabilities or GemminiCapabilities()
         self.orders = tuple(orders)
@@ -57,11 +59,15 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         if type(include_cpu) is not bool:
             raise ValueError("include_cpu must be a boolean")
         self.include_cpu = include_cpu
+        self.sample_groups = sample_groups
         self.target = None
 
     def _alternatives(self, sch, candidates):
         """Expose CPU execution as an explicit measured placement alternative."""
         return [sch] + candidates if self.include_cpu else candidates
+
+    def __str__(self):
+        return "GemminiScheduleRule"
 
     def _initialize_with_tune_context(self, context):
         self.target = context.target
@@ -116,8 +122,29 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             return [sch]
         results = []
         for order, load_order, chunk, rows, cols in itertools.product(
-            self.orders, self.load_orders, self.chunks, self.row_tiles, self.col_tiles
+            self.orders,
+            self.load_orders,
+            self.chunks,
+            (max(self.row_tiles),) if self.sample_groups else self.row_tiles,
+            (max(self.col_tiles),) if self.sample_groups else self.col_tiles,
         ):
+            m, n, depth = matches[0][1]
+            # Groups beyond the mathematical tile count only add padded
+            # work and staging. Keep unit groups for small/tail matrices.
+            if not self.sample_groups and (rows > (m + 15) // 16 or cols > (n + 15) // 16):
+                continue
+            unit_traversal = (
+                (m <= 16 or n <= 16) if self.sample_groups else (m <= 16 * rows or n <= 16 * cols)
+            )
+            if order != self.orders[0] and unit_traversal:
+                continue
+            # Chunks collapse to the same effective depth for short products.
+            effective = max(2, min(chunk, depth))
+            if any(
+                max(2, min(prior, depth)) == effective
+                for prior in self.chunks[: self.chunks.index(chunk)]
+            ):
+                continue
             candidate = sch.copy()
             try:
                 transformed, _ = schedule_contraction(
@@ -129,6 +156,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
                     mark_tensorize=True,
                     row_tiles=rows,
                     col_tiles=cols,
+                    sample_groups=self.sample_groups,
                 )
             except (ValueError, tir.schedule.ScheduleError):
                 continue
@@ -145,7 +173,36 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             self.row_tiles,
             self.col_tiles,
             self.include_cpu,
+            self.sample_groups,
         )
+
+
+@derived_object
+class MutateGemminiCategorical(ms.mutator.PyMutator):
+    """Mutate real categorical split factors through ordinary trace replay."""
+
+    def _initialize_with_tune_context(self, context):
+        del context
+
+    def apply(self, trace, seed):
+        rng = random.Random(int(seed))
+        samples = [
+            (index, inst)
+            for index, inst in enumerate(trace.insts)
+            if inst.kind.name == "SampleCategorical" and len(inst.attrs[0]) > 1
+        ]
+        if not samples:
+            return None
+        index, inst = rng.choice(samples)
+        old = int(dict(trace.as_json()[1])[index])
+        choices = [i for i in range(len(inst.attrs[0])) if i != old]
+        return trace.with_decision(inst, rng.choice(choices), remove_postproc=True)
+
+    def clone(self):
+        return MutateGemminiCategorical()
+
+    def __str__(self):
+        return "MutateGemminiCategorical"
 
 
 @derived_object
@@ -170,6 +227,9 @@ class VerifyGemminiMemory(ms.postproc.PyPostproc):
     def clone(self):
         return VerifyGemminiMemory(self.capabilities)
 
+    def __str__(self):
+        return "VerifyGemminiMemory"
+
 
 def gemmini_space_generator(capabilities=None, **rule_options):
     """Return a normal PostOrderApply generator with target-specific rules."""
@@ -177,5 +237,7 @@ def gemmini_space_generator(capabilities=None, **rule_options):
     return ms.space_generator.PostOrderApply(
         sch_rules=[GemminiScheduleRule(capabilities, **rule_options)],
         postprocs=[ms.postproc.RewriteTensorize(), VerifyGemminiMemory(capabilities)],
-        mutator_probs={},
+        mutator_probs={MutateGemminiCategorical(): 1.0}
+        if rule_options.get("sample_groups")
+        else {},
     )

@@ -42,14 +42,14 @@ class GemminiOperatorInventoryTests(unittest.TestCase):
         mapping = ExportedProgramImporter().convert_map
         seen = []
         for case in fixtures():
-            name, graph, arrays, expected, placement, _, selected_count, contract = case
+            name, graph, arrays, expected, placement, options, selected_count, contract = case
             with self.subTest(name=name):
                 op = contract["requested_operator"]
                 seen.append(op)
                 self.assertIn(contract["converter_key"], mapping)
                 self.assertIn("aten." + contract["converter_key"], contract["source_ops"])
                 report = []
-                graph = prepare_gemmini_graph(graph, report=report)
+                graph = prepare_gemmini_graph(graph, report=report, **options)
                 selected = [row for row in report if row["placement"] == "gemmini"]
                 self.assertEqual(len(selected), selected_count, report)
                 computes = []

@@ -95,7 +95,7 @@ class GemminiElementwiseTests(unittest.TestCase):
                         report = []
                         prepared = prepare_gemmini_graph(graph, report=report)
                         self.assertEqual(
-                            sum(r["placement"] == "gemmini" for r in report), 1, report
+                            sum(r["placement"] == "gemmini" for r in report), 0, report
                         )
                         device = next(
                             f for f in prepared.functions.values() if isinstance(f, tir.PrimFunc)
@@ -112,7 +112,7 @@ class GemminiElementwiseTests(unittest.TestCase):
                         np.testing.assert_array_equal(
                             input_value.numpy().view("uint8"), values.view("uint8")
                         )
-                        self.assertGreater(control.emulator_commands(), 0)
+                        self.assertEqual(control.emulator_commands(), 0)
                         self.assertEqual(control.emulator_faults(), 0)
                         self.assertEqual(control.emulator_pending(), 0)
                         legalized = relax.transform.LegalizeOps()(graph)
@@ -120,7 +120,7 @@ class GemminiElementwiseTests(unittest.TestCase):
                             f for f in legalized.functions.values() if isinstance(f, tir.PrimFunc)
                         )
                         saved = tvm.ir.save_json(original)
-                        scheduled = make_elementwise_schedule(original)
+                        scheduled = make_elementwise_schedule(original, scalar=True)
                         replay = tir.Schedule(original, debug_mask="all")
                         scheduled.trace.apply_to_schedule(replay, remove_postproc=False)
                         replayed = lower_tensorir_schedule(
@@ -188,7 +188,7 @@ class GemminiElementwiseTests(unittest.TestCase):
         vm = relax.VirtualMachine(tvm.runtime.load_module(str(path)), tvm.cpu())
         actual = vm["main"](tvm.nd.array(values)).numpy()
         np.testing.assert_array_equal(actual.view("uint32"), expected)
-        self.assertGreater(control.emulator_commands(), 0)
+        self.assertEqual(control.emulator_commands(), 0)
         self.assertEqual(control.emulator_faults(), 0)
         self.assertEqual(control.emulator_pending(), 0)
 
@@ -339,8 +339,9 @@ class GemminiElementwiseTests(unittest.TestCase):
                 builder.emit_func_output(output)
             report = []
             prepared = prepare_gemmini_graph(builder.get(), report=report)
-            self.assertEqual([row["placement"] for row in report], ["gemmini"], report)
-            self.assertEqual(report[0]["metadata"]["operation"], operation)
+            self.assertEqual([row["placement"] for row in report], ["gemmini" if dtype == "int8" else "cpu"], report)
+            if dtype == "int8":
+                self.assertEqual(report[0]["metadata"]["operation"], operation)
             path = self.root / f"relax-{dtype}.so"
             relax.build(prepared, "llvm").export_library(
                 str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11"]
@@ -517,7 +518,9 @@ class GemminiElementwiseTests(unittest.TestCase):
                 c = te.compute((3, 2), lambda i, j: a[i, j + 1], name="slice")
                 expected = av[:, 1:3]
             original = te.create_prim_func([a, c])
-            result = make_elementwise_schedule(original)
+            # Scalar DMA is an explicit capability experiment, never an
+            # implicit production fallback after rectangular matching fails.
+            result = make_elementwise_schedule(original, scalar=True)
             runtime, control = self.build(result.scheduled_mod)
             input_value = tvm.nd.array(av)
             output = tvm.nd.empty(expected.shape, "int8")
@@ -619,7 +622,7 @@ class GemminiElementwiseTests(unittest.TestCase):
         actual = relax.get_pipeline("gemmini", report=report)(graph)
         expected = prepare_gemmini_graph(graph)
         tvm.ir.assert_structural_equal(actual, expected)
-        self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 1, report)
+        self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 0, report)
         executable = relax.build(graph, "llvm", pipeline="gemmini_build")
         path = self.root / "registered-pipeline.so"
         executable.export_library(
@@ -667,7 +670,7 @@ class GemminiElementwiseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "buffer parameters"):
             make_elementwise_schedule(function)
         report = []
-        result = ScheduleGemminiTensorIR(report=report)(tvm.IRModule({"main": function}))
+        result = ScheduleGemminiTensorIR(report=report, offload_copies=True)(tvm.IRModule({"main": function}))
         tvm.ir.assert_structural_equal(result["main"], function)
         self.assertEqual(report[0]["placement"], "cpu")
         self.assertIn("buffer parameters", report[0]["reason"])
@@ -686,7 +689,7 @@ class GemminiElementwiseTests(unittest.TestCase):
                 builder.emit_func_output(output)
             report = []
             prepared = prepare_gemmini_graph(builder.get(), report=report)
-            self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 1, report)
+            self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 0, report)
             executable = relax.build(prepared, "llvm")
             path = self.root / (kind + "-default.so")
             executable.export_library(
@@ -700,7 +703,7 @@ class GemminiElementwiseTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 actual, values.T if kind == "permute" else values.astype("int32")
             )
-            self.assertGreater(control.emulator_commands(), 0)
+            self.assertEqual(control.emulator_commands(), 0)
             self.assertEqual(control.emulator_faults(), 0)
 
 

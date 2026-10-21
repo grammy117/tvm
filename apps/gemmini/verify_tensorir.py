@@ -73,7 +73,7 @@ void* memset(void* p,int c,size_t n) { volatile unsigned char* d=p;for(size_t i=
 void* memcpy(void* d,const void* s,size_t n) { volatile unsigned char* o=d;const volatile unsigned char* p=s;for(size_t i=0;i<n;++i)o[i]=p[i];return d; }
 int printf(const char* format,...) { (void)format;puts_htif("VENDOR_DIAGNOSTIC\n");return 0; }
 __attribute__((noreturn)) void exit(int code) { tohost=((uint64_t)(code?code:99)<<1)|1;for(;;){} }
-static unsigned computes,zeros,dmas,accumulates,acc_writes,relus;
+static unsigned computes,zeros,dmas,accumulates,acc_writes,relus,scaled_outs;
 void __real_tvm_gemmini_compute(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
 void __real_tvm_gemmini_zero_acc(uint32_t,uint32_t,uint32_t);
 void __wrap_tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
@@ -99,6 +99,11 @@ void __wrap_tvm_gemmini_dma_spad_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,
 }
 void __wrap_tvm_gemmini_dma_relu_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
   ++dmas;++relus;__real_tvm_gemmini_dma_relu_out(p,c,m,n,s,w);
+}
+void __real_tvm_gemmini_dma_scaled_out(int8_t*,uint32_t,uint32_t,uint32_t,int64_t,uint32_t,int32_t,int32_t);
+void __wrap_tvm_gemmini_dma_scaled_out(int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,uint32_t scale,int32_t relu,int32_t w) {
+  ++dmas;++scaled_outs;if(relu)++relus;
+  __real_tvm_gemmini_dma_scaled_out(p,c,m,n,s,scale,relu,w);
 }
 static uint64_t hash(const void* p,size_t n) {
   const volatile unsigned char* b=p;uint64_t h=1469598103934665603ULL;
@@ -918,7 +923,7 @@ def fixtures():
 
 def fixture_guest(
     index, arrays, expected, workspace, operation, placement="gemmini", *,
-    timing_repeats=0, rtol=0.0, atol=0.0,
+    timing_repeats=0, rtol=0.0, atol=0.0, required_scaled=False,
 ):
     """Check every flat output independently, including tuples and host-only cases."""
     import numpy as np
@@ -974,6 +979,8 @@ def fixture_guest(
             f"unsigned write_before_{index}=acc_writes, relu_before_{index}=relus;",
         ]
     )
+    if required_scaled:
+        checks.append(f"unsigned scaled_before_{index}=scaled_outs;")
     for number in range(len(outputs)):
         checks.append(f"memset(&out_{index}_{number},0x6d,sizeof(out_{index}_{number}));")
     checks.append(f"memset(&work_{index},0x6d,sizeof(work_{index}));")
@@ -983,6 +990,8 @@ def fixture_guest(
         )
     if placement == "host":
         primitive_check = f"if(computes!=before_{index} || dmas!=dma_before_{index} || zeros!=zero_before_{index})return 21;"
+    elif operation == "graph_array":
+        primitive_check = f"if(computes==before_{index})return 21;"
     elif operation == "matmul_bias":
         primitive_check = f"if(computes==before_{index} || acc_writes==write_before_{index} || zeros!=zero_before_{index})return 21;"
     elif operation and operation != "sum_i8_i32":
@@ -995,6 +1004,8 @@ def fixture_guest(
         primitive_check += f"if(relus==relu_before_{index})return 21;"
     if placement == "mixed":
         primitive_check += f"if(computes!=before_{index})return 21;"
+    if required_scaled:
+        primitive_check += f"if(scaled_outs==scaled_before_{index})return 21;"
     checks.extend(
         [
             f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index}.data,{workspace})) return 20;",
@@ -1119,6 +1130,7 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
             timing_repeats=timing_repeats,
             rtol=rtol,
             atol=atol,
+            required_scaled=any(row.get("metadata", {}).get("readout_fused") or row.get("metadata", {}).get("scaled_readout") for row in reports[name]),
         )
         guest.extend(declarations)
         checks.append(f'puts_htif("TENSORIR_CASE {name}\\n");')
@@ -1155,6 +1167,7 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
         "-Wl,--wrap=tvm_gemmini_dma_widen",
         "-Wl,--wrap=tvm_gemmini_dma_spad_out",
         "-Wl,--wrap=tvm_gemmini_dma_relu_out",
+        "-Wl,--wrap=tvm_gemmini_dma_scaled_out",
         "-I" + str(out),
     ]
     sources = [out / "start.S", out / "runner.c", package / "runtime.c", package / "constants.S"]
@@ -1228,6 +1241,7 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
         "include/tvm/topi/nn/pooling.h",
         "python/tvm/topi/transform.py",
         "python/tvm/tir/function.py",
+        "python/tvm/tir/transform/rounding.py",
         "python/tvm/relax/transform/legalize_ops/statistical.py",
         "python/tvm/relax/transform/legalize_ops/nn.py",
         "python/tvm/relax/transform/legalize_ops/grad.py",
@@ -1255,6 +1269,9 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
                 "gemmini_bias",
                 "gemmini_regions",
                 "gemmini_dse",
+                "gemmini_search",
+                "gemmini_layout",
+                "gemmini_epilogue",
             )
         ],
     ):
@@ -1335,6 +1352,8 @@ def run(args):
     bindings = list(bundle["bindings"]) + [elf]
     env = dict(os.environ)
     if args.backend == "spike":
+        from verify_exported_graph import guest_layout
+        _, guest_map = guest_layout(bundle.get("guest_memory_bytes", 256 << 20))
         receipt = json.loads(args.simulator_receipt.read_text())
         bindings.extend(
             [
@@ -1352,7 +1371,7 @@ def run(args):
             receipt["spike_path"],
             "--extlib=" + receipt["plugin_path"],
             "--extension=gemmini",
-            "-m0x80000000:0x10000000",
+            guest_map,
             elf["path"],
         ]
     else:

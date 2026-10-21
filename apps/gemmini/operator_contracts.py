@@ -353,6 +353,7 @@ def fixtures():
                 str(node.target) for node in exported.graph.nodes if node.op == "call_function"
             ],
             "execution_kind": kind,
+            "placement_policy": "explicit primitive capability exercise; scalar DMA is not production placement",
         }
         yield (
             "requested_" + name.replace(".", "_"),
@@ -360,7 +361,7 @@ def fixtures():
             arrays,
             expected[0] if len(expected) == 1 else tuple(expected),
             placement,
-            {},
+            {"offload_copies": True, "movement_strategy": "scalar"},
             selected,
             metadata,
         )
