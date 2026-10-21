@@ -30,6 +30,53 @@ from verify_tensorir import classify_output, fixture_guest
 
 
 class TensorIRResultTests(unittest.TestCase):
+    def test_mixed_movement_rejects_array_arithmetic_even_with_correct_outputs(self):
+        declarations, checks = fixture_guest(
+            0, [np.array([3], "int32")], np.array([1.25], "float32"), 0, "copy_f32", "mixed"
+        )
+        source = (
+            r"""
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+static unsigned computes,zeros,dmas,accumulates,acc_writes,relus;
+static void puts_htif(const char* text) {(void)text;}
+static uint64_t hash(const void* p,size_t n) {
+  const unsigned char* b=p;uint64_t h=0;for(size_t i=0;i<n;++i)h=h*257+b[i];return h;
+}
+int stage_0_model_run(const void*const* in,void*const* out,uint8_t* work,uint64_t size) {
+  (void)in;(void)work;(void)size;
+  ++dmas;computes+=BAD_COMPUTE;((uint32_t*)out[0])[0]=0x3fa00000;return 0;
+}
+"""
+            + "\n".join(declarations)
+            + "\nint main(void){\n"
+            + "\n".join(checks)
+            + "\nreturn 0;}\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="tensorir-mixed-check-") as directory:
+            root = Path(directory)
+            path = root / "guest.c"
+            path.write_text(source)
+            for compute, expected_code in ((0, 0), (1, 21)):
+                binary = root / f"guest-{compute}"
+                subprocess.run(
+                    [
+                        "cc",
+                        "-std=c11",
+                        "-O2",
+                        "-DBAD_ORACLE=0",
+                        f"-DBAD_COMPUTE={compute}",
+                        path,
+                        "-o",
+                        binary,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                result = subprocess.run([binary], capture_output=True)
+                self.assertEqual(result.returncode, expected_code)
+
     def test_guest_checks_second_output_bits_and_guards(self):
         expected = (
             np.array([11, -7], "int32"),

@@ -888,6 +888,9 @@ def fixtures():
             builder.emit_func_output(result_var)
         expected = (a.astype("int64") @ b.astype("int64") + bias).astype("int32")
         result.append((name, builder.get(), arrays, expected))
+    from operator_contracts import fixtures as requested_fixtures
+
+    result.extend(requested_fixtures())
     return result
 
 
@@ -956,6 +959,8 @@ def fixture_guest(index, arrays, expected, workspace, operation, placement="gemm
         primitive_check += f"if(accumulates==add_before_{index})return 21;"
     if operation == "relu_i8":
         primitive_check += f"if(relus==relu_before_{index})return 21;"
+    if placement == "mixed":
+        primitive_check += f"if(computes!=before_{index})return 21;"
     checks.extend(
         [
             f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index},{workspace})) return 20;",
@@ -1004,9 +1009,8 @@ def prepare(args):
         modules[name] = prepare_gemmini_graph(
             mod, report=report, schedule_options=options, **(case[5] if len(case) > 5 else {})
         )
-        if sum(row["placement"] == "gemmini" for row in report) != (
-            0 if placement == "host" else 1
-        ):
+        expected_functions = case[6] if len(case) > 6 else (0 if placement == "host" else 1)
+        if sum(row["placement"] == "gemmini" for row in report) != expected_functions:
             raise ValueError("Fixture did not use the structural accelerator rule: " + name)
         reports[name] = report
     package = out / "package"
@@ -1121,6 +1125,7 @@ def prepare(args):
     bindings.extend(identity(out / name) for name in ("runner.c", "start.S", "link.ld"))
     for relative in (
         "apps/gemmini/verify_tensorir.py",
+        "apps/gemmini/operator_contracts.py",
         "apps/gemmini/baremetal.py",
         "apps/gemmini/matmul.c",
         "apps/gemmini/matmul.h",
@@ -1180,6 +1185,7 @@ def prepare(args):
         "cases": [case[0] for case in cases],
         "placements": {case[0]: case[4] if len(case) > 4 else "gemmini" for case in cases},
         "preparation_options": {case[0]: case[5] if len(case) > 5 else {} for case in cases},
+        "operator_contracts": {case[0]: case[7] for case in cases if len(case) > 7},
     }
     (out / "bundle.json").write_text(json.dumps(bundle, indent=2) + "\n")
     print(json.dumps({"status": "prepared", "bundle": str(out / "bundle.json")}))
@@ -1297,6 +1303,8 @@ def run(args):
 
 
 def main():
+    from operator_contracts import REQUESTED_OPERATORS
+
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     build = sub.add_parser("prepare")
@@ -1403,6 +1411,7 @@ def main():
             "pool_crop2d",
             "pool_override2d",
             "pool_long2d",
+            *["requested_" + name.replace(".", "_") for name in REQUESTED_OPERATORS],
             *[
                 "overlap_" + kind
                 for kind in (
