@@ -18,6 +18,7 @@
 # pylint: disable=invalid-name, inconsistent-return-statements, unidiomatic-typecheck
 # pylint: disable=import-outside-toplevel
 """PyTorch ExportedProgram of Relax."""
+
 from collections import ChainMap, OrderedDict
 from functools import partial
 from typing import Callable, Dict, List, Tuple
@@ -170,6 +171,64 @@ class ExportedProgramImporter(BaseFXGraphImporter):
         stride = [node.args[4] if len(node.args) > 4 else 1]
         return self.block_builder.emit(relax.op.strided_slice(x, axes, begin, end, stride))
 
+    def _scatter_slice(self, node: fx.Node, *, select=False) -> relax.Var:
+        """Import functional slice updates as ordinary, target-independent TOPI."""
+        import numpy as np
+        from tvm import tir, topi
+
+        args = self.retrieve_args(node)
+        x, source = args[:2]
+        shape = self.shape_of(x)
+        if not all(isinstance(dim, tir.IntImm) for dim in shape):
+            raise NotImplementedError(
+                "Scatter slice import currently requires a static input shape"
+            )
+        shape = tuple(int(dim) for dim in shape)
+        rank = len(shape)
+        axis = args[2] if len(args) > 2 else node.kwargs.get("dim", 0)
+        if not isinstance(axis, int) or not -rank <= axis < rank:
+            raise ValueError("Scatter slice dimension is outside the input rank")
+        axis %= rank
+        if select:
+            index = args[3] if len(args) > 3 else node.kwargs["index"]
+            if not isinstance(index, int) or not -shape[axis] <= index < shape[axis]:
+                raise ValueError("Scatter select index is outside the input extent")
+            start, stop, step = index % shape[axis], index % shape[axis] + 1, 1
+            source = self.block_builder.emit(relax.op.expand_dims(source, axis))
+        else:
+            start = args[3] if len(args) > 3 else node.kwargs.get("start", None)
+            stop = args[4] if len(args) > 4 else node.kwargs.get("end", None)
+            step = args[5] if len(args) > 5 else node.kwargs.get("step", 1)
+            if not isinstance(step, int) or step <= 0:
+                raise ValueError("PyTorch scatter slice requires a positive static step")
+            if any(value is not None and not isinstance(value, int) for value in (start, stop)):
+                raise NotImplementedError("Scatter slice bounds must be static integers")
+            start, stop, step = slice(start, stop, step).indices(shape[axis])
+        expected = list(shape)
+        expected[axis] = len(range(start, stop, step))
+        if (
+            tuple(self.shape_of(source)) != tuple(expected)
+            or source.struct_info.dtype != x.struct_info.dtype
+        ):
+            raise ValueError("Scatter source shape and dtype must match the selected slice")
+        if not expected[axis]:
+            return self.block_builder.emit_te(topi.identity, x)
+        begin, end, strides = [0] * rank, list(shape), [1] * rank
+        begin[axis], end[axis], strides[axis] = start, stop, step
+        if any(value > (1 << 31) - 1 for value in (*shape, *strides)):
+            raise NotImplementedError("TOPI scatter slice requires signed INT32 index bounds")
+
+        def compute(data, updates):
+            return topi.strided_set(
+                data,
+                updates,
+                topi.utils.const_vector(np.array(begin, "int32")),
+                topi.utils.const_vector(np.array(end, "int32")),
+                topi.utils.const_vector(np.array(strides, "int32")),
+            )
+
+        return self.block_builder.emit_te(compute, x, source, primfunc_name_hint="scatter_slice")
+
     ########## Others ##########
 
     def create_convert_map(
@@ -274,7 +333,9 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "replication_pad2d.default": partial(self._pad, mode="edge"),
             "replication_pad3d.default": partial(self._pad, mode="edge"),
             "select.int": self._select,
+            "select_scatter.default": partial(self._scatter_slice, select=True),
             "slice.Tensor": self._slice,
+            "slice_scatter.default": self._scatter_slice,
             "split.Tensor": self._split,
             "squeeze.default": self._squeeze,
             "squeeze.dim": self._squeeze,

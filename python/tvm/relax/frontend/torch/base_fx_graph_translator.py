@@ -60,6 +60,8 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
             return "int64"
         elif input_type in ["int32", "torch.int32", torch.int32]:
             return "int32"
+        elif input_type in ["int8", "torch.int8", torch.int8]:
+            return "int8"
         elif input_type in ["bool", "torch.bool", torch.bool]:
             return "bool"
         else:
