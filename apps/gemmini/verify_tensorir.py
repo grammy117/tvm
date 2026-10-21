@@ -90,6 +90,60 @@ def fixtures():
     from tvm import relax, te, topi
 
     result = []
+    for kind in ("average", "override", "adaptive", "integer", "holes", "col2im", "boolean"):
+        import torch
+        from tvm.relax.frontend.torch import from_exported_program
+
+        class Overlap(torch.nn.Module):
+            def forward(self, g, x):
+                if kind in ("col2im", "boolean"):
+                    return torch.ops.aten.col2im.default(g, [3, 4], [2, 2], [1, 1], [0, 0], [1, 1])
+                if kind == "adaptive":
+                    return torch.ops.aten._adaptive_avg_pool2d_backward.default(g, x)
+                if kind == "holes":
+                    return torch.ops.aten.avg_pool2d_backward.default(
+                        g, x, [1], [3], [0], False, True, 1
+                    )
+                return torch.ops.aten.avg_pool2d_backward.default(
+                    g,
+                    x,
+                    [3, 3],
+                    [1, 1] if kind == "integer" else [2, 2],
+                    [1, 1],
+                    kind != "integer",
+                    True,
+                    5 if kind == "override" else 1 if kind == "integer" else None,
+                )
+
+        dtype = (
+            "bool" if kind == "boolean" else "int64" if kind in ("integer", "holes") else "float32"
+        )
+        g_shape = (
+            (1, 4, 6)
+            if kind in ("col2im", "boolean")
+            else (1, 1, 1, 2)
+            if kind == "holes"
+            else (1, 1, 3, 4)
+            if kind == "integer"
+            else (1, 1, 2, 3)
+        )
+        gradient = (np.arange(np.prod(g_shape)).reshape(g_shape) - 3).astype(dtype)
+        if kind == "integer":
+            gradient = np.resize(np.array([-(1 << 63), (1 << 63) - 1, -17, 33], "int64"), g_shape)
+        elif kind == "average":
+            gradient *= 18
+        elif kind == "override":
+            gradient *= 5
+        elif kind == "adaptive":
+            gradient *= 6
+        elif kind == "col2im":
+            gradient /= 4
+        x_shape = (1, 1, 5, 6) if kind == "adaptive" else (1, 1, 3, 4)
+        values = np.zeros(x_shape, dtype)
+        model = Overlap()
+        args = (torch.from_numpy(gradient), torch.from_numpy(values))
+        mod = from_exported_program(torch.export.export(model, args), unwrap_unit_return_tuple=True)
+        result.append((f"overlap_{kind}", mod, [gradient, values], model(*args).numpy(), "host"))
     for kind, dim in (
         ("avg", 1),
         ("avg", 2),
@@ -1010,14 +1064,17 @@ def prepare(args):
         "src/te/operation/create_primfunc.cc",
         "src/tir/ir/stmt_functor.cc",
         "src/tir/ir/data_type_rewriter.cc",
+        "include/tvm/topi/nn/pooling.h",
         "python/tvm/topi/transform.py",
         "python/tvm/tir/function.py",
         "python/tvm/relax/transform/legalize_ops/statistical.py",
         "python/tvm/relax/transform/legalize_ops/nn.py",
+        "python/tvm/relax/transform/legalize_ops/grad.py",
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
         "python/tvm/relax/frontend/torch/base_fx_graph_translator.py",
         "python/tvm/relax/frontend/torch/_numeric.py",
         "python/tvm/relax/frontend/torch/_pooling.py",
+        "python/tvm/relax/frontend/torch/_overlap.py",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -1270,6 +1327,18 @@ def main():
             "pool_crop2d",
             "pool_override2d",
             "pool_long2d",
+            *[
+                "overlap_" + kind
+                for kind in (
+                    "average",
+                    "override",
+                    "adaptive",
+                    "integer",
+                    "holes",
+                    "col2im",
+                    "boolean",
+                )
+            ],
         ],
     )
     execute = sub.add_parser("run")

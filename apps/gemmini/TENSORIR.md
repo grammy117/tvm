@@ -59,7 +59,8 @@ guard described in README.md. That guard rejects unsupported automatic-copy
 annotations and is not a DMA optimization.
 
 The migration includes generic C++ scheduler/IR fixes. Including the pooling
-work described below, twelve core C++ files differ from the legacy branch.
+and gradient work described below, twelve core C++ source files and one TOPI
+header differ from the legacy branch.
 In `decompose_reduction`, initialization reads were omitted and retained
 on the update block instead. Separate read-region analysis preserves an
 input-dependent initialization and lets subsequent cache placement see its
@@ -114,6 +115,12 @@ extent as an endpoint. Independent CPU execution checks cover triangular and
 rectangular domains, nonzero origins, input-dependent identities, tuple outputs,
 both index widths and schedule trace replay. These repairs are independent of
 Gemmini instruction selection.
+
+Average-pool backward also needs its divisor clipped to the originally declared
+padding when ceil mode extends the last window. The TOPI implementation had
+always used the full kernel area for included padding. The repaired generic
+operator agrees with an independent window Jacobian in both layouts and floating
+dtypes; the normal non-ceil implementation is unchanged.
 
 `gemmini_space_generator()` is a standard MetaSchedule `PostOrderApply` space
 generator with a target-specific `PyScheduleRule`, standard `RewriteTensorize`
@@ -219,7 +226,7 @@ Statuses here are development state, not a completed hardware-support table.
 | Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | Direct arithmetic import preserves scalar promotion, alpha and explicit wrapping. Unit-alpha INT32 tensor/scalar addition uses native accumulator loads/readout; general scale/subtract/negate and wider arithmetic stay on CPU. INT8 ReLU uses exact widen/readout tile intrinsics. Exact FP16 add/sub with alpha outside +/-1 is explicitly unqualified because the pinned CPU reference rounds vector and scalar-tail intermediates differently |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; wider frontend and rounding audit remains required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Admitted batched/unbatched frontend forms preserve padding, ceil-window, divisor and dtype contracts. Ordinary floating averaging remains CPU arithmetic; legal FP32 padding copies may use DMA. INT64 regular pooling uses modulo-sum/truncating-division mathematics on CPU. Bounded Spike/RTL fixtures cover regular/adaptive pooling in all three dimensions; host tests also exercise underscore aliases. This is not a claim of native average arithmetic |
-| Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Gather/scatter accumulation and numeric semantics still require investigation |
+| Overlap accumulation | `avg_pool2d_backward`, `_adaptive_avg_pool2d_backward`, `col2im` | Admitted static batched/unbatched contracts now import to stock Relax gradients or unscheduled mathematical TE gathers/reductions. Tested FP16/FP32/FP64 gradients and overlap sums stay on CPU. Regular INT64 pool gradients preserve exact modulo accumulation and truncating division; Boolean col2im uses logical overlap. Bounded target fixtures require zero accelerator commands for their arithmetic |
 | Movement | `clone`, `repeat`, `cat`, `slice_scatter`, `select_scatter`, `fill.Scalar`, `full`, `full_like`, `constant_pad_nd`, `reflection_pad1d`, `reflection_pad2d`, `reflection_pad3d`, `replication_pad2d`, `replication_pad3d`, `_to_copy` | INT8/INT32/FP32 copies, indexed repeats/slices, constant/reflection/edge padding, signed widening and runtime scalar fills use native DMA where Tensorize proves the access map. Constant padding includes admitted cropping. Index-selected copies expose concatenation and static positive-stride scatter regions through standard scheduling. Constant full/full_like import preserves the captured dtype; normal constant folding can eliminate them, and unfolded literal fills use the existing DMA intrinsic. Broader dtype/frontend/aliasing admission remains under audit |
 | Views/metadata | `as_strided`, `diagonal`, `permute`, `scalar_tensor`, `select.int`, `slice.Tensor`, `split_with_sizes`, `squeeze.dim`, `squeeze.dims`, `unsqueeze`, `view` | Admitted static frontend forms execute as standard metadata or INT8/INT32/FP32 mathematical copies. Internal reshapes can disappear; indexed or boundary materializations use DMA when Tensorize proves the access map. Constants and nonunit squeeze can require no device calls. Hidden storage aliases, dynamic contracts and zero-extent static-export buffers remain explicit limitations |
 
@@ -234,12 +241,12 @@ complete acceptance of every ATen overload or frontend graph.
 | Requested mapping | Evidence-backed boundary |
 | --- | --- |
 | `add.Tensor` / `sub.Tensor` through load scaling | Full-width accumulator loads have no configured scaler. Unscaled INT32 addition is supported and the RTL SRAM adder wraps to 32 bits. General alpha scaling or subtraction does not follow from that. INT8 scaled loads round/saturate; `-(-128)` demonstrates why they cannot replace arbitrary wrapping negation or widened subtraction. |
-| `add.Scalar`, `sub.Scalar` | A zero load stride repeats a scalar down a one-column DMA rectangle. Runtime INT32 scalar-tensor addition is now supported on either side, including an explicit wrapping variant. Immediate constants and native subtraction remain separate admission work; there is no full-width negative load scaler. |
+| `add.Scalar`, `sub.Scalar` | A zero load stride repeats a scalar down a one-column DMA rectangle. Runtime INT32 scalar-tensor addition is supported on either side, including an explicit wrapping variant. Immediate INT32 add constants also lower through ordinary numerical definitions and native addition. Native subtraction does not follow: there is no full-width negative load scaler. |
 | `mul.Scalar`, `div.Scalar`, `neg` | The available scaled small readout narrows to INT8. It is not an arbitrary FP32 or full-INT32 multiply/divide unit. Any narrower integer recipe must specify its rounding, saturation and value range before admission. |
 | `relu` | Full-width INT32 readout bypasses activation/scaling, so INT32/FP ReLU remains CPU work. Native INT8 ReLU uses a typed tile intrinsic with exact widening, identity scale and narrow readout. Its private INT32 temporary contains only widened INT8 values. |
 | `mean.dim`, `mean.default`, `sum.dim_IntList` | A registered sum intrinsic uses a ones-vector contraction for signed INT8 sums with K <= 16,777,216. The prefix bound permits exact internal INT32 accumulation and an ordinary CPU widening for INT64 results. Mean retains its specified CPU conversion/division; a narrowing readout scale cannot stand in for arbitrary floating mean. |
 | `avg_pool1d/2d/3d`, adaptive average pooling | Ordinary floating inputs do not fit the integer arithmetic unit. An integer recipe must specify windows, divisors, exclude-padding/ceil behavior and rounding. The max-pool readout feature does not implement average pooling. |
-| Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. No generic backward mapping is claimed. |
+| Average-pool backward and `col2im` | These require the actual gradient dtype, scatter/overlap semantics and window divisors. Accumulate-on-load updates local accumulator rows; it does not scatter-add into arbitrary host output addresses. CPU mathematical implementations are admitted; no generic native gradient mapping is claimed. |
 | Generic data movement | Primitive DMA handles rectangular regions with contiguous columns and one row stride. Copies preserving bits and signed widening are admitted. Index remapping, multiple sources, fill broadcasting and overlapping updates need appropriate schedules or remain CPU work. They must not be described as absent silicon features merely because the current schedule does not handle them. |
 | Views and metadata | Reshape-like operations may disappear or become host metadata when consumers can accept the layout. Permute, diagonal, slicing and `as_strided` may need materialization under the compact-buffer ABI. `as_strided` admits contiguous sources and rebases storage offsets only when all reads remain within the logical input. Unsupported hidden storage access is an importer representation limit, not a missing DMA feature. Host metadata is not accelerator arithmetic. |
 
@@ -835,10 +842,75 @@ ELF instruction audits reject hardware loops. The adapter is unchanged. These
 are functional results, not performance labels or native average arithmetic.
 
 Explicit-divisor/INT64 average-pool mathematics currently requires positive
-static spatial extents. Runtime scalar creation, broader alias/dynamic contracts,
-backward/overlap operations and the convolution frontend audit remain unfinished.
-The next `backward-next-audit-v1.json` reproduces missing importers for eleven
+static spatial extents. Runtime scalar creation, broader alias/dynamic contracts
+and the convolution frontend audit remain unfinished. The subsequent
+`backward-next-audit-v1.json` reproduces missing importers for eleven
 source-supported dtype/operator cases and a stock average-pool backward mismatch
 with ceil mode and included padding. Those are separate frontend/generic
-legalization defects, not evidence of native gradient support. This milestone
-does not complete the full requested operator inventory.
+legalization defects, not evidence of native gradient support.
+
+The following overlap changes resolve that admission audit for tested contracts.
+Regular FP32/FP64 pool backward without an explicit divisor uses the normal
+`relax.grad.avg_pool2d_backward` operator and its corrected TOPI legalization.
+Half/INT64 or explicit-divisor variants use unscheduled TE: compute one delta
+per output window, then sum the deltas covering each input location. Its
+rectangular reduction bound follows kernel/stride geometry; absent windows
+contribute zero, including input positions covered by no output. Half keeps
+its actual scalar division and addition rounding, rather than borrowing the
+forward operator's FP32 accumulation policy. INT64 sums use unsigned limb math
+and restore signed wrapping. Overflowing overlap sums have independent
+unbounded Python integer references.
+
+Adaptive backward uses its actual variable window boundaries and per-axis
+division. Col2im uses a mathematical gather from column entries whose stride
+and dilation lattice maps onto the output pixel. The reduction follows kernel
+offsets, including padding, overlap and uncovered pixels. Half/FP32/FP64 sums
+and Boolean logical overlap preserve the admitted CPU contracts. No C gradient
+or folding kernels, hardware instructions or scheduling choices appear in
+these frontend definitions. Missing integer col2im/adaptive-gradient source CPU
+contracts are reported separately from native hardware capability.
+
+The source numeric definitions were checked against pinned PyTorch 2.10
+[average-pool backward](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/AvgPoolKernel.cpp),
+[adaptive-pool backward](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/cpu/AdaptiveAvgPoolKernel.cpp)
+and [column overlap](https://github.com/pytorch/pytorch/blob/v2.10.0/aten/src/ATen/native/im2col.h)
+implementations, alongside independent execution oracles. These are source CPU
+semantics, not claims of floating Gemmini arithmetic.
+
+`unit-overlap-full-pinned-v1.log` passes all 684 collected checks against
+immutable `compiler-core-v10`. This includes 99 new frontend cases, one static
+backend check with six numerical contracts, 32 independent window-Jacobian
+checks and the preceding forward pooling/arithmetic/movement/view regressions.
+Floating CPU comparisons retain explicit tolerances. The INT64 overlap check
+compares both PyTorch and an unbounded integer oracle. Boolean overlap, reduced
+floating rounding, unit-size kernels, default/broadcast geometry, nontrivial
+strides, asymmetric padding, variable windows and uncovered pixels are covered.
+`qualification-core-pool-gradient-v1.json` retains the generic divisor fix and
+eight failures on the prior compiler, separately from frontend admission.
+
+`device-overlap-gradient-v1` and `device-overlap-fold-v1` pass ten fixture
+executions on both Spike and the pinned RTL, with wrong-oracle controls. All
+seven new gradient/folding fixtures require zero accelerator commands; small
+matmul, split and sum regressions still exercise native instructions. Selected
+FP32 results are compared as raw words; INT64 and Boolean outputs are exact.
+The target checks include overlapping INT64 wrap and required zero writes for
+uncovered inputs. Positive RTL runs take approximately 41 and 30 seconds within
+the 60-second/300,000-cycle bounds. All 126 distinct artifact bindings verify,
+the adapter is unchanged and instruction audits reject hardware loops. No
+performance label or native floating arithmetic is implied.
+
+The overlap frontend currently requires static positive window/image extents;
+complex dtypes and broader dynamic/layout contracts remain outside its tested
+admission. Host FP16/FP64 checks do not imply target qualification for all
+floating bit patterns or source CPU memory formats. The complete 51-op audit
+and coverage-wide source freeze are still required.
+
+`convolution-next-audit-v1.json` checks 108 small direct/named/backward
+operator/dtype/dimension variants. The pinned source CPU supports 72: three
+named FP32 forward cases pass, fifteen named forward cases return the wrong
+dtype, and 54 are refused by the current importer. Missing direct convolution
+and convolution-backward conversions are frontend gaps, not successful CPU
+fallback. `convolution-adjoint-framework-v1.json` separately tests reuse of the
+stock Relax 2D adjoint: its four ordinary/grouped non-dilated cases pass, while
+all four dilated cases fail. Convolution admission and generic framework
+fidelity are the next required work; this milestone does not complete the goal.
