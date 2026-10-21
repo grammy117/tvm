@@ -18,6 +18,8 @@
  */
 #include "./ir_comparator.h"
 
+#include <cstring>
+
 #include "../../arith/scalable_expression.h"
 
 namespace tvm {
@@ -290,7 +292,9 @@ bool TensorizeComparator::VisitExpr_(const IntImmNode* op, const PrimExpr& other
 
 bool TensorizeComparator::VisitExpr_(const FloatImmNode* op, const PrimExpr& other) {
   const auto* rhs = other.as<FloatImmNode>();
-  if (op->value != rhs->value) {
+  // Literal replacement must preserve NaN payloads and signed zero. Floating
+  // equality rejects an identical NaN and accepts opposite zero signs.
+  if (std::memcmp(&op->value, &rhs->value, sizeof(op->value)) != 0) {
     if (assert_mode_) {
       std::ostringstream os;
       os << "FloatImmNode values do not match: op->value=" << op->value
