@@ -533,3 +533,24 @@ binds those checks, source patches and immutable compiled libraries. These
 checks qualify the disclosed scheduler fixes and functional region support;
 the full requested operator inventory and final coverage-wide source freeze
 remain unfinished.
+
+`device-copy-v1` adds eight copy-region fixtures: INT8/INT32/FP32 concatenation,
+contiguous and positive-stride slice updates, and select updates, plus small
+contraction and sum regressions. All ten cases pass Spike and the pinned RTL;
+wrong-oracle controls fail as intended on both substrates. The RTL positive
+run completes within the 60-second, 300,000-cycle bounds. The primitive adapter
+is unchanged and both ELF instruction audits contain no prohibited instructions.
+`unit-copy-full-pinned-v1.log` passes all 195 collected backend/app, padding and
+scatter-frontend checks against immutable `compiler-core-v5` libraries.
+`unit-core-partition-pinned-v2.log` passes 230 generic scheduler/TOPI checks,
+with one existing affine-analysis skip. The previous immutable compiler fails
+five focused partition/definition regressions. The new checks include duplicate
+display names, singleton regions, all three copy dtypes, NaN payloads, input
+preservation, Python/JSON traces, ordinary VM compilation, MetaSchedule and
+CPU retention for runtime predicates or excessive partitioning.
+
+This checkpoint does not complete the operator inventory. A subsequent frontend
+audit reproduces incorrect default integer `sum` output dtypes and lost
+`keepdim=True` shape in the existing `_sum` importer. Correct INT64 semantics
+must be restored independently of native INT8-to-INT32 reduction scheduling;
+passing the latter does not qualify the current ATen importer for those sums.
