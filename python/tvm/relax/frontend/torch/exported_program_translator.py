@@ -133,6 +133,29 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     ########## Manipulation ##########
 
+    def _pad(self, node: fx.Node, *, mode=None) -> relax.Var:
+        args = self.retrieve_args(node)
+        x = args[0]
+        padding = args[1] if len(args) > 1 else node.kwargs["pad" if mode is None else "padding"]
+        if mode is None:
+            mode = args[2] if len(args) > 2 else node.kwargs.get("mode", "constant")
+            value = args[3] if len(args) > 3 else node.kwargs.get("value", None)
+        else:
+            value = args[2] if len(args) > 2 else node.kwargs.get("value", None)
+        mode = "edge" if mode == "replicate" else mode
+        if mode not in ("constant", "reflect", "edge"):
+            raise NotImplementedError(f"Unsupported PyTorch padding mode: {mode}")
+        ndim = len(self.shape_of(x))
+        if len(padding) % 2 or len(padding) > 2 * ndim:
+            raise ValueError("Padding must contain pairs for at most the input rank")
+        widths = [0] * (2 * ndim)
+        for axis in range(len(padding) // 2):
+            offset = 2 * (ndim - axis - 1)
+            widths[offset : offset + 2] = padding[2 * axis : 2 * axis + 2]
+        return self.block_builder.emit(
+            relax.op.nn.pad(x, widths, 0 if value is None else value, pad_mode=mode)
+        )
+
     def _select(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
         dim = node.args[1]
@@ -239,9 +262,17 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "cat.default": self._cat,
             "concat.default": self._cat,
             "cumsum.default": self._cumsum,
+            "constant_pad_nd.default": partial(self._pad, mode="constant"),
             "expand.default": self._expand,
+            "pad.default": self._pad,
             "permute.default": self._permute,
+            "reflection_pad1d.default": partial(self._pad, mode="reflect"),
+            "reflection_pad2d.default": partial(self._pad, mode="reflect"),
+            "reflection_pad3d.default": partial(self._pad, mode="reflect"),
             "repeat.default": self._repeat,
+            "replication_pad1d.default": partial(self._pad, mode="edge"),
+            "replication_pad2d.default": partial(self._pad, mode="edge"),
+            "replication_pad3d.default": partial(self._pad, mode="edge"),
             "select.int": self._select,
             "slice.Tensor": self._slice,
             "split.Tensor": self._split,
