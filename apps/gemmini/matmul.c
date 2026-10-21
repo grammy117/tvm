@@ -162,6 +162,12 @@ void tvm_gemmini_end(void) {
   asm volatile("fence rw,rw" ::: "memory");
 }
 
+int32_t tvm_gemmini_validate_tensor_output(void* c, int64_t c_bytes) {
+  if (!c || c_bytes <= 0 || (uintptr_t)c % _Alignof(acc_t)) return -1;
+  if ((uint64_t)c_bytes > UINTPTR_MAX - (uintptr_t)c) return -2;
+  return 0;
+}
+
 int32_t tvm_gemmini_validate_tensor_buffers(const void* a, int64_t a_bytes, const void* b, int64_t b_bytes,
                                           void* c, int64_t c_bytes) {
   if (!a || !b || !c || a_bytes <= 0 || b_bytes <= 0 || c_bytes <= 0 ||

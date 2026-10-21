@@ -527,7 +527,7 @@ def lower_tensorir_schedule(
     )
     inputs = [(buffer, size) for buffer, size in zip(buffers, sizes) if buffer.data not in written]
     outputs = [(buffer, size) for buffer, size in zip(buffers, sizes) if buffer.data in written]
-    if not inputs or not outputs:
+    if not outputs:
         raise ValueError("TensorIR admission could not establish input/output ownership")
     failure = tir.SeqStmt(
         [
@@ -553,17 +553,30 @@ def lower_tensorir_schedule(
         ]
     )
     for output, output_bytes in outputs:
-        for source, source_bytes in inputs:
-            status = tir.Var("gemmini_admission", "int32")
-            arguments = [
+        checks = [
+            tir.call_extern(
+                "int32",
+                "tvm_gemmini_validate_tensor_buffers",
                 source.data,
                 tir.IntImm("int64", source_bytes),
                 source.data,
                 tir.IntImm("int64", source_bytes),
                 output.data,
                 tir.IntImm("int64", output_bytes),
-            ]
-            admission = tir.call_extern("int32", "tvm_gemmini_validate_tensor_buffers", *arguments)
+            )
+            for source, source_bytes in inputs
+        ]
+        if not inputs:
+            checks.append(
+                tir.call_extern(
+                    "int32",
+                    "tvm_gemmini_validate_tensor_output",
+                    output.data,
+                    tir.IntImm("int64", output_bytes),
+                )
+            )
+        for admission in checks:
+            status = tir.Var("gemmini_admission", "int32")
             body = tir.LetStmt(status, admission, tir.IfThenElse(status != 0, failure, body))
     # Keep the ordinary TensorIR root for stock Relax analyses, including
     # RewriteDataflowReshape on single-input/single-output functions. Admission

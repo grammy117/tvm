@@ -123,6 +123,11 @@ unsigned emulator_faults(void) { return faults; }
 unsigned emulator_commands(void) { return commands; }
 unsigned emulator_fences(void) { return fences; }
 unsigned emulator_pending(void) { return count; }
+int32_t tvm_gemmini_validate_tensor_output(void* c,int64_t cz) {
+  if(!c || cz<=0 || (uintptr_t)c % _Alignof(int32_t))return -1;
+  if((uint64_t)cz>UINTPTR_MAX-(uintptr_t)c)return -2;
+  return 0;
+}
 int32_t tvm_gemmini_validate_tensor_buffers(const void* a,int64_t az,const void* b,int64_t bz,void* c,int64_t cz) {
   if(!a || !b || !c || az<=0 || bz<=0 || cz<=0) return -1;
   uintptr_t aa=(uintptr_t)a,bb=(uintptr_t)b,cc=(uintptr_t)c;

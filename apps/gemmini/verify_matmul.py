@@ -44,6 +44,7 @@ PUBLIC_SYMBOLS = (
     "tvm_gemmini_load_a", "tvm_gemmini_load_b", "tvm_gemmini_compute", "tvm_gemmini_store", "tvm_gemmini_end",
     "tvm_gemmini_zero_acc", "tvm_gemmini_dma_a", "tvm_gemmini_dma_b", "tvm_gemmini_dma_out",
     "tvm_gemmini_validate_tensor_buffers",
+    "tvm_gemmini_validate_tensor_output",
 )
 
 
