@@ -413,10 +413,30 @@ def schedule_contraction(
                     sch.compute_inline(upstream)
                 except tir.schedule.ScheduleError:
                     pass
-    for consumer in sch.get_consumers(write):
+    pending, placed = list(sch.get_consumers(write)), set()
+
+    def inside_tile(producer):
+        return any(sch.get(loop).same_as(sch.get(outer)) for loop in sch.get_loops(producer))
+
+    while pending:
+        consumer = pending.pop(0)
+        name = sch.get(consumer).name_hint
+        if name in placed:
+            continue
+        # A fused epilogue can have independent pointwise producers, such as
+        # widening a narrow bias. Inline those ordinary expressions before
+        # moving the consumer; keep non-inlineable CPU reductions outside.
+        for producer in list(sch.get_producers(consumer)):
+            if not inside_tile(producer):
+                try:
+                    sch.compute_inline(producer)
+                except tir.schedule.ScheduleError:
+                    pass
+        if not all(inside_tile(producer) for producer in sch.get_producers(consumer)):
+            continue
         sch.reverse_compute_at(consumer, outer, preserve_unit_loops=True)
-        for downstream in sch.get_consumers(consumer):
-            sch.reverse_compute_at(downstream, outer, preserve_unit_loops=True)
+        placed.add(name)
+        pending.extend(sch.get_consumers(consumer))
     init = sch.decompose_reduction(block, ko)
     bias_intrinsic = None
     if biased:

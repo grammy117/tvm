@@ -213,7 +213,7 @@ the physical words preserve NaN payloads, signed zero, infinities and subnormals
 Runtime scalar FP32 fills and indexed repeat/copy layouts use the same typed
 copy rules. This adds data movement, not floating accelerator arithmetic.
 
-## Full requested operator inventory — completion audit pending
+## Full requested operator inventory — final target audit pending
 
 The following 51 operator spellings retain the user's full requested scope.
 Statuses here are development state, not a completed hardware-support table.
@@ -222,7 +222,7 @@ Statuses here are development state, not a completed hardware-support table.
 | --- | --- | --- |
 | Matrix | `mm`, `bmm` | Direct ATen import preserves the captured dtype. INT8 products use a proven wider sum and explicit output conversion, with native array scheduling where legal. INT32/INT64 input arithmetic retains exact modular CPU reductions. Integer reduction extents require static admission; general floating matmul remains CPU work |
 | Biased matrix | `addmm` | Eligible mathematical INT8-to-INT32 products with INT32 tensor bias use native accumulator preload. Direct ATen addmm preserves its dtype, alpha/beta, broadcasting and wrapping; INT8 results can use an array contraction followed by CPU casts/bias. Direct ATen INT8 bias is not thereby claimed to be preloaded |
-| Convolution | `convolution`, `convolution_backward` | Exact INT8/INT32 sliding-window contraction scheduling implemented; generic FP training gradients do not fit this numeric unit. Frontend/decomposition and grouped/transpose admission audit remains pending |
+| Convolution | `convolution`, `convolution_backward` | Direct and named forward one/two/three-dimensional imports preserve admitted dtype, groups, strides, dilation, transpose and output padding. Bounded INT8 products use native array contractions with explicit output conversion. Full-width INT32/INT64 modulo math remains CPU work. FP32/FP64 gradients compose the stock Relax 2D adjoint where available and ordinary TE contractions otherwise; their floating arithmetic remains CPU work. Static shape, tensor-return and source dtype restrictions are detailed below |
 | Arithmetic | `add.Tensor`, `sub.Tensor`, `add.Scalar`, `sub.Scalar`, `mul.Scalar`, `div.Scalar`, `neg`, `relu` | Direct arithmetic import preserves scalar promotion, alpha and explicit wrapping. Unit-alpha INT32 tensor/scalar addition uses native accumulator loads/readout; general scale/subtract/negate and wider arithmetic stay on CPU. INT8 ReLU uses exact widen/readout tile intrinsics. Exact FP16 add/sub with alpha outside +/-1 is explicitly unqualified because the pinned CPU reference rounds vector and scalar-tail intermediates differently |
 | Reduction | `mean.dim`, `mean.default`, `sum.dim_IntList` | Bounded signed INT8 sums use INT32 array accumulation, including exact INT64 results with CPU widening. The original CPU conversion/division can follow a sum. Ordinary floating reductions and floating-input means retain CPU work; wider frontend and rounding audit remains required |
 | Pooling | `avg_pool1d`, `avg_pool2d`, `avg_pool3d`, `adaptive_avg_pool1d`, `_adaptive_avg_pool2d`, `_adaptive_avg_pool3d` | Admitted batched/unbatched frontend forms preserve padding, ceil-window, divisor and dtype contracts. Ordinary floating averaging remains CPU arithmetic; legal FP32 padding copies may use DMA. INT64 regular pooling uses modulo-sum/truncating-division mathematics on CPU. Bounded Spike/RTL fixtures cover regular/adaptive pooling in all three dimensions; host tests also exercise underscore aliases. This is not a claim of native average arithmetic |
@@ -914,3 +914,73 @@ fallback. `convolution-adjoint-framework-v1.json` separately tests reuse of the
 stock Relax 2D adjoint: its four ordinary/grouped non-dilated cases pass, while
 all four dilated cases fail. Convolution admission and generic framework
 fidelity are the next required work; this milestone does not complete the goal.
+
+The following convolution work repairs that audit for the admitted contracts.
+The importer preserves the captured output dtype for both direct `convolution`
+and named one/two/three-dimensional forms. INT8 products have a type-derived
+prefix bound and use a wider mathematical accumulator followed by explicit
+output conversion. Bias is included in that bound. INT32/INT64 convolution uses
+overflow-free limb mathematics and explicit modulo reductions, including
+transpose and bias; independent unbounded integer oracles verify full-range
+values. FP16 forward computes in FP32 and restores FP16, while FP32/FP64 retain
+their types. These are mathematical frontend definitions, not device selection.
+
+Transpose import uses IOX weights and the actual output-padding/group/dilation
+argument positions. Ordinary Relax transpose operators are retained where their
+contracts apply. Generic TOPI now supplies a guarded NCX/IOX transpose for
+dilation; the 3D frontend and valid ATen output-padding cases outside the current
+Relax operator's narrower admission use the same unscheduled mathematics. A
+real-tap gather avoids multiplying fictitious zero kernel taps by NaNs. The
+Relax 2D adjoint's output-padding calculation includes the dilated kernel span.
+Independent scatter and Jacobian checks cover both dtypes, groups, asymmetric
+padding, strides and dilation, including zero outputs at uncovered positions.
+
+FP32/FP64 normal 1D gradients lift their height axis and reuse the stock 2D
+adjoint; normal 2D gradients use it directly. Other admitted gradients use
+unscheduled batch/spatial contractions, with normal Relax sums for bias.
+Output masks avoid emitting unused tensor gradients. Empty batches produce
+zero weight/bias gradients. Integer gradients are not source CPU operations;
+FP16 backward is explicitly unqualified because the pinned CPU build reports
+an unsupported DNNL backward path. This is a source qualification boundary,
+not a claim that floating gradients fit the integer array. Dynamic adjoints,
+complex/BF16 contracts and None-valued static-export returns remain outside
+this admission.
+
+Scheduling also handles independent epilogue producers. Standard `compute_inline`
+can fold a narrow bias's widening expression before `reverse_compute_at` places
+the CPU epilogue near the native readout. Placement walks the consumer chain,
+retaining non-inlineable CPU producers outside the tile instead of rejecting
+the contraction. Tails, independent bias, reduction-produced bias, delayed DMA
+and Python/JSON trace replay are checked independently of convolution names.
+ATen INT8 bias is not thereby claimed to use accumulator preload or saturating
+readout. All these placement choices are explicit TVM schedule instructions.
+
+`unit-convolution-full-pinned-v1.log` passes all 879 collected checks against
+the unchanged immutable `compiler-core-v10` libraries. It includes 146 new
+frontend contracts, three backend tests with multiple contracts, 41 independent
+transpose/adjoint checks and five refreshed existing frontend tests. The
+separate generic convolution regression passes 124 checks; the added NaN case
+is included in the broader run. `convolution-next-audit-v3.json` passes all 72
+source-supported cases in the original 108-case screen. The preceding v2
+audit's twelve tuple-return errors were in its result-flattening harness;
+they are not importer failures. Actual source CPU gaps, including some integer
+transpose/dilated and FP16 backward paths, remain explicitly distinguished.
+
+`device-convolution-native-v1` and `device-convolution-cpu-v1` pass eleven
+fixture executions on Spike and the pinned RTL, with wrong-oracle controls.
+The native cases require actual array compute for direct INT8 1D/2D/3D
+convolutions with bias and preserved INT8 output. Full-width integer convolution
+and transpose, plus normal/transposed 3D gradients with all three tensor outputs,
+require CPU arithmetic and zero device commands. Small contraction, split and
+INT64-sum regressions remain included. Positive RTL runs take approximately 30
+and 50 seconds within the 60-second/300,000-cycle bounds. The adapter and compiler
+libraries are unchanged; instruction audits reject hardware loops. These runs
+provide functional evidence without performance labels.
+
+The separate `requested-operators-audit-v1.json` passes all 51 requested
+spellings through actual ATen import, preparation, static export and delayed-DMA
+execution at explicit small shape/dtype contracts. It records the exact source
+operators and distinguishes native arithmetic, native movement beside CPU math,
+pure CPU work and folded/metadata-only results. That audit is not target
+qualification: final coverage-wide source freeze, all-operator bounded target
+checks and the final capability/limitation inventory remain required.

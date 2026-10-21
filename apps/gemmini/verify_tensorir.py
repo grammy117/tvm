@@ -90,6 +90,78 @@ def fixtures():
     from tvm import relax, te, topi
 
     result = []
+    for kind in (
+        "native1d",
+        "native2d",
+        "native3d",
+        "wide",
+        "transpose_wide",
+        "backward",
+        "transpose_backward",
+    ):
+        import torch
+        from tvm.relax.frontend.torch import from_exported_program
+
+        native = kind.startswith("native")
+        backward = "backward" in kind
+        transpose = kind.startswith("transpose")
+        dim = int(kind[-2]) if native else 3 if backward else 2
+        dtype = "int8" if native else "float32" if backward else "int64"
+
+        class Convolution(torch.nn.Module):
+            def forward(self, x, w, bias, g):
+                if backward:
+                    return torch.ops.aten.convolution_backward.default(
+                        g,
+                        x,
+                        w,
+                        [g.shape[1]],
+                        [1] * dim,
+                        [0] * dim,
+                        [1] * dim,
+                        transpose,
+                        [0] * dim,
+                        1,
+                        [True, True, True],
+                    )
+                return torch.ops.aten.convolution.default(
+                    x,
+                    w,
+                    bias,
+                    [1] * dim,
+                    [0] * dim,
+                    [1] * dim,
+                    transpose,
+                    [0] * dim,
+                    1,
+                )
+
+        spatial = (2,) * (dim - 1) + (3,)
+        shape = (1, 1) + spatial
+        w_shape = (1, 2) + (2,) * dim if transpose else (2, 1) + (2,) * dim
+        values = (np.arange(np.prod(shape)).reshape(shape) * 37 - 128).astype(dtype)
+        weights = (np.arange(np.prod(w_shape)).reshape(w_shape) * 29 - 128).astype(dtype)
+        if dtype == "int64":
+            seed = np.array([-(1 << 63), (1 << 63) - 1, -17, 33], "int64")
+            values, weights = np.resize(seed, shape), np.resize(seed[::-1], w_shape)
+        elif backward:
+            values = (np.arange(np.prod(shape)).reshape(shape) % 13 - 7).astype(dtype)
+            weights = (np.arange(np.prod(w_shape)).reshape(w_shape) % 7 - 4).astype(dtype)
+        bias = np.array([-17, 23], dtype)
+        op = getattr(torch.nn.functional, f"conv{'_transpose' if transpose else ''}{dim}d")
+        expected_forward = op(torch.from_numpy(values), torch.from_numpy(weights))
+        g = (np.arange(expected_forward.numel()).reshape(expected_forward.shape) % 11 - 6).astype(
+            dtype
+        )
+        arrays = [values, weights, bias, g]
+        model = Convolution()
+        args = tuple(torch.from_numpy(array) for array in arrays)
+        expected = model(*args)
+        expected = tuple(value.numpy() for value in expected) if backward else expected.numpy()
+        mod = from_exported_program(torch.export.export(model, args), unwrap_unit_return_tuple=True)
+        result.append(
+            (f"convolution_{kind}", mod, arrays, expected, "gemmini" if native else "host")
+        )
     for kind in ("average", "override", "adaptive", "integer", "holes", "col2im", "boolean"):
         import torch
         from tvm.relax.frontend.torch import from_exported_program
@@ -1075,6 +1147,10 @@ def prepare(args):
         "python/tvm/relax/frontend/torch/_numeric.py",
         "python/tvm/relax/frontend/torch/_pooling.py",
         "python/tvm/relax/frontend/torch/_overlap.py",
+        "python/tvm/relax/frontend/torch/_convolution.py",
+        "python/tvm/relax/op/_op_gradient.py",
+        "python/tvm/topi/nn/__init__.py",
+        "python/tvm/topi/nn/conv_transpose.py",
         *[
             "python/tvm/relax/backend/contrib/" + name + ".py"
             for name in (
@@ -1337,6 +1413,18 @@ def main():
                     "holes",
                     "col2im",
                     "boolean",
+                )
+            ],
+            *[
+                "convolution_" + kind
+                for kind in (
+                    "native1d",
+                    "native2d",
+                    "native3d",
+                    "wide",
+                    "transpose_wide",
+                    "backward",
+                    "transpose_backward",
                 )
             ],
         ],
