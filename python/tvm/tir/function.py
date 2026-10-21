@@ -279,7 +279,7 @@ class IndexMap(Object):
 
             The function to map from source indices to target indices.
             The function should accept `tir.Var` parameters and return
-            a either a `tir.PrimExpr`, or a list of `tir.PrimExpr`.
+            a `tir.PrimExpr`, a Python integer, or a list of these values.
             Returning a `tir.PrimExpr` is equivalent to returning a
             list of length 1 containing that `tir.PrimExpr`.
 
@@ -334,8 +334,8 @@ class IndexMap(Object):
 
             The function to map from source indices to target indices.
             The function should accept tir.Var parameters and return
-            either a `tir.PrimExpr` or a list.  Each element of the
-            returned list should be either a `tir.PrimExpr` or the
+            either a `tir.PrimExpr`, a Python integer, or a list. Each element of the
+            returned list should be a `tir.PrimExpr`, a Python integer, or the
             object `IndexMap.AXIS_SEPARATOR`.  Returning a
             `tir.PrimExpr` is equivalent to returning a list of length
             1 containing that `tir.PrimExpr`.
@@ -416,16 +416,18 @@ class IndexMap(Object):
             for val in mapping:
                 if isinstance(val, tvm.ir.PrimExpr):
                     final_indices.append(val)
+                elif isinstance(val, int):
+                    final_indices.append(tvm.tir.const(val, index_dtype))
                 elif val is IndexMap.AXIS_SEPARATOR:
                     axis_separators.append(len(final_indices))
                 else:
                     raise TypeError(
                         "Expected mapping function to return list of "
-                        "either tvm.ir.PrimExpr or IndexMap.AXIS_SEPARATOR.  "
+                        "tvm.ir.PrimExpr, Python integers or IndexMap.AXIS_SEPARATOR.  "
                         f"Instead received {val} of type {type(val)}."
                     )
         else:
-            final_indices.append(mapping)
+            final_indices.append(tvm.tir.const(mapping, index_dtype) if isinstance(mapping, int) else mapping)
 
         return IndexMap(initial_indices, final_indices, inverse_index_map), axis_separators
 

@@ -272,5 +272,19 @@ def test_map_ndarray():
     np.testing.assert_equal(inverse_map.map_ndarray(index_map.map_ndarray(arr)).numpy(), inp)
 
 
+@pytest.mark.parametrize("dtype", ["int32", "int64"])
+def test_python_integer_literals_preserve_index_dtype(dtype):
+    index_map = IndexMap.from_func(lambda i: (0, i, -1), index_dtype=dtype)
+    expected = IndexMap.from_func(
+        lambda i: (tvm.tir.const(0, dtype), i, tvm.tir.const(-1, dtype)), index_dtype=dtype
+    )
+    tvm.ir.assert_structural_equal(index_map, expected)
+    values = index_map.map_indices([tvm.tir.const(7, dtype)])
+    assert [int(value) for value in values] == [0, 7, -1]
+    assert all(value.dtype == dtype for value in values)
+    scalar = IndexMap.from_func(lambda i: 0, index_dtype=dtype)
+    assert scalar.final_indices[0].dtype == dtype
+
+
 if __name__ == "__main__":
     tvm.testing.main()
