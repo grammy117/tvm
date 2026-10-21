@@ -25,6 +25,7 @@ not hardware timing, model quality, or coverage of unimplemented operators.
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -33,6 +34,27 @@ import time
 
 from verify_baremetal_cpu import STARTUP, LINKER, identity
 from verify_matmul import audit_instructions
+
+
+TIMING_GUEST = r"""
+static inline uint64_t dse_cycles(void) {
+  uint64_t value;
+  asm volatile("fence rw,rw; csrr %0,cycle" : "=r"(value) :: "memory");
+  return value;
+}
+static char* dse_u64(char* out,uint64_t value) {
+  char text[24]; unsigned used=0;
+  do { text[used++]=(char)('0'+value%10); value/=10; } while(value);
+  for(unsigned i=0;i<used/2;++i) {char a=text[i];text[i]=text[used-i-1];text[used-i-1]=a;}
+  for(unsigned i=0;i<used;++i)*out++=text[i];return out;
+}
+static void dse_sample(unsigned stage,unsigned sample,uint64_t cycles) {
+  char line[128];char* out=line;const char* text="DSE_CYCLES stage=";
+  while(*text)*out++=*text++;out=dse_u64(out,stage);text=" sample=";
+  while(*text)*out++=*text++;out=dse_u64(out,sample);text=" cycles=";
+  while(*text)*out++=*text++;out=dse_u64(out,cycles);*out++='\n';*out=0;puts_htif(line);
+}
+"""
 
 
 GUEST = r"""
@@ -894,9 +916,17 @@ def fixtures():
     return result
 
 
-def fixture_guest(index, arrays, expected, workspace, operation, placement="gemmini"):
+def fixture_guest(
+    index, arrays, expected, workspace, operation, placement="gemmini", *,
+    timing_repeats=0, rtol=0.0, atol=0.0,
+):
     """Check every flat output independently, including tuples and host-only cases."""
     import numpy as np
+
+    if type(timing_repeats) is not int or not 0 <= timing_repeats <= 10:
+        raise ValueError("Timing repeats must be an integer in [0,10]")
+    if any(not math.isfinite(value) or value < 0 for value in (rtol, atol)):
+        raise ValueError("Comparison tolerances must be finite and nonnegative")
 
     def flatten(value):
         if isinstance(value, (tuple, list)):
@@ -930,7 +960,10 @@ def fixture_guest(index, arrays, expected, workspace, operation, placement="gemm
         guest.append(
             f"static struct {{ uint8_t head[64]; {ctype} data[{array.size}]; uint8_t tail[64]; }} out_{index}_{number} __attribute__((aligned(64)));"
         )
-    guest.append(f"static uint8_t work_{index}[{max(workspace, 1)}] __attribute__((aligned(64)));")
+    guest.append(
+        f"static struct {{uint8_t head[64]; uint8_t data[{max(workspace, 1)}]; uint8_t tail[64];}} "
+        f"work_{index} __attribute__((aligned(64)));"
+    )
     pointers = ",".join(f"in_{index}_{arg}" for arg in range(len(arrays)))
     results = ",".join(f"out_{index}_{number}.data" for number in range(len(outputs)))
     checks.extend(
@@ -943,6 +976,7 @@ def fixture_guest(index, arrays, expected, workspace, operation, placement="gemm
     )
     for number in range(len(outputs)):
         checks.append(f"memset(&out_{index}_{number},0x6d,sizeof(out_{index}_{number}));")
+    checks.append(f"memset(&work_{index},0x6d,sizeof(work_{index}));")
     for arg in range(len(arrays)):
         checks.append(
             f"uint64_t hash_{index}_{arg}=hash(in_{index}_{arg},sizeof(in_{index}_{arg}));"
@@ -963,25 +997,49 @@ def fixture_guest(index, arrays, expected, workspace, operation, placement="gemm
         primitive_check += f"if(computes!=before_{index})return 21;"
     checks.extend(
         [
-            f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index},{workspace})) return 20;",
+            f"if(stage_{index}_model_run(inputs_{index},outputs_{index},work_{index}.data,{workspace})) return 20;",
             primitive_check,
         ]
     )
+    validation = []
     for number, array in enumerate(outputs):
-        checks.append(
-            f'for(unsigned i=0;i<{array.size};++i)if((uint64_t)(int64_t)out_{index}_{number}.data[i]!=((uint64_t)(int64_t)expected_{index}_{number}[i]^BAD_ORACLE)){{puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}'
-        )
-        checks.append(
+        if array.dtype == np.float32 and (rtol or atol):
+            validation.append(
+                f"for(unsigned i=0;i<{array.size};++i){{"
+                f"union {{uint32_t u;float f;}} actual={{.u=out_{index}_{number}.data[i]}};"
+                f"union {{uint32_t u;float f;}} expected={{.u=expected_{index}_{number}[i]^(BAD_ORACLE?UINT32_C(0x40000000):0)}};"
+                f"float tolerance={float(atol).hex()}f+{float(rtol).hex()}f*(expected.f<0?-expected.f:expected.f);"
+                'if(!(actual.f>=expected.f-tolerance && actual.f<=expected.f+tolerance)){puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}'
+            )
+        else:
+            validation.append(
+                f'for(unsigned i=0;i<{array.size};++i)if((uint64_t)(int64_t)out_{index}_{number}.data[i]!=((uint64_t)(int64_t)expected_{index}_{number}[i]^BAD_ORACLE)){{puts_htif("TENSORIR_NUMERICAL_FAILURE\\n");return 22;}}'
+            )
+        validation.append(
             f"for(unsigned i=0;i<64;++i)if(out_{index}_{number}.head[i]!=0x6d || out_{index}_{number}.tail[i]!=0x6d)return 23;"
         )
     for arg in range(len(arrays)):
-        checks.append(
+        validation.append(
             f"if(hash_{index}_{arg}!=hash(in_{index}_{arg},sizeof(in_{index}_{arg})))return 24;"
         )
+    validation.append(
+        f"for(unsigned i=0;i<64;++i)if(work_{index}.head[i]!=0x6d || work_{index}.tail[i]!=0x6d)return 23;"
+    )
+    checks.extend(validation)
+    if timing_repeats:
+        checks.append(f"uint64_t cycle_samples_{index}[{timing_repeats}];")
+        checks.append(f"for(unsigned repeat=0;repeat<{timing_repeats};++repeat){{")
+        checks.append("uint64_t cycle_begin=dse_cycles();")
+        checks.append(f"int status=stage_{index}_model_run(inputs_{index},outputs_{index},work_{index}.data,{workspace});")
+        checks.append(f"cycle_samples_{index}[repeat]=dse_cycles()-cycle_begin;")
+        checks.append("if(status)return 20;")
+        checks.extend(validation)
+        checks.append("}")
+        checks.append(f"for(unsigned repeat=0;repeat<{timing_repeats};++repeat)dse_sample({index},repeat,cycle_samples_{index}[repeat]);")
     return guest, checks
 
 
-def prepare(args):
+def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
     from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
     from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
     from baremetal import export_graphs
@@ -997,25 +1055,39 @@ def prepare(args):
     adapter_object = adapter_path.parent / "matmul.o"
     if identity(adapter_object)["sha256"] != adapter["object_sha256"]:
         raise ValueError("Adapter object changed")
-    cases = [case for case in fixtures() if case[0] in args.cases]
+    available = fixtures() if cases is None else cases
+    cases = [case for case in available if case[0] in args.cases]
     if len(cases) != len(set(args.cases)) or not cases:
         raise ValueError("Unknown or empty verification case selection")
     modules, reports = {}, {}
     for case in cases:
         name, mod = case[:2]
         placement = case[4] if len(case) > 4 else "gemmini"
-        report = []
-        options = {"col_tiles": 2, "reduction_chunk": 8} if name == "reuse" else None
-        modules[name] = prepare_gemmini_graph(
-            mod, report=report, schedule_options=options, **(case[5] if len(case) > 5 else {})
-        )
+        if prepared_reports is None:
+            report = []
+            options = {"col_tiles": 2, "reduction_chunk": 8} if name == "reuse" else None
+            modules[name] = prepare_gemmini_graph(
+                mod, report=report, schedule_options=options, **(case[5] if len(case) > 5 else {})
+            )
+        else:
+            modules[name], report = mod, prepared_reports[name]
         expected_functions = case[6] if len(case) > 6 else (0 if placement == "host" else 1)
         if sum(row["placement"] == "gemmini" for row in report) != expected_functions:
             raise ValueError("Fixture did not use the structural accelerator rule: " + name)
         reports[name] = report
     package = out / "package"
     manifest = export_graphs(modules, package, memory_limit_bytes=16 << 20)
-    guest = [GUEST, '#include "package/model.h"']
+    timing_repeats = getattr(args, "timing_repeats", 0)
+    rtol, atol = getattr(args, "rtol", 0.0), getattr(args, "atol", 0.0)
+    guest = [GUEST]
+    if getattr(args, "libm", False):
+        # Newlib exposes errno through this documented ABI. This guest runs
+        # one hart without threads; no libc I/O, allocator or syscall stubs are
+        # supplied. The selected libm implements all floating arithmetic.
+        guest.append("#include <errno.h>\nstatic int guest_errno;\nint* __errno(void){return &guest_errno;}\n")
+    if timing_repeats:
+        guest.append(TIMING_GUEST)
+    guest.append('#include "package/model.h"')
     checks = [
         "extern int32_t tvm_gemmini_validate_tensor_output(void*,int64_t);",
         "uint32_t admission_probe=0;",
@@ -1044,6 +1116,9 @@ def prepare(args):
             manifest["stages"][name]["workspace_bytes"],
             operation,
             placement,
+            timing_repeats=timing_repeats,
+            rtol=rtol,
+            atol=atol,
         )
         guest.extend(declarations)
         checks.append(f'puts_htif("TENSORIR_CASE {name}\\n");')
@@ -1051,7 +1126,7 @@ def prepare(args):
     guest.append(
         "int main(void){\n"
         + "\n".join(checks)
-        + f'\nputs_htif("TENSORIR_PASS cases={len(cases)} exact=1 guards=1 primitives=1\\n");return 0;}}\n'
+        + f'\nputs_htif("TENSORIR_PASS cases={len(cases)} exact={int(not (rtol or atol))} guards=1 primitives=1\\n");return 0;}}\n'
     )
     (out / "runner.c").write_text("\n".join(guest))
     (out / "start.S").write_text(STARTUP)
@@ -1083,6 +1158,12 @@ def prepare(args):
         "-I" + str(out),
     ]
     sources = [out / "start.S", out / "runner.c", package / "runtime.c", package / "constants.S"]
+    math_libraries = []
+    if getattr(args, "libm", False):
+        for name in ("libm.a", "libgcc.a"):
+            path = Path(subprocess.check_output([str(gcc), "-march=rv64gc", "-mabi=lp64d",
+                                                "-print-file-name=" + name], text=True).strip())
+            math_libraries.append(path.resolve(strict=True))
     for name in modules:
         sources.extend([package / name / "model.c", package / name / "operators.o"])
     policy = adapter["instruction_policy"]
@@ -1098,6 +1179,7 @@ def prepare(args):
             "-DBAD_ORACLE=" + str(wrong),
             *map(str, sources),
             str(adapter_object),
+            *map(str, math_libraries),
             "-o",
             str(elf),
         ]
@@ -1118,6 +1200,8 @@ def prepare(args):
         elfs[label] = dict(identity(elf), instruction_audit=audit)
     source = app.parents[1]
     bindings = [identity(adapter_path), identity(adapter_object), identity(gcc)]
+    bindings.extend(identity(path) for path in math_libraries)
+    bindings.extend(identity(path) for path in additional_bindings)
     from tvm._ffi.base import _LIB  # pylint: disable=import-outside-toplevel
 
     bindings.append(identity(_LIB._name))
@@ -1150,6 +1234,7 @@ def prepare(args):
         "python/tvm/relax/frontend/torch/exported_program_translator.py",
         "python/tvm/relax/frontend/torch/base_fx_graph_translator.py",
         "python/tvm/relax/frontend/torch/_numeric.py",
+        "python/tvm/relax/frontend/torch/_quantization.py",
         "python/tvm/relax/frontend/torch/_pooling.py",
         "python/tvm/relax/frontend/torch/_overlap.py",
         "python/tvm/relax/frontend/torch/_convolution.py",
@@ -1169,6 +1254,7 @@ def prepare(args):
                 "gemmini_reduction",
                 "gemmini_bias",
                 "gemmini_regions",
+                "gemmini_dse",
             )
         ],
     ):
@@ -1182,6 +1268,8 @@ def prepare(args):
         "commands": commands,
         "bindings": bindings,
         "case_count": len(cases),
+        "timing_repeats": timing_repeats,
+        "comparison": {"rtol": rtol, "atol": atol, "integer": "exact"},
         "cases": [case[0] for case in cases],
         "placements": {case[0]: case[4] if len(case) > 4 else "gemmini" for case in cases},
         "preparation_options": {case[0]: case[5] if len(case) > 5 else {} for case in cases},
@@ -1191,7 +1279,7 @@ def prepare(args):
     print(json.dumps({"status": "prepared", "bundle": str(out / "bundle.json")}))
 
 
-def classify_output(backend, text, returncode, timed_out, negative=False, expected_cases=4):
+def classify_output(backend, text, returncode, timed_out, negative=False, expected_cases=4, exact=True):
     """Require guest evidence and exact decoded exit status, including RTL padding."""
     if timed_out:
         return False
@@ -1207,9 +1295,33 @@ def classify_output(backend, text, returncode, timed_out, negative=False, expect
                         codes.append(int(value))
             decoded = returncode == 255 and codes == [22]
         return decoded and "TENSORIR_NUMERICAL_FAILURE" in text
-    marker = f"TENSORIR_PASS cases={expected_cases} exact=1 guards=1 primitives=1"
+    marker = f"TENSORIR_PASS cases={expected_cases} exact={int(exact)} guards=1 primitives=1"
     passed = returncode == 0 and marker in text.splitlines()
     return passed and (backend == "spike" or "Verilog $finish" in text)
+
+
+def parse_cycle_samples(text, *, case_count, repeats, cycle_limit=None):
+    """Require every expected guest interval, without interpreting host wall time."""
+    samples = {}
+    for line in text.splitlines():
+        if not line.startswith("DSE_CYCLES "):
+            continue
+        fields = dict(field.split("=", 1) for field in line.split()[1:])
+        if set(fields) != {"stage", "sample", "cycles"}:
+            raise ValueError("Malformed guest cycle sample")
+        try:
+            stage, sample, cycles = (int(fields[key]) for key in ("stage", "sample", "cycles"))
+        except ValueError as error:
+            raise ValueError("Noninteger guest cycle sample") from error
+        key = stage, sample
+        if key in samples or not 0 <= stage < case_count or not 0 <= sample < repeats:
+            raise ValueError("Duplicate or unexpected guest cycle sample")
+        if cycles <= 0 or (cycle_limit is not None and cycles > cycle_limit):
+            raise ValueError("Invalid guest cycle interval")
+        samples[key] = cycles
+    if len(samples) != case_count * repeats:
+        raise ValueError("Missing guest cycle samples")
+    return [[samples[(stage, sample)] for sample in range(repeats)] for stage in range(case_count)]
 
 
 def run(args):
@@ -1279,8 +1391,29 @@ def run(args):
             code = child.wait()
     text = (out / (args.name + ".log")).read_text(errors="replace")
     passed = classify_output(
-        args.backend, text, code, timed_out, args.negative, bundle["case_count"]
+        args.backend, text, code, timed_out, args.negative, bundle["case_count"],
+        exact=not any(bundle.get("comparison", {}).get(key, 0) for key in ("rtol", "atol")),
     )
+    timing = None
+    timing_error = None
+    repeats = bundle.get("timing_repeats", 0)
+    if passed and not args.negative and repeats:
+        try:
+            samples = parse_cycle_samples(
+                text, case_count=bundle["case_count"], repeats=repeats,
+                cycle_limit=args.cycles if args.backend == "verilator" else None,
+            )
+            timing = {
+                "metric": "target_cycles" if args.backend == "verilator" else "functional_counter",
+                "usable_for_dse": args.backend == "verilator",
+                "scope": "selected_rtl_magic_memory_model" if args.backend == "verilator" else "spike_functional_only",
+                "samples_by_stage": samples,
+                "warmups": 1,
+                "cache_policy": "same buffers after one warmup; no inter-repeat cache flush",
+                "interval": "model_run including admission and completion; excludes startup, oracle and HTIF",
+            }
+        except ValueError as error:
+            passed, timing_error = False, str(error)
     record = {
         "status": "passed" if passed else "failed_or_incomplete",
         "backend": args.backend,
@@ -1295,6 +1428,8 @@ def run(args):
         "log": identity(out / (args.name + ".log")),
         "functional_only": True,
         "performance_qualified": False,
+        "timing": timing,
+        "timing_error": timing_error,
     }
     result.write_text(json.dumps(record, indent=2) + "\n")
     print(json.dumps({"status": record["status"], "receipt": str(result)}))
@@ -1311,6 +1446,10 @@ def main():
     build.add_argument("--output-dir", type=Path, required=True)
     build.add_argument("--adapter-receipt", type=Path, required=True)
     build.add_argument("--riscv-gcc", type=Path, required=True)
+    build.add_argument("--timing-repeats", type=int, default=0)
+    build.add_argument("--rtol", type=float, default=0.0)
+    build.add_argument("--atol", type=float, default=0.0)
+    build.add_argument("--libm", action="store_true", help="Bind and link the selected GCC math libraries")
     build.add_argument(
         "--cases",
         nargs="+",
