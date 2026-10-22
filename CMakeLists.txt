@@ -55,6 +55,7 @@ tvm_option(USE_HEXAGON_EXTERNAL_LIBS "Path to git repo containing external Hexag
 tvm_option(USE_RPC "Build with RPC" ON)
 tvm_option(USE_THREADS "Build with thread support" ON)
 tvm_option(USE_LLVM "Build with LLVM, can be set to specific llvm-config path" OFF)
+tvm_option(USE_HOST_ONLY_AUTO_COPY_GUARD "Validate and reject auto_copy in host-only builds without automatic copy lowering" OFF)
 tvm_option(USE_MLIR "Build with MLIR support" OFF)
 tvm_option(USE_STACKVM_RUNTIME "Include stackvm into the runtime" OFF)
 tvm_option(USE_GRAPH_EXECUTOR "Build with tiny graph executor" ON)
@@ -334,6 +335,12 @@ tvm_file_glob(GLOB CODEGEN_SRCS
     )
 
 list(APPEND COMPILER_SRCS ${CODEGEN_SRCS})
+
+# Opt-in supported subset for checkouts without automatic copy lowering. Enabling
+# this alongside the normal implementation intentionally produces duplicate symbols.
+if(USE_HOST_ONLY_AUTO_COPY_GUARD)
+  list(APPEND COMPILER_SRCS "apps/gemmini/auto_copy_guard.cc")
+endif()
 
 tvm_file_glob(GLOB_RECURSE RELAY_OP_SRCS
     src/relay/op/*.cc
