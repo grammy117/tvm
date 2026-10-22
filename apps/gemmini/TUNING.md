@@ -188,6 +188,9 @@ Cycle and wall-time caps bound simulator use. An unfinished CPU/default trial is
 reported as unavailable with its failure artifact; it is never assigned a fake
 cycle value or used to calculate a speedup. Differences measured on separate
 operators, phases or baseline types are not added together.
+The RTL cap covers the complete simulation, including startup and validation,
+not just the timed operator interval. An extended retry can therefore pass with
+an operator cycle count below the original simulation cap.
 
 ## Reproduction and delivery
 
