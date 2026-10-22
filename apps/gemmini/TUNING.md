@@ -29,11 +29,16 @@ are not evidence for Gemmini performance.
 | Physical SRAM and host synchronization | `gemmini_memory.py` lifetime allocation, dependence checks and command lowering |
 | Device evaluation | Target builder/runner, guarded mathematical oracle, Spike verification and Verilator cycle measurement |
 
-The two compiler-core changes are general TensorIR fixes, not runtime patches:
+The compiler-core changes are general TensorIR/MetaSchedule fixes:
 subspace division moves tile-aligned partition offsets outside the tensorized
 inner iterator (including its single-term fast path), and region coverage
 analysis handles an empty intersection before subtracting its infinity sentinels.
-The arith, blockize and loop-partition regressions exercise those changes.
+Trace replay now rejects a resampled/mutated candidate when a later schedule
+primitive raises a legality error. The rendered C++ exception retains a distinct
+type, so unrelated internal failures still propagate. This repairs the pinned
+stock search implementation; it does not replace its algorithm or mutators.
+Arith, blockize, loop-partition and both search-strategy regressions exercise
+these changes.
 
 ## Search space and fixed lowering
 
@@ -94,6 +99,13 @@ RTL verification of a wrong-oracle ELF is retained separately for representative
 slices. Input immutability and guard checks run on Spike; they are intentionally
 outside the RTL timing interval.
 
+`qualify_tuning_package.py` links a representative operator directly from the
+exported `libmodel.a`, using the campaign's guarded inputs and mathematical
+oracle. It recompiles only the small calling wrapper and checks the operator
+workspace ABI. Both positive and wrong-oracle ELFs run on Spike and RTL. This
+binds slice qualification to the delivered archive rather than only to a
+separately compiled search candidate.
+
 The timer surrounds `model_run`, including its CPU epilogue and completion fence.
 A first call shorter than 400,000 cycles is repeated, and the second call is the
 reported warm interval; longer operators report the first interval. Both values
@@ -107,8 +119,11 @@ cycle fields for interpretation. Failed measurements use TVM's invalid-record
 sentinel and cannot become queried winners.
 
 Baselines are measured outside the search database, and the measurement cache
-serializes concurrent requests for identical workload/code pairs. A repeated
-proposal uses the retained result and is marked `reused`. Once search finishes,
+serializes concurrent requests for identical workload/guest-ELF pairs. This also
+binds the input blobs, wrapper and adapter. Older pilot caches used LLVM hashes;
+the current driver migrates their entries through the retained ELF identities.
+A failed capped run may be retried only when its cycle allowance is increased.
+A repeated proposal uses the retained result and is marked `reused`. Once search finishes,
 the verified default trace is committed through the standard database API so a
 deployment can retain it if search found nothing faster. No custom winner replay
 is used. Fresh compilation registers the workload's intrinsic families before
@@ -161,10 +176,11 @@ the pinned receipts before a run begins.
 ```sh
 ../metaschedule-dse-campaign.sh tinyllama-decode --operators 0 1 \
   --trials-per-task 8 --parallel 4 --builders 2 --baseline-workers 2
-python apps/gemmini/report_tuning.py /absolute/path/to/campaign
-python apps/gemmini/compile_package.py --program /path/to/campaign/program.json \
+$PY apps/gemmini/report_tuning.py /absolute/path/to/campaign
+$PY apps/gemmini/compile_package.py --program /path/to/campaign/program.json \
   --tuning-database /path/to/campaign/database --output-dir /path/to/package \
   --riscv-gcc /path/to/riscv64-unknown-elf-gcc --adapter-receipt /path/to/receipt.json
+$PY apps/gemmini/qualify_tuning_package.py /path/to/campaign /path/to/package WORKLOAD_KEY
 ```
 
 Each finished campaign carries `results.json`, `results.csv`, sampled best traces,

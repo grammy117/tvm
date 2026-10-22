@@ -66,6 +66,12 @@ def summarize(root):
         row["replay_successful_trials"] = sum(trial.get("cycles") is not None for trial in replay)
         row["replay_best_cycles"] = min(
             (trial["cycles"] for trial in replay if trial.get("cycles") is not None), default=None)
+        matched_budget = min(len(measured), len(replay))
+        row["matched_trial_budget"] = matched_budget
+        for label, proposals in (("evolutionary", measured), ("replay", replay)):
+            row[f"matched_budget_{label}_best_cycles"] = min(
+                (trial["cycles"] for trial in proposals[:matched_budget]
+                 if trial.get("cycles") is not None), default=None)
         if winner is not None:
             sch = tir.Schedule(workload)
             winner.trace.apply_to_schedule(sch, remove_postproc=False)
@@ -81,6 +87,11 @@ def summarize(root):
                 if inst.kind.name.startswith("Sample"):
                     row["best_decisions"].append({"instruction": inst.kind.name,
                                                  "decision": decisions[index]})
+            if row["best_sketch"] != "cpu":
+                tiles = [item["decision"] for item in row["best_decisions"]
+                         if item["instruction"] == "SamplePerfectTile"]
+                row["sampled_tile_factors_outer_reuse"] = dict(zip(
+                    ("M", "N", "K", "tail_M", "tail_N", "tail_K"), tiles))
             trace_path = root / "best" / key / "trace.py"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             trace_path.write_text(str(winner.trace) + "\n")

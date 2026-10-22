@@ -32,7 +32,7 @@ from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_
 import measure
 
 
-def complete(root, *, commit=False, max_cycles=6_000_000):
+def complete(root, *, commit=False, commit_only=False, max_cycles=6_000_000):
     root = Path(root).resolve()
     inventory = json.loads((root / "tasks.json").read_text())
     provenance = json.loads((root / "hardware-provenance.json").read_text())
@@ -51,6 +51,9 @@ def complete(root, *, commit=False, max_cycles=6_000_000):
             if record.get("status") == "passed":
                 item["default"] = record
                 continue
+        if commit_only:
+            item["default"] = previous
+            continue
         # Do not race an ongoing baseline that has not reported a refusal.
         if not commit and item.get("default", {}).get("status") != "failed":
             continue
@@ -104,9 +107,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("campaign", type=Path)
     parser.add_argument("--commit", action="store_true")
+    parser.add_argument("--commit-only", action="store_true",
+                        help="Import completed baseline measurements without running repairs")
     parser.add_argument("--max-cycles", type=int, default=6_000_000)
     args = parser.parse_args()
-    complete(args.campaign, commit=args.commit, max_cycles=args.max_cycles)
+    complete(args.campaign, commit=args.commit or args.commit_only,
+             commit_only=args.commit_only, max_cycles=args.max_cycles)
 
 
 if __name__ == "__main__":

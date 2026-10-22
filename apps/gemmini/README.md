@@ -28,7 +28,7 @@ compiler, portable archive, guarded boot ELFs and deployment bindings.
 preserved as `route="legacy"` and `prepare_gemmini_graph_legacy`; the template
 scheduling/search recipes below describe that preserved route.
 
-The current compiler branch is `gemmini/metaschedule-dse`; the older setup and template recipes below refer to `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
+The current compiler branch is `gemmini/metaschedule-dse`; the older setup and template recipes below refer to `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. [TUNING.md](TUNING.md) describes the per-operator RTL measurements and package-slice qualification. Pretrained quality, full-model RTL timing and deployed FireSim hardware remain unqualified.
 
 | Location | Integration responsibility |
 | --- | --- |

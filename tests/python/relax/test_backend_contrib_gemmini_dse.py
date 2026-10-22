@@ -54,7 +54,8 @@ def test_concurrent_duplicate_measurements_run_once(tmp_path, monkeypatch):
         folder.mkdir()
         path = folder / "artifact.json"
         path.write_text(json.dumps({"folder": str(folder), "workload": "same-workload",
-                                    "program_sha256": "same-code", "native": True}))
+                                    "program_sha256": f"different-llvm-{index}", "native": True,
+                                    "elfs": {"valid": {"sha256": "same-guest-bytes"}}}))
         paths.append(path)
     with ThreadPoolExecutor(4) as pool:
         assert list(pool.map(campaign.run, paths)) == [17] * 4

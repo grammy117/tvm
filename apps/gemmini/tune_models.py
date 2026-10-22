@@ -74,7 +74,27 @@ class Campaign:
         self.program_locks = {}
         self.default_cycles = {}
         cache = self.root / "measurement-cache.json"
-        self.cache = json.loads(cache.read_text()) if cache.exists() else {}
+        self.cache = {}
+        if cache.exists():
+            for record in json.loads(cache.read_text()).values():
+                artifact_path = Path(record["folder"]) / "artifact.json"
+                if artifact_path.exists():
+                    artifact = json.loads(artifact_path.read_text())
+                    measurement = artifact_path.parent / "measurement.json"
+                    if measurement.exists():
+                        latest = json.loads(measurement.read_text())
+                        if latest.get("status") == "passed":
+                            record = latest
+                    self.cache.setdefault(self.measurement_key(artifact), record)
+
+    @staticmethod
+    def measurement_key(artifact):
+        # Bind the actual guest bytes: changes to inputs, wrappers, adapters or
+        # the compiler must not reuse a label merely because LLVM text matches.
+        # Conversely, distinct LLVM metadata can produce exactly the same ELF.
+        binary = artifact.get("elfs", {}).get("valid", {}).get(
+            "sha256", artifact["program_sha256"])
+        return Path(artifact["workload"]).name + ":" + binary
 
     def workload_folder(self, key):
         return self.root / "workloads" / key
@@ -120,20 +140,23 @@ class Campaign:
     def run(self, artifact_path):
         artifact = json.loads(Path(artifact_path).read_text())
         key = Path(artifact["workload"]).name
-        program = key + ":" + artifact["program_sha256"]
+        program = self.measurement_key(artifact)
         with self.lock:
             program_lock = self.program_locks.setdefault(program, threading.Lock())
         # Search strategies can submit identical generated code concurrently.
         # Serialize only those duplicates; distinct programs still run in parallel.
         with program_lock:
+            cap = self.cap(key)
+            if not artifact["native"]:
+                cap = min(cap, self.args.cpu_max_cycles)
             with self.lock:
                 cached = self.cache.get(program)
+            if (cached is not None and cached.get("cycle_cap") is not None
+                    and cached["status"] != "passed" and cached["cycle_cap"] < cap):
+                cached = None
             if cached is not None:
                 record = dict(cached, reused_from=cached["folder"])
             else:
-                cap = self.cap(key)
-                if not artifact["native"]:
-                    cap = min(cap, self.args.cpu_max_cycles)
                 record = measure.run_candidate(artifact, self.toolchain, max_cycles=cap)
                 with self.lock:
                     self.cache[program] = record
@@ -180,7 +203,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=sorted(model_workloads.MODELS), required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("--trials-per-task", type=int, default=16)
+    parser.add_argument("--trials-per-task", type=int, default=16,
+                        help="Global budget multiplier; the stock scheduler distributes this times the task count")
     parser.add_argument("--parallel", type=int, default=14)
     parser.add_argument("--builders", type=int, default=6)
     parser.add_argument("--strategy", choices=("evolutionary", "replay"), default="evolutionary")
