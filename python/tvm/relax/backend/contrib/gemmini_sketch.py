@@ -266,16 +266,20 @@ def _tile_copy(sch, copy, rows, cols):
 
 def _place_epilogue(sch, write, outer):
     """Move pointwise CPU consumers of the output tile into the tile loop."""
-    pending, placed = list(sch.get_consumers(write)), set()
+    pending = [sch.get(block).name_hint for block in sch.get_consumers(write)]
+    placed = set()
 
     def inside_tile(block):
         return any(sch.get(loop).same_as(sch.get(outer)) for loop in sch.get_loops(block))
 
     while pending:
-        consumer = pending.pop(0)
-        name = sch.get(consumer).name_hint
-        if name in placed:
+        name = pending.pop(0)
+        # A shared pointwise producer can also be queued as another consumer.
+        # Inlining it removes its BlockRV; resolve queued names against the
+        # current schedule instead of retaining invalid references.
+        if name in placed or name not in _block_names(sch):
             continue
+        consumer = sch.get_block(name)
         node = sch.get(consumer)
         if (
             isinstance(node.body, tir.BufferStore)
@@ -297,7 +301,7 @@ def _place_epilogue(sch, write, outer):
         except tir.schedule.ScheduleError:
             continue
         placed.add(name)
-        pending.extend(sch.get_consumers(consumer))
+        pending.extend(sch.get(block).name_hint for block in sch.get_consumers(consumer))
 
 
 def apply_contraction_sketch(

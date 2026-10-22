@@ -242,6 +242,51 @@ class SketchTests(EmulatedCase):
 
 
 class DesignSpaceTests(EmulatedCase):
+    def test_shared_convolution_epilogue_survives_inlining_and_trace_replay(self):
+        from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_workloads
+
+        data = relax.Var("data", relax.TensorStructInfo((1, 7, 7, 16), "int8"))
+        weight = relax.Var("weight", relax.TensorStructInfo((16, 3, 3, 16), "int8"))
+        bias = relax.Var("bias", relax.TensorStructInfo((1, 1, 1, 16), "int32"))
+        bb = relax.BlockBuilder()
+        with bb.function("main", [data, weight, bias]):
+            with bb.dataflow():
+                product = bb.emit(relax.op.nn.conv2d(
+                    data, weight, padding=1, data_layout="NHWC", kernel_layout="OHWI",
+                    out_dtype="int32"))
+                wide = bb.emit(relax.op.astype(bb.emit(relax.op.add(product, bias)), "int64"))
+                magnitude = bb.emit(relax.op.abs(wide))
+                rounded = bb.emit(relax.op.floor_divide(
+                    bb.emit(relax.op.add(magnitude, relax.const(32, "int64"))),
+                    relax.const(64, "int64")))
+                signed = bb.emit(relax.op.where(
+                    bb.emit(relax.op.less(wide, relax.const(0, "int64"))),
+                    bb.emit(relax.op.negative(rounded)), rounded))
+                output = bb.emit_output(relax.op.astype(relax.op.clip(signed, -127, 127), "int8"))
+            bb.emit_func_output(output)
+        prepared, _, _ = prepare_gemmini_tensorir_workloads(bb.get())
+        task = ms.relax_integration.extract_tasks(prepared, GemminiCapabilities().target())[0]
+        func = task.dispatched[0]["main"]
+        sch = tir.Schedule(task.dispatched[0], seed=1)
+        sch = apply_contraction_sketch(
+            sch, sch.get_block(contraction_names(func)[0]),
+            ContractionSketch(rows=7, epilogue="tile"), tensorize=True)
+        rng = np.random.default_rng(0)
+        arrays = [rng.integers(-5, 6, tuple(int(x) for x in func.buffer_map[p].shape),
+                               dtype=func.buffer_map[p].dtype) for p in func.params]
+        reference = [tvm.nd.array(a) for a in arrays]
+        tvm.build(task.dispatched[0], "llvm")(*reference)
+        for seed in (1, 5, 17):
+            replay = tir.Schedule(task.dispatched[0], seed=seed)
+            tir.schedule.Trace(sch.trace.insts, {}).apply_to_schedule(replay, remove_postproc=False)
+            lowered = lower_tensorir_schedule(func, replay).scheduled_mod
+            path = self.root / f"conv-{seed}.so"
+            tvm.build(lowered, "llvm").export_library(
+                str(path), addons=[str(self.root / "emulator.c")], cc="cc", options=["-std=c11"])
+            actual = [tvm.nd.array(a) for a in arrays]
+            tvm.runtime.load_module(str(path))(*actual)
+            np.testing.assert_array_equal(actual[-1].numpy(), reference[-1].numpy())
+
     def test_union_space_random_points_are_exact(self):
         caps = GemminiCapabilities()
         rng = random.Random(0)
