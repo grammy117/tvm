@@ -143,9 +143,13 @@ implements a separate schedule replay path.
 The XGB warmup is four feature-bearing samples for these bounded experiments, rather
 than its upstream default of 100. The model and `cost-model.json` retain its
 training state. Early pilot campaigns that used the upstream warmup are labeled
-as such; they do not establish learned ranking. A small budget does not establish
-a global optimum. ReplayTrace comparisons and actual successful-trial counts
-are reported alongside results.
+as such; they do not establish learned ranking. The bounded ResNet campaign
+submitted all eight proposals before its first RTL result, so its final trained
+model is reusable but is not evidence of learned ranking during that run. The
+16-trial smoke campaign includes proposals after training and retains the
+corresponding model state. A small budget does not establish a global optimum.
+ReplayTrace comparisons and actual successful-trial counts are reported
+alongside results.
 
 ## Workloads and interpretation
 
