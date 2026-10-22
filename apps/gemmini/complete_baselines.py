@@ -63,6 +63,16 @@ def complete(root, *, commit=False, commit_only=False, max_cycles=6_000_000):
         sch = default_schedule(func)
         folder = root / "baseline-repairs" / key
         artifact_path = folder / "artifact.json"
+        original = Path(previous.get("artifact", ""))
+        if original.is_file():
+            original_measurement = original.parent / "measurement.json"
+            if original_measurement.exists():
+                original_result = json.loads(original_measurement.read_text())
+                if (original_result.get("status") != "passed"
+                        and original_result.get("cycle_cap", max_cycles) < max_cycles):
+                    # Expanding an allowance must run the same executable, not
+                    # silently replace the default with freshly compiled code.
+                    artifact_path, folder = original, original.parent
         if artifact_path.exists():
             artifact = json.loads(artifact_path.read_text())
         else:

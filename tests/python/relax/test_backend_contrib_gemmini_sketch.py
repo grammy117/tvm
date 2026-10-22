@@ -181,6 +181,19 @@ class SketchTests(EmulatedCase):
         _, _, piped = self.check((64, 64, 48), ContractionSketch(pipeline=True), decisions)
         self.assertGreater(piped["spad_rows"], plain["spad_rows"])
 
+    def test_full_sram_capacity_is_usable_and_overflow_is_rejected(self):
+        decisions = {"i": [1, 8], "j": [1, 8], "k": [1, 64]}
+        _, _, metadata = self.check((128, 1024, 128), ContractionSketch(), decisions)
+        self.assertEqual(metadata["spad_rows"], 1024 * 16)
+        self.assertEqual(metadata["acc_rows"], 64 * 16)
+        func = matmul(144, 1024, 128)
+        sch = tir.Schedule(func, debug_mask="all")
+        sch = apply_contraction_sketch(
+            sch, sch.get_block("product"), ContractionSketch(),
+            decisions={"i": [1, 9], "j": [1, 8], "k": [1, 64]}, tensorize=True)
+        with self.assertRaisesRegex(ValueError, "SRAM capacity"):
+            lower_tensorir_schedule(func, sch)
+
     def test_root_staging_needs_no_per_dma_wait(self):
         decisions = {"i": [3, 1], "j": [1, 2], "k": [3, 1]}
         _, fences, metadata = self.check((48, 36, 32), ContractionSketch(staging="root"), decisions)
