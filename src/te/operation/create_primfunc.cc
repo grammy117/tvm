@@ -480,6 +480,15 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
   // In lower levels, we just create new block var and bind it to the previous level block var.
   auto axes_levels = GenerateNestedIterLevels(axes, analyzer);
   ICHECK(!axes_levels.empty());
+  // Reduction axes can be split over several levels when an extent depends
+  // on another iterator.  An init in each nested block would reset partial
+  // results.  Initialize once outside their union instead, including when an
+  // outer reduction has an empty extent.
+  bool separate_init = std::count_if(axes_levels.begin(), axes_levels.end(), [](const auto& level) {
+                         return std::any_of(level.begin(), level.end(), [](const IterVar& axis) {
+                           return axis->iter_type == IterVarType::kCommReduce;
+                         });
+                       }) > 1;
   std::vector<NestedScopeInfo> scopes;
   scopes.reserve(axes_levels.size());
   std::unordered_set<Var> defined_axes;
@@ -503,8 +512,11 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
         }
         Range dom = Range::FromMinExtent(analyzer->Simplify(min), analyzer->Simplify(extent));
         IterVar new_block_iter(dom, block_var, axis->iter_type, axis->thread_tag, axis->span);
-        cur_scope.loop_vars.emplace_back(loop_var, dom);
-        cur_scope.AddBlockIter(axis, new_block_iter, loop_var);
+        // LLVM lowering requires zero-based physical loops. Keep the logical
+        // domain and express its origin in the block binding instead.
+        cur_scope.loop_vars.emplace_back(loop_var,
+                                         Range::FromMinExtent(make_zero(index_type), dom->extent));
+        cur_scope.AddBlockIter(axis, new_block_iter, loop_var + dom->min);
         defined_axes.insert(axis->var);
       } else if (defined_axes.count(axis->var)) {
         ICHECK_GT(i, 0);
@@ -535,7 +547,10 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
   const ReduceNode* reduce = compute_op->body[0].as<ReduceNode>();
   if (reduce) {
     PrimExpr expr_body = compute_op->body[0];
-    Stmt init = GenerateInitStmt(leaf.store_indices, buffers, reduce, leaf.axes_remap, info);
+    Optional<Stmt> init = separate_init
+                              ? NullOpt
+                              : Optional<Stmt>(GenerateInitStmt(leaf.store_indices, buffers, reduce,
+                                                               leaf.axes_remap, info));
     Stmt body =
         GenerateBodyStmt(leaf.store_indices, buffers, leaf.axes_remap, expr_body, info, analyzer);
     seq_stmt.push_back(BlockRealize(/*iter_values=*/leaf.bindings,
@@ -584,7 +599,8 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
       const auto& block_iters = cur.block_iters;
 
       Optional<Stmt> init{NullOpt};
-      if (reduce && std::any_of(block_iters.begin(), block_iters.end(), [](const IterVar& iter) {
+      if (!separate_init && reduce &&
+          std::any_of(block_iters.begin(), block_iters.end(), [](const IterVar& iter) {
             return iter->iter_type == IterVarType::kCommReduce;
           })) {
         // if the reduce axis defined in non-leaf scopes, the nested block is also
@@ -606,7 +622,35 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
                                 /*match_buffers=*/{},
                                 /*annotations=*/annotations));
     }
-    for (size_t j = cur.loop_vars.size(); j > 0; --j) {
+    size_t remaining_loops = cur.loop_vars.size();
+    if (i == 1 && separate_init) {
+      size_t spatial_axes = compute_op->axis.size();
+      ICHECK_GE(cur.block_iters.size(), spatial_axes);
+      for (; remaining_loops > spatial_axes; --remaining_loops) {
+        const auto& [loop_var, dom] = cur.loop_vars[remaining_loops - 1];
+        body = For(loop_var, dom->min, dom->extent, ForKind::kSerial, body);
+      }
+      Array<IterVar> init_iters;
+      Array<PrimExpr> init_bindings, init_indices;
+      Map<Var, PrimExpr> init_remap;
+      for (size_t j = 0; j < spatial_axes; ++j) {
+        const auto& original = cur.block_iters[j];
+        ICHECK_EQ(original->iter_type, IterVarType::kDataPar);
+        Var var = original->var.copy_with_suffix("_init");
+        init_iters.push_back(IterVar(original->dom, var, IterVarType::kDataPar));
+        init_bindings.push_back(cur.bindings[j]);
+        init_indices.push_back(var);
+        init_remap.Set(compute_op->axis[j]->var, var);
+      }
+      Stmt init_body = GenerateInitStmt(init_indices, buffers, reduce, init_remap, info);
+      Stmt initialize = BlockRealize(
+          init_bindings, Bool(true),
+          Block(init_iters, {}, {}, info->FreshName(compute_op->name + "_init"), init_body,
+                /*init=*/NullOpt, /*alloc_buffers=*/{}, /*match_buffers=*/{},
+                {{tir::attr::script_parsing_detect_access, IntImm(DataType::Int(32), 3)}}));
+      body = SeqStmt::Flatten(initialize, body);
+    }
+    for (size_t j = remaining_loops; j > 0; --j) {
       const auto& [loop_var, dom] = cur.loop_vars[j - 1];
       body = For(loop_var, dom->min, dom->extent, ForKind::kSerial, body);
     }

@@ -17,6 +17,7 @@
 
 import inspect
 
+import numpy as np
 import pytest
 
 import tvm
@@ -562,6 +563,79 @@ class TestDivIndex(BaseCompare):
         TestCase(tdiv(y + x * z, z), tdiv(y, z) + x, non_negative),
         TestCase(tdiv(y + z * x, z), tdiv(y, z) + x, non_negative),
     )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("denominator", [3.0, 127.0, -3.0, -127.0, 2.0, -1.0])
+def test_float_div_constant_preserves_division(dtype, denominator):
+    x = tir.Var("x", dtype)
+    before = tir.Div(x, tir.const(denominator, dtype))
+    after = tvm.arith.Analyzer().rewrite_simplify(before)
+    assert isinstance(after, tir.Div)
+    assert after.dtype == dtype
+    tvm.ir.assert_structural_equal(after, before)
+
+
+@pytest.mark.parametrize("dtype,denominator", [("float32", 2.0**-149), ("float64", 2.0**-1074)])
+def test_float_div_tiny_constant_preserves_division(dtype, denominator):
+    # Even an exact power of two is unsafe to reciprocate when its reciprocal overflows.
+    x = tir.Var("x", dtype)
+    before = tir.Div(x, tir.const(denominator, dtype))
+    after = tvm.arith.Analyzer().rewrite_simplify(before)
+    assert isinstance(after, tir.Div)
+    assert after.dtype == dtype
+    tvm.ir.assert_structural_equal(after, before)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_float_div_constant_folding_and_broadcast(dtype):
+    analyzer = tvm.arith.Analyzer()
+    x = tir.Var("x", dtype)
+    three = tir.const(3.0, dtype)
+    before = tir.Div(tir.const(6.0, dtype), three)
+    tvm.ir.assert_structural_equal(analyzer.rewrite_simplify(before), tir.const(2.0, dtype))
+    tvm.ir.assert_structural_equal(analyzer.rewrite_simplify(tir.Div(x, tir.const(1.0, dtype))), x)
+    before = tir.Div(tir.Broadcast(x, 4), tir.Broadcast(three, 4))
+    expected = tir.Broadcast(tir.Div(x, three), 4)
+    tvm.ir.assert_structural_equal(analyzer.rewrite_simplify(before), expected)
+
+
+@pytest.mark.parametrize("numerator,denominator,expected", [(-7, 3, -2), (7, -3, -2), (-7, -3, 2)])
+def test_integer_div_constant_keeps_truncation(numerator, denominator, expected):
+    before = tir.Div(tir.const(numerator, "int32"), tir.const(denominator, "int32"))
+    after = tvm.arith.Analyzer().rewrite_simplify(before)
+    tvm.ir.assert_structural_equal(after, tir.const(expected, "int32"))
+
+
+@tvm.testing.requires_llvm
+@pytest.mark.parametrize("denominator_sign", [1, -1])
+@pytest.mark.parametrize(
+    "dtype,numerator,denominator,expected_bits",
+    [
+        ("float32", 4.46875, 127.0, 0x3D102041),
+        ("float32", 7.0, 3.0, 0x40155555),
+        ("float64", 5.0, 3.0, 0x3FFAAAAAAAAAAAAB),
+        ("float64", 3.0, 10.0, 0x3FD3333333333333),
+        ("float32", 2.0**-149, 2.0**-149, 0x3F800000),
+        ("float64", 2.0**-1074, 2.0**-1074, 0x3FF0000000000000),
+    ],
+)
+def test_float_div_constant_execution(dtype, numerator, denominator, expected_bits, denominator_sign):
+    # Expected bits are rounded once, ties to even, from the exact rational quotients.
+    # In particular, FP32 expectations do not use an FP64 division as their reference.
+    data = te.placeholder((2,), dtype=dtype, name="data")
+    divisor = tir.const(denominator_sign * denominator, dtype)
+    analyzer = tvm.arith.Analyzer()
+    output = te.compute(data.shape, lambda i: analyzer.rewrite_simplify(tir.Div(data[i], divisor)), name="output")
+    func = tvm.build(te.create_prim_func([data, output]), target="llvm")
+    inputs = tvm.nd.array(np.array([numerator, -numerator], dtype=dtype))
+    result = tvm.nd.empty((2,), dtype=dtype)
+    func(inputs, result)
+
+    uint_dtype, sign_bit = ("uint32", 1 << 31) if dtype == "float32" else ("uint64", 1 << 63)
+    positive_bits = expected_bits if denominator_sign == 1 else expected_bits ^ sign_bit
+    expected = np.array([positive_bits, positive_bits ^ sign_bit], dtype=uint_dtype)
+    np.testing.assert_array_equal(result.numpy().view(uint_dtype), expected)
 
 
 class TestFloordivIndex(BaseCompare):

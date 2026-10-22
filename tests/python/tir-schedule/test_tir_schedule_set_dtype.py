@@ -17,6 +17,7 @@
 # pylint: disable=missing-function-docstring,missing-module-docstring
 
 import pytest
+import numpy as np
 import tvm
 import tvm.testing
 from tvm import tir
@@ -122,6 +123,55 @@ def test_set_dtype_subregion():
     sch.unsafe_set_dtype(sch.get_block("B"), 0, "float16")
     assert_structural_equal_ignore_global_symbol(element_wise_subregion_match_set_dtype, sch.mod["main"])
     verify_trace_roundtrip(sch=sch, mod=func)
+
+
+@pytest.mark.parametrize("source_dtype", ["int32", "int64"])
+def test_dtype_change_then_tensorize_constant_initialization(source_dtype):
+    @T.prim_func
+    def original(C: T.Buffer((4,), "int64")):
+        B = T.alloc_buffer((4,), source_dtype)
+        for i in range(4):
+            with T.block("init"):
+                vi = T.axis.spatial(4, i)
+                B[vi] = T.cast(0, source_dtype)
+        for i in range(4):
+            with T.block("out"):
+                vi = T.axis.spatial(4, i)
+                C[vi] = T.Cast("int64", B[vi])
+
+    @T.prim_func
+    def zero(C: T.Buffer((4,), "int32", offset_factor=1)):
+        with T.block("root"):
+            T.reads()
+            T.writes(C[0:4])
+            for i in range(4):
+                with T.block("zero"):
+                    vi = T.axis.spatial(4, i)
+                    C[vi] = T.int32(0)
+
+    name = "test.tir.zero_after_dtype_change"
+    @T.prim_func
+    def zero_impl(C: T.Buffer((4,), "int32", offset_factor=1)):
+        with T.block("root"):
+            T.reads()
+            T.writes(C[0:4])
+            C[0] = T.int32(0)
+            C[1] = T.int32(0)
+            C[2] = T.int32(0)
+            C[3] = T.int32(0)
+
+    tir.TensorIntrin.register(name, zero, zero_impl, override=True)
+    saved = tvm.ir.save_json(original)
+    sch = tir.Schedule(original, debug_mask="all")
+    block = sch.get_block("init")
+    sch.unsafe_set_dtype(block, 0, "int32")
+    tile = sch.blockize(sch.get_loops(block)[0], preserve_unit_iters=False)
+    sch.tensorize(tile, name)
+    verify_trace_roundtrip(sch, original)
+    assert tvm.ir.save_json(original) == saved
+    output = tvm.nd.array(np.full(4, -99, "int64"))
+    tvm.build(sch.mod, "llvm")(output)
+    np.testing.assert_array_equal(output.numpy(), np.zeros(4, "int64"))
 
 
 if __name__ == "__main__":

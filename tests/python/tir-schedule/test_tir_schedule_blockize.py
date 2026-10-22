@@ -369,5 +369,18 @@ def test_blockize_blocks():
     verify_trace_roundtrip(sch=s, mod=blocks_func)
 
 
+def test_repeated_blockize_names_remain_queryable_and_replayable():
+    sch = tir.Schedule(single_elementwise, debug_mask="all")
+    block = sch.get_block("B")
+    scope = sch.blockize(sch.get_loops(block)[0])
+    scope_name = sch.get(scope).name_hint
+    inner = sch.blockize(sch.get_loops(block)[0])
+    inner_name = sch.get(inner).name_hint
+    assert scope_name != inner_name
+    assert sch.get(sch.get_block(scope_name)).same_as(sch.get(scope))
+    assert sch.get(sch.get_block(inner_name)).same_as(sch.get(inner))
+    verify_trace_roundtrip(sch, single_elementwise)
+
+
 if __name__ == "__main__":
     tvm.testing.main()

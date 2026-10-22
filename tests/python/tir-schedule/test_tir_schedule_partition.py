@@ -16,17 +16,61 @@
 # under the License.
 # pylint: disable=missing-function-docstring,missing-module-docstring
 import pytest
+import numpy as np
 import tvm
 import tvm.testing
 from tvm import te, tir
 from tvm.script import tir as T
-from tvm.tir.expr import IntImm
 from tvm.tir.schedule.testing import (
-    assert_structural_equal_ignore_global_symbol,
     verify_trace_roundtrip,
 )
 
 # pylint: disable=no-member,invalid-name,unused-variable
+
+
+def assert_partition_equivalent(expected, actual):
+    """Check behavior independently of the choice of partition coordinates."""
+    assert tir.analysis.verify_well_formed(actual)
+    loops = []
+    tir.stmt_functor.post_order_visit(
+        actual.body, lambda node: loops.append(node) if isinstance(node, tir.For) else None
+    )
+    assert all(isinstance(loop.min, tir.IntImm) and int(loop.min) == 0 for loop in loops)
+
+    def execute(func):
+        # On CPU, replace the opaque GPU sink only for this test, preserving
+        # its destination and index argument. This checks partitioned addresses,
+        # without claiming execution of a GPU fragment instruction.
+        def lower_sink(stmt):
+            if (
+                isinstance(stmt, tir.Evaluate)
+                and isinstance(stmt.value, tir.Call)
+                and stmt.value.op == tvm.ir.Op.get("tir.tvm_fill_fragment")
+            ):
+                call = stmt.value
+                buffer = next(b for b in func.buffer_map.values() if b.data.same_as(call.args[0]))
+                index = call.args[-1]
+                return tir.BufferStore(
+                    buffer,
+                    tir.const(17, buffer.dtype),
+                    [index // buffer.shape[1], index % buffer.shape[1]],
+                )
+            return None
+
+        lowered = func.with_body(tir.stmt_functor.ir_transform(func.body, None, lower_sink))
+        args = []
+        for index, param in enumerate(func.params):
+            buffer = func.buffer_map[param]
+            shape = tuple(int(dim) for dim in buffer.shape)
+            values = ((np.arange(np.prod(shape)).reshape(shape) + 13 * index) % 37 - 18).astype(
+                buffer.dtype
+            )
+            args.append(tvm.nd.array(values))
+        tvm.build(lowered.with_attr("global_symbol", "main"), "llvm")(*args)
+        return [value.numpy() for value in args]
+
+    for reference, result in zip(execute(expected), execute(actual)):
+        np.testing.assert_array_equal(reference, result)
 
 
 @T.prim_func
@@ -91,187 +135,6 @@ def elementwise_with_opaque_block(a: T.handle, b: T.handle) -> None:
 
 
 @T.prim_func
-def elementwise_partition_with_opaque_block(a: T.handle, b: T.handle) -> None:
-    B = T.match_buffer(b, [128, 128, 128])
-    A = T.match_buffer(a, [128, 128, 128])
-    with T.block("root"):
-        T.reads()
-        T.writes()
-        with T.block("opaque_i_common"):
-            T.reads()
-            T.writes()
-            with T.block("opaque_i0_partition"):
-                T.reads()
-                T.writes()
-                for i0, j, k in T.grid(112, 128, 128):
-                    with T.block("opaque_i0"):
-                        T.reads(A[i0, j, k])
-                        T.writes(B[i0, j, k])
-                        with T.block("B_i0"):
-                            vi, vj, vk = T.axis.remap("SSS", [i0, j, k])
-                            T.reads(A[0:112, 0:128, 0:128])
-                            T.writes(B[0:112, 0:128, 0:128])
-                            B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-            with T.block("opaque_i1_partition"):
-                T.reads()
-                T.writes()
-                for i1 in range(112, 128):
-                    for j, k in T.grid(128, 128):
-                        with T.block("opaque_i1"):
-                            T.reads(A[i1, j, k])
-                            T.writes(B[i1, j, k])
-                            with T.block("B_i1"):
-                                vi, vj, vk = T.axis.remap("SSS", [i1, j, k])
-                                T.reads(A[112:128, 0:128, 0:128])
-                                T.writes(B[112:128, 0:128, 0:128])
-                                B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-
-
-@T.prim_func
-def elementwise_loop_partition_case0(a: T.handle, b: T.handle) -> None:
-    A = T.match_buffer(a, [128, 128, 128])
-    B = T.match_buffer(b, [128, 128, 128])
-    with T.block("root"):
-        T.reads()
-        T.writes()
-        with T.block("B_i_common"):
-            T.reads()
-            T.writes()
-            with T.block("B_i0_partition"):
-                T.reads()
-                T.writes()
-                for i0 in range(2):
-                    with T.block("B_i0_j_common"):
-                        T.reads()
-                        T.writes()
-                        with T.block("B_i0_j0_partition"):
-                            T.reads()
-                            T.writes()
-                            for j0, k in T.grid(4, 128):
-                                with T.block("B_i0_j0"):
-                                    vi, vj, vk = T.axis.remap("SSS", [i0, j0, k])
-                                    T.reads(A[0:2, 0:4, 0:128])
-                                    T.writes(B[0:2, 0:4, 0:128])
-                                    B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-                        with T.block("B_i0_j1_partition"):
-                            T.reads()
-                            T.writes()
-                            for j1 in range(4, 36):
-                                for k in range(128):
-                                    with T.block("B_i0_j1"):
-                                        vi, vj, vk = T.axis.remap("SSS", [i0, j1, k])
-                                        T.reads(A[0:2, 4:36, 0:128])
-                                        T.writes(B[0:2, 4:36, 0:128])
-                                        B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-                        with T.block("B_i0_j2_partition"):
-                            T.reads()
-                            T.writes()
-                            for j2 in range(36, 128):
-                                for k in range(128):
-                                    with T.block("B_i0_j2"):
-                                        vi, vj, vk = T.axis.remap("SSS", [i0, j2, k])
-                                        T.reads(A[0:2, 36:128, 0:128])
-                                        T.writes(B[0:2, 36:128, 0:128])
-                                        B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-            with T.block("B_i1_partition"):
-                T.reads()
-                T.writes()
-                for i1 in range(2, 3):
-                    for j, k in T.grid(128, 128):
-                        with T.block("B_i1"):
-                            vi, vj, vk = T.axis.remap("SSS", [i1, j, k])
-                            T.reads(A[2, 0:128, 0:128])
-                            T.writes(B[2, 0:128, 0:128])
-                            B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-            with T.block("B_i2_partition"):
-                T.reads()
-                T.writes()
-                for i2 in range(3, 67):
-                    for j, k in T.grid(128, 128):
-                        with T.block("B_i2"):
-                            vi, vj, vk = T.axis.remap("SSS", [i2, j, k])
-                            T.reads(A[3:67, 0:128, 0:128])
-                            T.writes(B[3:67, 0:128, 0:128])
-                            B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-            with T.block("B_i3_partition"):
-                T.reads()
-                T.writes()
-                for i3 in range(67, 128):
-                    for j, k in T.grid(128, 128):
-                        with T.block("B_i3"):
-                            vi, vj, vk = T.axis.remap("SSS", [i3, j, k])
-                            T.reads(A[67:128, 0:128, 0:128])
-                            T.writes(B[67:128, 0:128, 0:128])
-                            B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-
-
-@T.prim_func
-def elementwise_loop_partition_case1(a: T.handle, b: T.handle) -> None:
-    A = T.match_buffer(a, [128, 128, 128])
-    B = T.match_buffer(b, [128, 128, 128])
-    with T.block("root"):
-        T.reads()
-        T.writes()
-        with T.block("B_i_common"):
-            T.reads()
-            T.writes()
-            with T.block("B_i0_partition"):
-                T.reads()
-                T.writes()
-                for i0, j, k in T.grid(63, 128, 128):
-                    with T.block("B_i0"):
-                        vi, vj, vk = T.axis.remap("SSS", [i0, j, k])
-                        T.reads(A[0:63, 0:128, 0:128])
-                        T.writes(B[0:63, 0:128, 0:128])
-                        B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-            with T.block("B_i1_partition"):
-                T.reads()
-                T.writes()
-                for i1 in range(63, 64):
-                    for j in range(128):
-                        with T.block("B_i1_k_common"):
-                            T.reads()
-                            T.writes()
-                            with T.block("B_i1_k0_partition"):
-                                T.reads()
-                                T.writes()
-                                for k0 in range(1):
-                                    with T.block("B_i1_k0"):
-                                        vi, vj, vk = T.axis.remap("SSS", [i1, j, k0])
-                                        T.reads(A[63, 0:128, 0])
-                                        T.writes(B[63, 0:128, 0])
-                                        B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-                            with T.block("B_i1_k1_partition"):
-                                T.reads()
-                                T.writes()
-                                for k1 in range(1, 65):
-                                    with T.block("B_i1_k1"):
-                                        vi, vj, vk = T.axis.remap("SSS", [i1, j, k1])
-                                        T.reads(A[63, 0:128, 1:65])
-                                        T.writes(B[63, 0:128, 1:65])
-                                        B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-                            with T.block("B_i1_k2_partition"):
-                                T.reads()
-                                T.writes()
-                                for k2 in range(65, 128):
-                                    with T.block("B_i1_k2"):
-                                        vi, vj, vk = T.axis.remap("SSS", [i1, j, k2])
-                                        T.reads(A[63, 0:128, 65:128])
-                                        T.writes(B[63, 0:128, 65:128])
-                                        B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-            with T.block("B_i2_partition"):
-                T.reads()
-                T.writes()
-                for i2 in range(64, 128):
-                    for j, k in T.grid(128, 128):
-                        with T.block("B_i2"):
-                            vi, vj, vk = T.axis.remap("SSS", [i2, j, k])
-                            T.reads(A[64:128, 0:128, 0:128])
-                            T.writes(B[64:128, 0:128, 0:128])
-                            B[vi, vj, vk] = A[vi, vj, vk] * T.float32(2)
-
-
-@T.prim_func
 def opaque_access(a: T.handle, b: T.handle) -> None:
     A = T.match_buffer(a, [16, 16], "float32")
     B = T.match_buffer(b, [16, 16], "float32")
@@ -289,56 +152,6 @@ def opaque_access(a: T.handle, b: T.handle) -> None:
             T.evaluate(T.tvm_fill_fragment(B.data, 16, 16, 16, 0, vi * 16 + vj, dtype="handle"))
 
 
-@T.prim_func
-def opaque_access_loop_partition(a: T.handle, b: T.handle) -> None:
-    A = T.match_buffer(a, (16, 16))
-    B = T.match_buffer(b, (16, 16))
-    for i in range(16):
-        with T.block("A_j_common"):
-            T.reads()
-            T.writes()
-            with T.block("A_j0_partition"):
-                T.reads()
-                T.writes()
-                for j0 in range(12):
-                    with T.block("A_j0"):
-                        vi, vj = T.axis.remap("SS", [i, j0])
-                        T.reads()
-                        T.writes(A[0:16, 0:12])
-                        A[vi, vj] = T.float32(1)
-            with T.block("A_j1_partition"):
-                T.reads()
-                T.writes()
-                for j1 in range(12, 16):
-                    with T.block("A_j1"):
-                        vi, vj = T.axis.remap("SS", [i, j1])
-                        T.reads()
-                        T.writes(A[0:16, 12:16])
-                        A[vi, vj] = T.float32(1)
-    for i in range(16):
-        with T.block("B_j_common"):
-            T.reads()
-            T.writes()
-            with T.block("B_j0_partition"):
-                T.reads()
-                T.writes()
-                for j0 in range(12):
-                    with T.block("B_j0"):
-                        vi, vj = T.axis.remap("SS", [i, j0])
-                        T.reads()
-                        T.writes(B[0:16, 0:16])
-                        T.tvm_fill_fragment(B.data, 16, 16, 16, 0, vi * 16 + vj)
-            with T.block("B_j1_partition"):
-                T.reads()
-                T.writes()
-                for j1 in range(12, 16):
-                    with T.block("B_j1"):
-                        vi, vj = T.axis.remap("SS", [i, j1])
-                        T.reads()
-                        T.writes(B[0:16, 0:16])
-                        T.tvm_fill_fragment(B.data, 16, 16, 16, 0, vi * 16 + vj)
-
-
 # pylint: enable=no-member,invalid-name,unused-variable
 
 
@@ -350,9 +163,9 @@ def test_loop_partition():
 
     block_b_partition = sch.get_block("B_i0")
     i, j, k = sch.get_loops(block_b_partition)
-    loops = sch.loop_partition(j, factors=[4, 32])
+    sch.loop_partition(j, factors=[4, 32])
 
-    assert_structural_equal_ignore_global_symbol(elementwise_loop_partition_case0, sch.mod["main"])
+    assert_partition_equivalent(elementwise, sch.mod["main"])
     verify_trace_roundtrip(sch=sch, mod=elementwise)
 
 
@@ -366,7 +179,7 @@ def test_partition_with_inferred_factor():
     i, j, k = sch.get_loops(block_b_partition)
     sch.loop_partition(k, factors=[1, 64, None])
 
-    assert_structural_equal_ignore_global_symbol(elementwise_loop_partition_case1, sch.mod["main"])
+    assert_partition_equivalent(elementwise, sch.mod["main"])
     verify_trace_roundtrip(sch=sch, mod=elementwise)
 
 
@@ -375,9 +188,7 @@ def test_partition_with_opaque_block():
     block_opaque = sch.get_block("opaque")
     i, _, _ = sch.get_loops(block_opaque)
     sch.loop_partition(i, factors=[None, 16])
-    assert_structural_equal_ignore_global_symbol(
-        elementwise_partition_with_opaque_block, sch.mod["main"]
-    )
+    assert_partition_equivalent(elementwise_with_opaque_block, sch.mod["main"])
     verify_trace_roundtrip(sch=sch, mod=elementwise_with_opaque_block)
 
 
@@ -389,7 +200,7 @@ def test_partition_with_opaque_access():
     block_b = sch.get_block("B")
     _, j = sch.get_loops(block_b)
     sch.loop_partition(j, factors=[None, 4])
-    assert_structural_equal_ignore_global_symbol(opaque_access_loop_partition, sch.mod["main"])
+    assert_partition_equivalent(opaque_access, sch.mod["main"])
     verify_trace_roundtrip(sch=sch, mod=opaque_access)
 
 
@@ -410,6 +221,110 @@ def test_partition_int64_extent_with_mixed_factors():
             te.const(51, "int32"),
         ],
     )
+
+
+def test_partition_reduction_keeps_one_initialization():
+    source = te.placeholder((3, 11), "int32", name="source")
+    k = te.reduce_axis((0, 11), name="k")
+    summed = te.compute((3,), lambda i: te.sum(source[i, k], axis=k), name="sum")
+    original = te.create_prim_func([source, summed])
+    sch = tir.Schedule(original, debug_mask="all")
+    sch.loop_partition(sch.get_loops(sch.get_block("sum"))[-1], [2, 3])
+    values = np.arange(33, dtype="int32").reshape(3, 11) - 17
+    actual = tvm.nd.empty((3,), "int32")
+    tvm.build(sch.mod, "llvm")(tvm.nd.array(values), actual)
+    np.testing.assert_array_equal(actual.numpy(), values.sum(axis=1, dtype="int32"))
+    verify_trace_roundtrip(sch, original)
+
+
+def test_partition_nonzero_loop_min_and_single_partition():
+    @T.prim_func
+    def original(A: T.Buffer((12,), "int32"), B: T.Buffer((12,), "int32")):
+        for i in T.serial(3, 9):
+            with T.block("copy"):
+                vi = T.axis.spatial((3, 9), i)
+                B[vi] = A[vi] + 7
+
+    for factors in ([2], [None]):
+        sch = tir.Schedule(original, debug_mask="all")
+        loops = sch.loop_partition(sch.get_loops(sch.get_block("copy"))[0], factors)
+        assert all(int(sch.get(loop).min) == 0 for loop in loops)
+        values = np.arange(12, dtype="int32")
+        actual = tvm.nd.array(np.full(12, -99, "int32"))
+        tvm.build(sch.mod, "llvm")(tvm.nd.array(values), actual)
+        expected = np.full(12, -99, "int32")
+        expected[3:9] = values[3:9] + 7
+        np.testing.assert_array_equal(actual.numpy(), expected)
+        verify_trace_roundtrip(sch, original)
+
+
+def test_partition_preserves_private_definitions_and_consumers():
+    @T.prim_func
+    def original(A: T.Buffer((7, 3), "int32"), B: T.Buffer((7, 3), "int32")):
+        for i in range(7):
+            with T.block("row"):
+                vi = T.axis.spatial(7, i)
+                tmp = T.alloc_buffer((3,), "int32")
+                for j in range(3):
+                    with T.block("local"):
+                        vj = T.axis.spatial(3, j)
+                        tmp[vj] = A[vi, vj] + 2
+                for j in range(3):
+                    with T.block("out"):
+                        vj = T.axis.spatial(3, j)
+                        B[vi, vj] = tmp[vj] * 3
+
+    sch = tir.Schedule(original, debug_mask="all")
+    sch.loop_partition(sch.get_loops(sch.get_block("row"))[0], [2])
+    assert_partition_equivalent(original, sch.mod["main"])
+    assert tir.analysis.verify_well_formed(sch.mod["main"])
+    definitions = []
+    tir.stmt_functor.post_order_visit(
+        sch.mod["main"].body,
+        lambda n: definitions.extend(n.alloc_buffers) if isinstance(n, tir.Block) else None,
+    )
+    assert len(definitions) == 2 and not definitions[0].data.same_as(definitions[1].data)
+    verify_trace_roundtrip(sch, original)
+
+    a = te.placeholder((7,), "int32", name="a")
+    b = te.compute((7,), lambda i: a[i] * 2, name="b")
+    c = te.compute((7,), lambda i: b[i] + 3, name="c")
+    sch = tir.Schedule(te.create_prim_func([a, c]), debug_mask="all")
+    sch.loop_partition(sch.get_loops(sch.get_block("b"))[0], [2])
+    scope = sch.get_child_blocks(sch.get_block("root"))[0]
+    assert [sch.get(block).name_hint for block in sch.get_consumers(scope)] == ["c"]
+
+
+def test_partition_then_copy_canonicalization_and_blockization():
+    from tvm import topi
+
+    a = te.placeholder((2, 3), "int32", name="duplicate")
+    b = te.placeholder((2, 4), "int32", name="duplicate")
+    out = topi.concatenate([a, b], axis=1)
+    original = te.create_prim_func([a, b, out])
+    saved = tvm.ir.save_json(original)
+    sch = tir.Schedule(original, debug_mask="all")
+    i, j = sch.get_loops(sch.get_block("T_concat"))
+    sch.reorder(j, i)
+    sch.loop_partition(j, [3])
+    regions = []
+    for name in ("T_concat_ax10", "T_concat_ax11"):
+        block = sch.get_block(name)
+        copied = sch.cache_write(block, 0, "global")
+        sch.compute_inline(block)
+        sch.blockize(sch.get_loops(copied)[0])
+        region = sch.cache_write(copied, 0, "global")
+        sch.compute_inline(copied)
+        assert isinstance(sch.get(region).body.value, tir.BufferLoad)
+        assert len(sch.get(region).reads) == 1
+        regions.append(region)
+    values = np.arange(6, dtype="int32").reshape(2, 3)
+    other = np.arange(8, dtype="int32").reshape(2, 4) + 19
+    actual = tvm.nd.empty((2, 7), "int32")
+    tvm.build(sch.mod, "llvm")(tvm.nd.array(values), tvm.nd.array(other), actual)
+    np.testing.assert_array_equal(actual.numpy(), np.concatenate([values, other], axis=1))
+    verify_trace_roundtrip(sch, original)
+    assert tvm.ir.save_json(original) == saved
 
 
 def test_partition_fail_symbolic():

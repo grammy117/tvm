@@ -182,9 +182,10 @@ class ComputeLegalizer : public StmtExprMutator {
   PrimExpr VisitExpr_(const CastNode* op) final {
     auto op_val = PromoteToTarget(this->VisitExpr(op->value));
 
-    // all casts to matched data type (fp8/bf16) becomes f32
+    // Keep explicit narrowing even when its internal storage is promoted.
     if (MatchDType(op->dtype)) {
-      return cast(promote_dtype_.with_lanes(op->dtype.lanes()), op_val);
+      PrimExpr promoted = cast(promote_dtype_.with_lanes(op->dtype.lanes()), op_val);
+      return PromoteToTarget(DTypeConversion(promoted, op->dtype));
     }
 
     if (op_val.same_as(op->value)) {
@@ -318,17 +319,18 @@ class ComputeLegalizer : public StmtExprMutator {
     if (value.same_as(op->value) && indices.same_as(op->indices) && new_buf.same_as(op->buffer)) {
       return GetRef<Stmt>(op);
     } else {
-      if (MatchDType(new_buf->dtype)) {
+      // Preserve logical storage rounding even when physical storage is promoted.
+      if (MatchDType(op->buffer->dtype)) {
         int index_lanes = indices.size() ? indices.back().dtype().lanes() : 1;
-        int buffer_lanes = new_buf->dtype.lanes();
-        DataType legalized_dtype = new_buf->dtype.with_lanes(index_lanes * buffer_lanes);
+        int buffer_lanes = op->buffer->dtype.lanes();
+        DataType legalized_dtype = op->buffer->dtype.with_lanes(index_lanes * buffer_lanes);
         value = CastTargetToDType(value, legalized_dtype);
       }
-      if (value.dtype() != new_buf->dtype) {
+      if (value.dtype().element_of() != new_buf->dtype.element_of()) {
         // this happens when buffer get rewritten to f32
         // but values remain as fp8/bf16
         ICHECK(MatchDType(value->dtype));
-        value = cast(new_buf->dtype.with_lanes(value.dtype().lanes()), value);
+        value = PromoteToTarget(value);
       }
       ICHECK(!op->predicate.defined()) << "Predicated buffer store is not currently supported in "
                                           "data type legalizer pass.";

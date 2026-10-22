@@ -16,7 +16,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#include <tvm/ir/name_supply.h>
 #include <tvm/tir/data_type_rewriter.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <functional>
 
@@ -536,6 +538,19 @@ BlockRealize BlockizeImpl(const ScheduleState& self, const StmtSRef& loop_sref,
                                              /*block=*/block_subst);
   block_sref_reuse->Set(block, inner_realize->block);
   // Step 6: Generate the outer block.
+  // Repeated blockization may otherwise create duplicate names, making the
+  // generated block inaccessible to GetBlock and tensorization postprocessors.
+  const StmtSRefNode* root = block_sref.get();
+  while (root->parent != nullptr) {
+    root = root->parent;
+  }
+  NameSupply names;
+  PostOrderVisit(GetRef<Stmt>(root->stmt), [&names](const ObjectRef& node) {
+    if (const auto* existing = node.as<BlockNode>()) {
+      names->ReserveName(existing->name_hint, /*add_prefix=*/false);
+    }
+  });
+  String outer_name = names->FreshName(block_subst->name_hint + "_o", /*add_prefix=*/false);
   return BlockRealize(
       /*iter_values=*/std::move(outer_bindings),
       /*predicate=*/std::move(outer_predicate),
@@ -543,7 +558,7 @@ BlockRealize BlockizeImpl(const ScheduleState& self, const StmtSRef& loop_sref,
       Block(/*iter_vars=*/std::move(outer_iter_vars),
             /*reads=*/EvalSetRegions(block_subst->reads, inner_iter_dom),
             /*writes=*/EvalSetRegions(block_subst->writes, inner_iter_dom),
-            /*name_hint=*/block_subst->name_hint + "_o",
+            /*name_hint=*/outer_name,
             /*body=*/MakeLoopNest(inner_realize, loops),
             /*init=*/
             block_subst->init.defined()  //
@@ -850,7 +865,9 @@ void Tensorize(ScheduleState self, const StmtSRef& sref, const TensorIntrin& int
   // Step 6: Update the cached flags.
   StmtSRef result = self->stmt2ref.at(block_realize->block.get());
   StmtSRef scope_root = tir::GetScopeRoot(self, result, /*require_stage_pipeline=*/false);
-  self->UpdateScopeBlockInfo(scope_root->StmtAs<BlockNode>()->body);
+  bool scope_block_affine_binding = self->IsAffineBlockBinding(scope_root);
+  self->UpdateScopeBlockInfo(tir::GetBlockRealize(self, scope_root));
+  self->block_info[scope_root].affine_binding = scope_block_affine_binding;
 }
 
 /******** InstructionKind Registration ********/

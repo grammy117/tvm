@@ -551,7 +551,7 @@ struct DecomposPaddingTraits : public UnpackedInstTraits<DecomposPaddingTraits> 
     return sch->DecomposePadding(block_rv, loop_rv);
   }
 
-  static String UnpackedAsPython(Array<String> outputs, String block_rv, LoopRV loop_rv) {
+  static String UnpackedAsPython(Array<String> outputs, String block_rv, String loop_rv) {
     PythonAPICall py("decompose_padding");
     py.Input("block", block_rv);
     py.Input("loop", loop_rv);

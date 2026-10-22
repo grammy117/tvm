@@ -2310,8 +2310,25 @@ class SubspaceDivider {
       return DivisionResult::Failure();
     }
     bool need_predicate = !analyzer_->CanProveEqual(extent, mark_extent);
-    const IterMark& outer_mark = MarkFromArgsAndBase(outer_args, make_const(dtype, 0));
-    const IterMark& inner_mark = MarkFromArgsAndBase(inner_args, expr->base);
+    // A constant base that is a multiple of the inner extent belongs to the
+    // outer subspace: Y*E + (X + c*E) == (Y + c)*E + X keeps X within [0, E).
+    // Leaving it in the inner sum would bind an inner iterator outside its
+    // domain, as after loop_partition offsets a partition's iterations.
+    PrimExpr outer_base = make_const(dtype, 0), inner_base = expr->base;
+    if (!inner_args.empty() && !is_zero(expr->base)) {
+      PrimExpr inner_extent = make_const(dtype, 1);
+      for (const IterSplitExpr& arg : inner_args) inner_extent *= arg->extent;
+      if (analyzer_->CanProveEqual(floormod(expr->base, inner_extent), 0)) {
+        outer_base = analyzer_->Simplify(floordiv(expr->base, inner_extent));
+        inner_base = make_const(dtype, 0);
+      }
+    }
+    IterMark outer_mark = MarkFromArgsAndBase(outer_args, outer_base);
+    if (!is_zero(outer_base)) {
+      // The outer iterator now ranges over [base, base + extent).
+      outer_mark = IterMark(outer_mark->source, outer_mark->extent + outer_base);
+    }
+    const IterMark& inner_mark = MarkFromArgsAndBase(inner_args, inner_base);
     IterSumExpr outer_source = Downcast<IterSumExpr>(outer_mark->source);
     IterSumExpr inner_source = Downcast<IterSumExpr>(inner_mark->source);
     if (need_predicate) {
@@ -2340,6 +2357,18 @@ class SubspaceDivider {
  private:
   DivisionResult AddBase(DivisionResult division, PrimExpr base) {
     DivisionResult res = division;
+    if (analyzer_->CanProve(base >= 0) && analyzer_->CanProve(division.inner_extent > 0) &&
+        analyzer_->CanProveEqual(floormod(base, division.inner_extent), 0)) {
+      PrimExpr offset = analyzer_->Simplify(floordiv(base, division.inner_extent));
+      if (auto op = division.outer.as<IterSplitExpr>()) {
+        res.outer = IterSumExpr({op.value()}, offset);
+      } else if (auto op = division.outer.as<IterSumExpr>()) {
+        res.outer = IterSumExpr(op.value()->args, op.value()->base + offset);
+      }
+      res.outer_extent = analyzer_->Simplify(division.outer_extent + offset);
+      if (res.IsInner()) res.kind = DivisionResult::Kind::kMixed;
+      return res;
+    }
     if (auto op = division.inner.as<IterSplitExpr>()) {
       res.inner = IterSumExpr({op.value()}, base);
     } else if (auto op = division.inner.as<IterSumExpr>()) {

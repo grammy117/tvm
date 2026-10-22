@@ -111,6 +111,16 @@ bool ProducerCoversConsumer(const Array<PrimExpr>& buffer_shape,
     produced = arith::Intersect({produced, buffer_size});
     consumed = arith::Intersect({consumed, buffer_size});
 
+    // Clipping can make a previously nonempty region empty (for example an
+    // offset partition while blockizing a tail). Empty sets use +/- infinity
+    // sentinels, which must not enter ordinary integer subtraction below.
+    if (consumed.IsNothing()) {
+      continue;
+    }
+    if (produced.IsNothing()) {
+      return false;
+    }
+
     produced = arith::IntSet::Interval(analyzer->Simplify(produced.min()),
                                        analyzer->Simplify(produced.max()));
     consumed = arith::IntSet::Interval(analyzer->Simplify(consumed.min()),
@@ -708,10 +718,39 @@ class SRefUpdater : public StmtVisitor {
   const std::unordered_map<const Object*, StmtSRef>& reused_srefs_;
 };
 
+/*! \brief Detect shared statement containers omitted from the SRef tree. */
+class SharedContainerChecker : private StmtVisitor {
+ public:
+  static bool Check(const Stmt& body) {
+    SharedContainerChecker checker;
+    checker(body);
+    return checker.shared_;
+  }
+
+ private:
+  void VisitStmt(const Stmt& stmt) final {
+    // For/Block nodes have their own SRefs and are checked on the ancestor
+    // path. Containers between those nodes are absent from the SRef tree.
+    if (shared_ || stmt.as<ForNode>() || stmt.as<BlockNode>()) return;
+    if (!stmt.unique()) {
+      shared_ = true;
+      return;
+    }
+    if (const auto* seq = stmt.as<SeqStmtNode>()) {
+      if (!seq->seq.unique()) {
+        shared_ = true;
+        return;
+      }
+    }
+    StmtVisitor::VisitStmt(stmt);
+  }
+
+  bool shared_{false};
+};
+
 /*!
- * \brief A helper that returns a new copy of `parent_stmt`,
- * where the subtree `child_src_stmt` is replaced with the subtree `child_tgt_stmt`.
- * \note The visitor assumes `child_src_stmt` is the child of `parent_stmt` in the sref tree.
+ * \brief Return a copy of `parent_stmt` with its child subtree replaced.
+ * \note `child_src_stmt` must be a child of `parent_stmt` in the SRef tree.
  */
 class ChildReplacer : private StmtMutator {
  public:
@@ -875,7 +914,10 @@ void ScheduleStateNode::Replace(const tir::StmtSRef& _src_sref, const Stmt& tgt_
     int i = 0;
     const StmtSRefNode* p = src_sref.get();
     while (true) {
-      if (!p->stmt->unique()) {
+      const Stmt& body = p->stmt->IsInstance<ForNode>()
+                             ? static_cast<const ForNode*>(p->stmt)->body
+                             : static_cast<const BlockNode*>(p->stmt)->body;
+      if (!p->stmt->unique() || SharedContainerChecker::Check(body)) {
         num_copy_steps = i;
       }
       if (p->parent == nullptr) {

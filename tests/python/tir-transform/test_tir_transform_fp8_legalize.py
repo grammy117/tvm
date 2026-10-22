@@ -60,9 +60,7 @@ def get_after_compute_legalize(dtype: str, promote_dtype: str):
             D = T.decl_buffer((100,), dtype, data=Dptr)
             C = T.decl_buffer((100,), promote_dtype)
             for i in T.grid(100):
-                C[i] = promote_f8(dtype, promote_dtype, A[i]) + promote_f8(
-                    dtype, promote_dtype, B[i]
-                )
+                C[i] = promote_f8(dtype, promote_dtype, cast_to_f8(dtype, promote_dtype, promote_f8(dtype, promote_dtype, A[i]) + promote_f8(dtype, promote_dtype, B[i])))
                 D[i] = cast_to_f8(dtype, promote_dtype, T.exp(C[i]))
 
     return After
@@ -193,9 +191,7 @@ def get_after_storage_legalize(dtype: str, promote_dtype: str):
             D = T.decl_buffer((100,), "uint8", data=Dptr)
             C = T.decl_buffer((100,), promote_dtype)
             for i in T.grid(100):
-                C[i] = promote_uint8(dtype, promote_dtype, A[i]) + promote_uint8(
-                    dtype, promote_dtype, B[i]
-                )
+                C[i] = promote_uint8(dtype, promote_dtype, cast_to_uint8(dtype, promote_dtype, promote_uint8(dtype, promote_dtype, A[i]) + promote_uint8(dtype, promote_dtype, B[i])))
                 D[i] = cast_to_uint8(dtype, promote_dtype, T.exp(C[i]))
 
     return After
