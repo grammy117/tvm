@@ -336,13 +336,17 @@ def apply_contraction_sketch(
     i, j, _ = sch.get_loops(block)[-3:]
     # Interior/tail split: the interior keeps full rectangles and the tail gets
     # a partial-rectangle intrinsic of its own, with no padding or staging.
+    # Its size divides both the offset and remainder so transform_layout never
+    # maps one rectangle across a tile-major buffer boundary.
     if sketch.tail == "m" and m % rows:
         interior, tail = _partition_tail(sch, name, i, m, rows)
-        parts = [(interior, rows, cols, "", "ij"), (tail, m % rows, cols, "t", "ij")]
+        tail_rows = math.gcd(m - m % rows, m % rows)
+        parts = [(interior, rows, cols, "", "ij"), (tail, tail_rows, cols, "t", "ij")]
     elif sketch.tail == "n" and n % cols:
         sch.reorder(j, i)
         interior, tail = _partition_tail(sch, name, j, n, cols)
-        parts = [(interior, rows, cols, "", "ji"), (tail, rows, n % cols, "t", "ji")]
+        tail_cols = math.gcd(n - n % cols, n % cols)
+        parts = [(interior, rows, cols, "", "ji"), (tail, rows, tail_cols, "t", "ji")]
     for part, part_rows, part_cols, tag, loop_order in parts:
         sch = _schedule_part(
             sch,

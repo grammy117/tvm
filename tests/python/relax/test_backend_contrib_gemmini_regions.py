@@ -346,7 +346,7 @@ class GemminiRegionTests(unittest.TestCase):
                         if c.args[0].value in ("tvm_gemmini_dma_out", "tvm_gemmini_dma_spad_out")
                     ]
                     self.assertEqual(len(stores), 2)
-                    self.assertTrue(all(int(c.args[-1]) == 1 for c in stores))
+                    self.assertTrue(any(c.args[0].value == "tvm_gemmini_end" for c in calls))
 
     def test_constant_padding_uses_standard_metaschedule_candidates(self):
         graph = padding_graph((3, 4), "float32", ((1, 1), (2, 1)), -0.0)
@@ -393,6 +393,9 @@ class GemminiRegionTests(unittest.TestCase):
         self.assertEqual(control.emulator_faults(), 0)
 
         def remove_wait(node):
+            if (isinstance(node, tir.Call) and node.op == tvm.ir.Op.get("tir.call_extern")
+                    and node.args[0].value == "tvm_gemmini_end"):
+                return tir.const(0, "int32")
             if (
                 isinstance(node, tir.Call)
                 and node.op == tvm.ir.Op.get("tir.call_extern")

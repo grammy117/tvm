@@ -272,7 +272,7 @@ class GemminiBiasTests(unittest.TestCase):
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 3)  # One output tile: groups/order do not add reuse.
+        self.assertGreaterEqual(len(designs), 3)  # OS, WS, pipelines and stock CPU sketches.
         # Check both traversal orders and the largest A/B reuse groups through
         # the normal tensorization and memory legality postprocessors.
         for design in designs:

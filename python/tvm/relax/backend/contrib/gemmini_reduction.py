@@ -254,7 +254,8 @@ def register_reduction_intrinsics(rows, depth, wide=False, source_casts=None):
     for kind, (desc, impl) in pairs.items():
         name = f"gemmini.sum.{kind}.{rows}x{depth}" + (".wide" if wide else "")
         name += "." + "_".join(source_casts)
-        tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+        from .gemmini_intrin import register_intrinsic_once
+        register_intrinsic_once(name, _canonical_description(desc), impl)
         result[kind] = name
     return result
 

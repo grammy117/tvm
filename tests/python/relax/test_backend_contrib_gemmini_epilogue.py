@@ -74,3 +74,14 @@ def test_nonmonotone_and_source_rounding_variants_are_refused():
     other = tir.stmt_functor.ir_transform(tir.Evaluate(expr), None, change, ["tir.Call"]).value
     with pytest.raises(ValueError, match="round-to-nearest-even"):
         prove_readout(other, accumulator)
+
+
+@pytest.mark.parametrize("shift", [0, 1, 4, 16, 30])
+def test_clip_round_even_power_of_two_division_proves_relu_readout(shift):
+    accumulator = tir.decl_buffer((1,), "int32", scope="local.gemmini_acc")[0]
+    value = tir.Div(accumulator.astype("float32"), tir.const(float(1 << shift), "float32"))
+    result = tir.min(tir.max(tir.nearbyint(value), tir.const(0, "float32")),
+                     tir.const(127, "float32")).astype("int8")
+    proof = prove_readout(result, accumulator)
+    assert proof["relu"]
+    assert proof["transitions_checked"] == 127

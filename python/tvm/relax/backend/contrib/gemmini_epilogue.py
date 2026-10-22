@@ -18,6 +18,7 @@
 
 import hashlib
 import json
+import math
 from functools import lru_cache
 
 import numpy as np
@@ -141,6 +142,15 @@ def _readout_chain(expression, accumulator):
             raise ValueError("Readout scales must be positive finite FP32 constants")
         factors, relu = _readout_chain(inner, accumulator)
         return factors + (float(np.float32(factor)),), relu
+    if isinstance(expression, tir.Div) and isinstance(expression.b, tir.FloatImm):
+        divisor = float(expression.b.value)
+        # Only powers of two make division identical to multiplication by
+        # its reciprocal across the full FP32 accumulator domain.
+        mantissa, _ = math.frexp(divisor)
+        if divisor <= 0 or not np.isfinite(divisor) or mantissa != 0.5:
+            raise ValueError("Readout division requires a positive power of two")
+        factors, relu = _readout_chain(expression.a, accumulator)
+        return factors + (float(np.float32(1.0 / divisor)),), relu
     activation = _constant_pair(expression, tir.Max)
     if activation is not None and activation[1] == 0:
         factors, _ = _readout_chain(activation[0], accumulator)
@@ -227,7 +237,7 @@ def prove_readout(expression, accumulator):
         raise ValueError("Readout requires an INT8 output cast")
     high = _constant_pair(expression.value, tir.Min)
     low = _constant_pair(high[0], tir.Max) if high else None
-    if high is None or low is None or high[1] != 127 or low[1] != -128:
+    if high is None or low is None or high[1] != 127 or low[1] not in (-128, 0):
         raise ValueError("Readout requires exact signed-byte saturation")
     rounded = low[0]
     if not isinstance(rounded, tir.Call) or rounded.op != tvm.ir.Op.get("tir.nearbyint"):
@@ -235,6 +245,7 @@ def prove_readout(expression, accumulator):
     if condition is not None and not tvm.ir.structural_equal(condition.args[0], rounded.args[0]):
         raise ValueError("Readout NaN guard does not cover the scaled value")
     factors, relu = _readout_chain(rounded.args[0], accumulator)
+    relu = relu or low[1] == 0
     return dict(_prove_chain(factors, relu))
 
 
@@ -317,7 +328,7 @@ class NormalizeGemminiReadout:
 
 def _register_readout_intrinsic(expression, accumulator, rows, cols, proof):
     from .gemmini_elementwise import _canonical_description
-    from .gemmini_intrin import ACC
+    from .gemmini_intrin import ACC, register_intrinsic_once
 
     def value(buffer, i, j):
         def replace(node):
@@ -376,7 +387,7 @@ def _register_readout_intrinsic(expression, accumulator, rows, cols, proof):
     canonical = _canonical_description(desc)
     key = hashlib.sha256(tvm.ir.save_json(canonical).encode()).hexdigest()[:24]
     name = f"gemmini.readout.{rows}x{cols}.{key}"
-    tir.TensorIntrin.register(name, canonical, impl)
+    register_intrinsic_once(name, canonical, impl)
     return name
 
 

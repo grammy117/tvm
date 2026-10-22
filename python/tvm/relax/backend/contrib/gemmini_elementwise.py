@@ -367,7 +367,8 @@ def _register_elementwise_intrinsics(kind, rows, cols, rank, source_rank):
         key = f"gemmini.tir.{kind}.{rank}d.{rows}x{cols}.{name}"
         if source_rank is not None:
             key += f".source{source_rank}d"
-        tir.TensorIntrin.register(key, _canonical_description(desc), impl)
+        from .gemmini_intrin import register_intrinsic_once
+        register_intrinsic_once(key, _canonical_description(desc), impl)
         result[name] = key
     return result
 
@@ -453,7 +454,8 @@ def register_relu_intrinsic(rows, cols, rank, zero_first=False):
                 )
 
     name = f"gemmini.relu_i8.{rank}d.{rows}x{cols}" + (".zero_first" if zero_first else "")
-    tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+    from .gemmini_intrin import register_intrinsic_once
+    register_intrinsic_once(name, _canonical_description(desc), impl)
     return name
 
 
@@ -539,7 +541,8 @@ def register_literal_intrinsic(rows, cols, rank, dtype, value_bits):
 
     key = hashlib.sha256(dtype.encode() + value_bits).hexdigest()
     name = f"gemmini.constant.{dtype}.{rank}d.{rows}x{cols}.{key}"
-    tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+    from .gemmini_intrin import register_intrinsic_once
+    register_intrinsic_once(name, _canonical_description(desc), impl)
     return name
 
 

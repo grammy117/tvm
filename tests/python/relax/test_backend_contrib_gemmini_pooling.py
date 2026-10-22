@@ -135,6 +135,10 @@ class GemminiPoolingTests(unittest.TestCase):
         removed = []
 
         def remove_wait(node):
+            if (isinstance(node, tir.Call) and node.op == tvm.ir.Op.get("tir.call_extern")
+                    and node.args[0].value == "tvm_gemmini_end"):
+                removed.append(node)
+                return tir.const(0, "int32")
             if (
                 isinstance(node, tir.Call)
                 and node.op == tvm.ir.Op.get("tir.call_extern")

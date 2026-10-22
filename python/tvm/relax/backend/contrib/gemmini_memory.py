@@ -479,8 +479,11 @@ def _host_hazards(stmt, allocations):
         for later in range(index + 1, len(access)):
             other = access[later]
             if (record["dma_read"] & other["cpu_write"]) or (
-                record["dma_write"] & (other["cpu_read"] | other["cpu_write"] | other["dma_read"])
+                record["dma_write"] & (other["cpu_read"] | other["cpu_write"] | other["dma_read"] | other["dma_write"])
             ):
+                # Host destinations have no accelerator address scoreboard.
+                # Two separate regions can overlap (e.g. padding fill followed
+                # by the interior copy), so order their store groups too.
                 fences.add(later)
     return waits, fences, statements
 

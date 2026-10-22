@@ -22,12 +22,21 @@ No graph names, generated block names or text parsing select an implementation.
 """
 
 from functools import lru_cache
+from threading import Lock
 
 from tvm import tir
 from tvm.script import tir as T
 
 SPAD = "local.gemmini_spad"
 ACC = "local.gemmini_acc"
+_REGISTRATION_LOCK = Lock()
+
+
+def register_intrinsic_once(name, description, implementation):
+    """Make registry insertion atomic for concurrent workload preparation."""
+    with _REGISTRATION_LOCK:
+        if tir.TensorIntrin.get(name, allow_missing=True) is None:
+            tir.TensorIntrin.register(name, description, implementation)
 
 
 def _update_reference(current, a, b, wrapping):
@@ -233,6 +242,9 @@ def register_intrinsics(rows=16, cols=16, depth=16, wrapping=False):
 
     for kind, (desc, impl) in pairs.items():
         name = f"gemmini.tir.{kind}.{rows}x{cols}x{depth}" + (".wrapping" if wrapping else "")
-        tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+        # functools caches distinguish omitted defaults and explicit keyword
+        # arguments; the global intrinsic registry does not. Registration must
+        # remain idempotent for both call spellings.
+        register_intrinsic_once(name, _canonical_description(desc), impl)
         result[kind] = name
     return result

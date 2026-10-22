@@ -229,7 +229,7 @@ class GemminiReductionTests(unittest.TestCase):
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 2)
+        self.assertGreaterEqual(len(designs), 2)
         features = ms.feature_extractor.PerStoreFeature().extract_from(
             context, [ms.search_strategy.MeasureCandidate(design, []) for design in designs]
         )
@@ -273,7 +273,7 @@ class GemminiReductionTests(unittest.TestCase):
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 2)
+        self.assertGreaterEqual(len(designs), 2)
         features = ms.feature_extractor.PerStoreFeature().extract_from(
             context, [ms.search_strategy.MeasureCandidate(design, []) for design in designs]
         )

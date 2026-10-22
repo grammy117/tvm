@@ -106,6 +106,60 @@ class EmulatedCase(unittest.TestCase):
 
 
 class SketchTests(EmulatedCase):
+    def test_partitioned_tails_use_rectangles_without_host_staging(self):
+        for shape, sketch, decisions in (
+            ((50, 32, 32), ContractionSketch(tail="m"),
+             {"i": [3, 1], "j": [2, 1], "k": [2, 1],
+              "ti": [1, 1], "tj": [2, 1], "tk": [2, 1]}),
+            ((32, 32, 19), ContractionSketch(tail="n"),
+             {"i": [2, 1], "j": [1, 1], "k": [2, 1],
+              "ti": [2, 1], "tj": [3, 1], "tk": [2, 1]}),
+        ):
+            _, fences, metadata = self.check(shape, sketch, decisions)
+            self.assertEqual(metadata["host_private_buffers"], 0)
+            self.assertEqual(metadata["waited_host_buffers"], 0)
+            # Separate output regions are conservatively ordered once; no
+            # per-tile waits or host padding are needed for their edge tiles.
+            self.assertLessEqual(fences, 2)
+
+    def test_round_even_clip_is_fused_and_numerically_exact(self):
+        from tvm.relax.backend.contrib.gemmini_epilogue import normalize_readout_layout
+        a = te.placeholder((3, 5), "int8", "a")
+        b = te.placeholder((5, 4), "int8", "b")
+        k = te.reduce_axis((0, 5), "k")
+        product = te.compute((3, 4), lambda i, j: te.sum(
+            a[i, k].astype("int32") * b[k, j].astype("int32"), axis=k), name="product")
+        output = te.compute((3, 4), lambda i, j: tir.min(tir.max(
+            tir.nearbyint(product[i, j].astype("float32") / tir.const(16.0, "float32")),
+            tir.const(0.0, "float32")), tir.const(127.0, "float32")).astype("int8"), name="readout")
+        func = normalize_readout_layout(te.create_prim_func([a, b, output]))
+        self.assertIn("gemmini.readout_proof", func.attrs)
+        lowered = lower_tensorir_schedule(func, default_schedule(func)).scheduled_mod
+        self.assertIn("tvm_gemmini_dma_scaled_out", lowered.script())
+        path = self.root / "readout.so"
+        tvm.build(lowered, "llvm").export_library(str(path), addons=[str(self.root / "emulator.c")],
+                                                  cc="cc", options=["-std=c11"])
+        runtime = tvm.runtime.load_module(str(path))
+        av = np.resize(np.array([-128, 127, -1, 0, 16], "int8"), (3, 5))
+        bv = np.resize(np.array([127, -128, 1, 2, 0, 7, -3], "int8"), (5, 4))
+        out = tvm.nd.empty((3, 4), "int8")
+        runtime(tvm.nd.array(av), tvm.nd.array(bv), out)
+        expected = np.clip(np.rint((av.astype("int32") @ bv.astype("int32")).astype("float32") / 16), 0, 127).astype("int8")
+        np.testing.assert_array_equal(out.numpy(), expected)
+
+    def test_rule_keeps_prior_schedule_operations(self):
+        func = matmul(32, 32, 32)
+        sch = tir.Schedule(func)
+        block = sch.get_block("product")
+        sch.annotate(sch.get_block("root"), "test.caller_schedule", 7)
+        supplied = str(sch.trace)
+        candidates = GemminiScheduleRule().apply(sch, block)
+        self.assertTrue(candidates)
+        for candidate in candidates:
+            self.assertEqual(int(candidate.mod["main"].body.block.annotations["test.caller_schedule"]), 7)
+            self.assertIn('"test.caller_schedule"', str(candidate.trace))
+        self.assertEqual(str(sch.trace), supplied)
+
     def test_sketch_structures_are_exact(self):
         cases = [
             ((64, 64, 48), ContractionSketch(), {"i": [2, 2], "j": [3, 1], "k": [2, 2]}),

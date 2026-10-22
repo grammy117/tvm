@@ -489,7 +489,8 @@ def register_bias_intrinsic(rows, cols, kind):
 
     suffix = f"channel_r{kind[1]}_a{kind[2]}" if channel else kind
     name = f"gemmini.bias.{suffix}.{rows}x{cols}"
-    tir.TensorIntrin.register(name, _canonical_description(desc), impl)
+    from .gemmini_intrin import register_intrinsic_once
+    register_intrinsic_once(name, _canonical_description(desc), impl)
     return name
 
 
