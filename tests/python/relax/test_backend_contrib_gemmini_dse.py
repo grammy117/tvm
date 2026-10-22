@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import unittest
 
 import numpy as np
+import pytest
 import tvm
 from tvm import meta_schedule as ms, relax, tir
 from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
@@ -37,6 +38,34 @@ import test_backend_contrib_gemmini_tensorir as reference
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
 from tune_models import Campaign
 import measure
+from retry_capped import retry
+
+
+@pytest.mark.parametrize("status,cap,new_cap", [
+    ("passed", None, 200),
+    ("rtl_timeout_or_failure", 100, 100),
+])
+def test_cap_retry_rejects_success_and_unchanged_allowance(tmp_path, status, cap, new_cap):
+    (tmp_path / "campaign.json").write_text("{}")
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text("{}")
+    (tmp_path / "measurement.json").write_text(json.dumps({"status": status, "cycle_cap": cap}))
+    with pytest.raises(ValueError, match="increased allowance"):
+        retry(tmp_path, artifact, max_cycles=new_cap)
+
+
+def test_cap_retry_rejects_changed_executable(tmp_path):
+    (tmp_path / "campaign.json").write_text("{}")
+    elf = tmp_path / "valid.elf"
+    elf.write_bytes(b"original executable")
+    identity = measure.identity(elf)
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text(json.dumps({"elfs": {"valid": identity}}))
+    (tmp_path / "measurement.json").write_text(json.dumps({
+        "status": "rtl_timeout_or_failure", "cycle_cap": 100}))
+    elf.write_bytes(b"replaced executable")
+    with pytest.raises(ValueError, match="executable bytes changed"):
+        retry(tmp_path, artifact, max_cycles=200)
 
 
 def test_concurrent_duplicate_measurements_run_once(tmp_path, monkeypatch):

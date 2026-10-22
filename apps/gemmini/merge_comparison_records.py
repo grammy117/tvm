@@ -40,7 +40,11 @@ def merge(root):
     destination = open_gemmini_database(root / "database", prepared, capabilities=caps)
     source = ms.database.JSONDatabase(work_dir=str(root / "replay-database"))
     verified = set()
-    for line in (root / "replay-trials.jsonl").read_text().splitlines():
+    lines = (root / "replay-trials.jsonl").read_text().splitlines()
+    retries = root / "replay-retry-trials.jsonl"
+    if retries.exists():
+        lines += retries.read_text().splitlines()
+    for line in lines:
         row = json.loads(line)
         if row.get("cycles") is None:
             continue

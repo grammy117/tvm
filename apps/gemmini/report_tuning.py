@@ -41,6 +41,7 @@ def summarize(root):
 
     trials = read_trials("trials.jsonl")
     replay_trials = read_trials("replay-trials.jsonl")
+    retry_trials = read_trials("retry-trials.jsonl") + read_trials("replay-retry-trials.jsonl")
     tasks = []
     for item in inventory["tasks"]:
         key = item["workload"]
@@ -53,10 +54,14 @@ def summarize(root):
                 row[kind] = json.loads(path.read_text())
         measured = [trial for trial in trials if trial["workload"] == key]
         replay = [trial for trial in replay_trials if trial["workload"] == key]
-        cpu = [trial for trial in measured + replay
+        retries = [trial for trial in retry_trials if trial["workload"] == key]
+        row["post_search_retry_trials"] = len(retries)
+        row["post_search_retry_best_cycles"] = min(
+            (trial["cycles"] for trial in retries if trial.get("cycles") is not None), default=None)
+        cpu = [trial for trial in measured + replay + retries
                if trial.get("cycles") is not None and not trial.get("native")]
         row["cpu_scheduled_best_cycles"] = min((trial["cycles"] for trial in cpu), default=None)
-        row["cpu_scheduled_scope"] = "Successful stock LLVM candidates from both search strategies"
+        row["cpu_scheduled_scope"] = "Successful stock LLVM candidates from both searches and any separate cap retries"
         row["search_trials"] = len(measured)
         row["successful_search_trials"] = sum(trial.get("cycles") is not None for trial in measured)
         row["reused_measurements"] = sum(bool(trial.get("reused")) for trial in measured)
@@ -77,12 +82,15 @@ def summarize(root):
             winner.trace.apply_to_schedule(sch, remove_postproc=False)
             cycles = float(winner.run_secs[0])
             row["best_cycles"] = cycles
-            matching = [trial for trial in measured + replay if trial.get("cycles") == cycles]
+            matching = [trial for trial in measured + replay + retries if trial.get("cycles") == cycles]
             trace_json = json.loads(tvm.ir.save_json(winner.trace.as_json()))
             match = next((trial for trial in matching if trial.get("trace") == trace_json),
                          matching[0] if matching else None)
             row["best_measurement_artifact"] = (
                 match["artifact"] if match else row.get("default", {}).get("artifact"))
+            row["best_measurement_stage"] = ("post-search cap retry" if match and
+                                              match.get("post_search_retry") else
+                                              "search" if match else "default")
             row["best_sketch"] = str(sch.mod["main"].body.block.annotations.get("gemmini.sketch", "cpu"))
             row["best_decisions"] = []
             decisions = dict(winner.trace.as_json()[1])
@@ -119,6 +127,7 @@ def summarize(root):
         "database": "database", "operators": inventory["operators"], "tasks": tasks,
         "call_count_weighted_selected_ops": weighted,
         "replay_comparison": "Separate stock ReplayTrace search; compare successful trial counts and budgets. Default records are excluded from search-only minima.",
+        "retry_scope": "Post-search cap retries run retained ELFs unchanged and remain outside search-only minima and matched budgets.",
     }
     for name in ("campaign.json", "replay-campaign.json", "database/cost-model.json",
                  "comparison-merge.json"):

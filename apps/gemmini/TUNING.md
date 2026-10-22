@@ -140,6 +140,15 @@ API. Search-only minima and matched budgets still come from the separate trial
 logs. This aggregation neither feeds measurements back into a running search nor
 implements a separate schedule replay path.
 
+When a completed candidate reached its cycle cap, `retry_capped.py` can execute
+that exact retained ELF with a larger allowance. It verifies the executable and
+hardware hashes, preserves the original outcome, and commits a successful label
+with the existing trace through `JSONDatabase.commit_tuning_record`. It neither
+builds a new schedule nor applies a trace. These extra measurements are listed
+separately and excluded from the original search minima and matched budgets.
+The bounded ResNet campaign retries the first 3x3 proposal from each strategy
+after all original 3x3 proposals reached their 20-million-cycle cap.
+
 The XGB warmup is four feature-bearing samples for these bounded experiments, rather
 than its upstream default of 100. The model and `cost-model.json` retain its
 training state. Early pilot campaigns that used the upstream warmup are labeled
