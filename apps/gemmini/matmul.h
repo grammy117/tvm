@@ -61,6 +61,9 @@ void tvm_gemmini_begin(int64_t a_stride, int64_t b_stride, int64_t c_stride);
 void tvm_gemmini_load_a(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols);
 void tvm_gemmini_load_b(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols);
 void tvm_gemmini_compute(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate);
+/* Same contract in weight-stationary mode. Consecutive calls naming the same
+ * B rows and shape reuse the weights preloaded into the array. */
+void tvm_gemmini_compute_ws(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate);
 void tvm_gemmini_store(int32_t* dst, uint32_t crow, uint32_t rows, uint32_t cols);
 void tvm_gemmini_end(void);
 
@@ -69,6 +72,12 @@ void tvm_gemmini_end(void);
 void tvm_gemmini_zero_acc(uint32_t row, uint32_t rows, uint32_t cols);
 void tvm_gemmini_dma_a(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 void tvm_gemmini_dma_b(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+/* Multi-block loads: cols <= MAX_BLOCK_LEN*DIM; DIM-column block b is written
+ * at row + b*block_rows. */
+void tvm_gemmini_dma_a_blocks(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride,
+                              uint32_t block_rows, int32_t wait);
+void tvm_gemmini_dma_b_blocks(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride,
+                              uint32_t block_rows, int32_t wait);
 void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 /* Full-width overwrite/add preserve INT32 bit patterns; addition wraps modulo
  * 2^32, as the accumulator SRAM adder does. No scaler is applied. Widen uses

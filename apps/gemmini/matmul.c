@@ -119,25 +119,99 @@ static uint32_t accumulator_address(uint32_t row, int32_t accumulate) {
   return (1U << (ADDR_LEN - 1)) | (1U << (ADDR_LEN - 3)) | ((uint32_t)accumulate << (ADDR_LEN - 2)) | row;
 }
 
+/* Configuration and weight-stationary state shadowed by the adapter. Each
+ * command stream keeps its configuration until the next config command of the
+ * same kind, so an identical reconfiguration is redundant. The shadow is
+ * invalidated by begin() and by the vendor tiled-matmul path, which issue
+ * their own configuration commands.
+ */
+static struct {
+  int valid_ld[3];
+  uint64_t ld_stride[3];
+  uint32_t ld_block[3];
+  int ld_shrunk[3];
+  int valid_st;
+  uint64_t st_stride;
+  int st_act;
+  uint32_t st_scale;
+  int valid_ex;
+  int ex_dataflow;
+  /* Weights currently held by the array in weight-stationary mode. */
+  int valid_ws;
+  uint32_t ws_row, ws_rows, ws_cols;
+} shadow;
+
+static void invalidate_shadow(void) {
+  for (int i = 0; i < 3; ++i) shadow.valid_ld[i] = 0;
+  shadow.valid_st = 0;
+  shadow.valid_ex = 0;
+  shadow.valid_ws = 0;
+}
+
+static void config_ld(int id, uint64_t stride, int shrunk, uint32_t block) {
+  if (shadow.valid_ld[id] && shadow.ld_stride[id] == stride && shadow.ld_shrunk[id] == shrunk &&
+      shadow.ld_block[id] == block) {
+    return;
+  }
+  gemmini_extended4_config_ld(stride, MVIN_SCALE_IDENTITY, shrunk, block, id);
+  shadow.valid_ld[id] = 1;
+  shadow.ld_stride[id] = stride;
+  shadow.ld_shrunk[id] = shrunk;
+  shadow.ld_block[id] = block;
+}
+
+static void config_st(uint64_t stride, int act, float scale) {
+  union { uint32_t bits; float value; } s = {.value = scale};
+  if (shadow.valid_st && shadow.st_stride == stride && shadow.st_act == act && shadow.st_scale == s.bits) {
+    return;
+  }
+  gemmini_extended_config_st(stride, act, scale);
+  shadow.valid_st = 1;
+  shadow.st_stride = stride;
+  shadow.st_act = act;
+  shadow.st_scale = s.bits;
+}
+
+static void config_ex(int dataflow) {
+  if (shadow.valid_ex && shadow.ex_dataflow == dataflow) {
+    return;
+  }
+  gemmini_config_ex(dataflow, NO_ACTIVATION, 0);
+  shadow.valid_ex = 1;
+  shadow.ex_dataflow = dataflow;
+  shadow.valid_ws = 0;
+}
+
+/* A scratchpad load into rows still feeding preloaded weights replaces the
+ * source, not the array copy; keep reuse only for disjoint destinations. */
+static void scratchpad_written(uint32_t row, uint32_t rows) {
+  if (shadow.valid_ws && row < shadow.ws_row + shadow.ws_rows && shadow.ws_row < row + rows) {
+    shadow.valid_ws = 0;
+  }
+}
+
 void tvm_gemmini_begin(int64_t a_stride, int64_t b_stride, int64_t c_stride) {
   /* Flush stale translations once. CPU fences do not establish DMA coherence;
    * exclusive ownership and the platform completion contract remain required.
    */
   asm volatile("fence rw,rw" ::: "memory");
   gemmini_flush(0);
-  gemmini_config_ex(OUTPUT_STATIONARY, NO_ACTIVATION, 0);
-  gemmini_config_st((uint64_t)c_stride * sizeof(acc_t));
-  gemmini_extended3_config_ld((uint64_t)a_stride, MVIN_SCALE_IDENTITY, false, 0);
-  gemmini_extended3_config_ld((uint64_t)b_stride, MVIN_SCALE_IDENTITY, false, 1);
+  invalidate_shadow();
+  config_ex(OUTPUT_STATIONARY);
+  config_st((uint64_t)c_stride * sizeof(acc_t), NO_ACTIVATION, ACC_SCALE_IDENTITY);
+  config_ld(0, (uint64_t)a_stride, false, DIM);
+  config_ld(1, (uint64_t)b_stride, false, DIM);
 }
 
 void tvm_gemmini_load_a(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols) {
+  scratchpad_written(spadrow, rows);
   asm volatile("" ::: "memory");
   gemmini_extended_mvin(src, spadrow, cols, rows);
   asm volatile("" ::: "memory");
 }
 
 void tvm_gemmini_load_b(const int8_t* src, uint32_t spadrow, uint32_t rows, uint32_t cols) {
+  scratchpad_written(spadrow, rows);
   asm volatile("" ::: "memory");
   gemmini_extended_mvin2(src, spadrow, cols, rows);
   asm volatile("" ::: "memory");
@@ -146,9 +220,31 @@ void tvm_gemmini_load_b(const int8_t* src, uint32_t spadrow, uint32_t rows, uint
 void tvm_gemmini_compute(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate) {
   /* Restart the PE reduction for every chunk; accumulation across global K
    * happens in int32 SRAM, preserving the 20-bit PE bound for <=16 products.
+   * accumulate=0 overwrites the accumulator rows instead of adding to them.
    */
+  config_ex(OUTPUT_STATIONARY);
   gemmini_extended_preload(GARBAGE_ADDR, accumulator_address(crow, accumulate), DIM, DIM, n, m);
   gemmini_extended_compute_preloaded(arow, brow, k, m, n, k);
+}
+
+void tvm_gemmini_compute_ws(uint32_t arow, uint32_t brow, uint32_t crow, uint32_t m, uint32_t n, uint32_t k, int32_t accumulate) {
+  /* Weight-stationary form of the same contraction. Consecutive calls with the
+   * same B rectangle stream new A rows through weights already in the array,
+   * as the vendor WS loop does with GARBAGE preloads and accumulated computes.
+   */
+  config_ex(WEIGHT_STATIONARY);
+  uint32_t out = accumulator_address(crow, accumulate);
+  if (shadow.valid_ws && shadow.ws_row == brow && shadow.ws_rows == k && shadow.ws_cols == n) {
+    gemmini_extended_preload(GARBAGE_ADDR, out, n, k, n, m);
+    gemmini_extended_compute_accumulated(arow, GARBAGE_ADDR, k, m, DIM, DIM);
+  } else {
+    gemmini_extended_preload(brow, out, n, k, n, m);
+    gemmini_extended_compute_preloaded(arow, GARBAGE_ADDR, k, m, DIM, DIM);
+    shadow.valid_ws = 1;
+    shadow.ws_row = brow;
+    shadow.ws_rows = k;
+    shadow.ws_cols = n;
+  }
 }
 
 void tvm_gemmini_store(int32_t* dst, uint32_t crow, uint32_t rows, uint32_t cols) {
@@ -183,30 +279,52 @@ int32_t tvm_gemmini_validate_tensor_buffers(const void* a, int64_t a_bytes, cons
 void tvm_gemmini_zero_acc(uint32_t row, uint32_t rows, uint32_t cols) {
   /* LoadController marks vaddr=0 as all_zeros: no host zero buffer is read.
    * Channel 2 uses full-width accumulator DMA, independently of A/B loads. */
-  gemmini_extended3_config_ld(DIM * sizeof(acc_t), MVIN_SCALE_IDENTITY, false, 2);
+  config_ld(2, DIM * sizeof(acc_t), false, DIM);
   gemmini_extended_mvin3(NULL, (1U << (ADDR_LEN - 1)) | row, cols, rows);
 }
 
 void tvm_gemmini_dma_a(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_extended3_config_ld((uint64_t)stride, MVIN_SCALE_IDENTITY, false, 0);
+  config_ld(0, (uint64_t)stride, false, DIM);
   tvm_gemmini_load_a(src, row, rows, cols);
   if (wait) tvm_gemmini_end();
 }
 
 void tvm_gemmini_dma_b(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_extended3_config_ld((uint64_t)stride, MVIN_SCALE_IDENTITY, false, 1);
+  config_ld(1, (uint64_t)stride, false, DIM);
   tvm_gemmini_load_b(src, row, rows, cols);
   if (wait) tvm_gemmini_end();
 }
 
+/* One mvin of up to MAX_BLOCK_LEN DIM-column blocks; block b lands at row
+ * + b*block_rows, so consecutive tiles of a tile-major cache load together. */
+void tvm_gemmini_dma_a_blocks(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride,
+                              uint32_t block_rows, int32_t wait) {
+  config_ld(0, (uint64_t)stride, false, block_rows);
+  scratchpad_written(row, block_rows * ((cols + DIM - 1) / DIM));
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin(src, row, cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_b_blocks(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride,
+                              uint32_t block_rows, int32_t wait) {
+  config_ld(1, (uint64_t)stride, false, block_rows);
+  scratchpad_written(row, block_rows * ((cols + DIM - 1) / DIM));
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin2(src, row, cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
 void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_config_st((uint64_t)stride * sizeof(acc_t));
+  config_st((uint64_t)stride * sizeof(acc_t), NO_ACTIVATION, ACC_SCALE_IDENTITY);
   tvm_gemmini_store(dst, row, rows, cols);
   if (wait) tvm_gemmini_end();
 }
 
 void tvm_gemmini_dma_acc_write(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_extended3_config_ld((uint64_t)stride * sizeof(acc_t), MVIN_SCALE_IDENTITY, false, 2);
+  config_ld(2, (uint64_t)stride * sizeof(acc_t), false, DIM);
   asm volatile("" ::: "memory");
   gemmini_extended_mvin3(src, accumulator_address(row, 0), cols, rows);
   asm volatile("" ::: "memory");
@@ -214,7 +332,7 @@ void tvm_gemmini_dma_acc_write(const int32_t* src, uint32_t row, uint32_t rows, 
 }
 
 void tvm_gemmini_dma_acc_add(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_extended3_config_ld((uint64_t)stride * sizeof(acc_t), MVIN_SCALE_IDENTITY, false, 2);
+  config_ld(2, (uint64_t)stride * sizeof(acc_t), false, DIM);
   asm volatile("" ::: "memory");
   gemmini_extended_mvin3(src, accumulator_address(row, 1), cols, rows);
   asm volatile("" ::: "memory");
@@ -222,7 +340,7 @@ void tvm_gemmini_dma_acc_add(const int32_t* src, uint32_t row, uint32_t rows, ui
 }
 
 void tvm_gemmini_dma_widen(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_extended3_config_ld((uint64_t)stride, MVIN_SCALE_IDENTITY, true, 2);
+  config_ld(2, (uint64_t)stride, true, DIM);
   asm volatile("" ::: "memory");
   gemmini_extended_mvin3(src, accumulator_address(row, 0), cols, rows);
   asm volatile("" ::: "memory");
@@ -230,7 +348,7 @@ void tvm_gemmini_dma_widen(const int8_t* src, uint32_t row, uint32_t rows, uint3
 }
 
 void tvm_gemmini_dma_spad_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
-  gemmini_config_st((uint64_t)stride);
+  config_st((uint64_t)stride, NO_ACTIVATION, ACC_SCALE_IDENTITY);
   asm volatile("" ::: "memory");
   gemmini_extended_mvout(dst, row, cols, rows);
   asm volatile("" ::: "memory");
@@ -242,7 +360,7 @@ void tvm_gemmini_dma_relu_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t
    * every source value was widened from INT8; identity scaling is then exact.
    */
   uint32_t address = accumulator_address(row, 0) & ~(1U << (ADDR_LEN - 3));
-  gemmini_extended_config_st((uint64_t)stride, RELU, ACC_SCALE_IDENTITY);
+  config_st((uint64_t)stride, RELU, ACC_SCALE_IDENTITY);
   asm volatile("" ::: "memory");
   gemmini_extended_mvout(dst, address, cols, rows);
   asm volatile("" ::: "memory");
@@ -255,7 +373,7 @@ void tvm_gemmini_dma_scaled_out(int8_t* dst, uint32_t row, uint32_t rows, uint32
    * INT32 input and supplies a positive finite tensor-wide FP32 scale. */
   union { uint32_t bits; float value; } scale = {.bits = scale_bits};
   uint32_t address = accumulator_address(row, 0) & ~(1U << (ADDR_LEN - 3));
-  gemmini_extended_config_st((uint64_t)stride, relu ? RELU : NO_ACTIVATION, scale.value);
+  config_st((uint64_t)stride, relu ? RELU : NO_ACTIVATION, scale.value);
   asm volatile("" ::: "memory");
   gemmini_extended_mvout(dst, address, cols, rows);
   asm volatile("" ::: "memory");
@@ -285,6 +403,7 @@ int32_t tvm_gemmini_matmul_i8_i32(const int8_t* a, const int8_t* b, int32_t* c, 
   tiled_matmul((size_t)m, (size_t)n, (size_t)k, a, b, NULL, c, (size_t)a_stride, (size_t)b_stride, (size_t)n, (size_t)c_stride,
                MVIN_SCALE_IDENTITY, MVIN_SCALE_IDENTITY, 0, NO_ACTIVATION, ACC_SCALE_IDENTITY, 0,
                false, 1, 1, 1, false, false, true, false, 0, OS);
+  invalidate_shadow();
   asm volatile("fence rw,rw" ::: "memory");
   return 0;
 }
