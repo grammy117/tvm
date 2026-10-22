@@ -26,6 +26,12 @@
 namespace tvm {
 namespace tir {
 
+/*! \brief A rendered legality error, retaining its type across C++ schedule callers. */
+class RenderedScheduleError : public tvm::runtime::Error {
+ public:
+  explicit RenderedScheduleError(const std::string& message) : tvm::runtime::Error(message) {}
+};
+
 /*! \brief Error that happens during TensorIR scheduling */
 class ScheduleError : public tvm::runtime::Error {
  public:

@@ -53,6 +53,7 @@
 #include "../support/nd_int_set.h"
 #include "../support/table_printer.h"
 #include "../support/utils.h"
+#include "../tir/schedule/error.h"
 #include "../tir/schedule/primitive.h"
 #include "../tir/schedule/utils.h"
 
@@ -330,7 +331,15 @@ struct ThreadedTraceApply {
                               /*debug_mode=*/0,
                               /*error_render_level=*/tir::ScheduleErrorRenderLevel::kNone);
 
-    trace->ApplyToSchedule(sch, /*remove_postproc=*/true);
+    try {
+      trace->ApplyToSchedule(sch, /*remove_postproc=*/true);
+    } catch (const tir::RenderedScheduleError&) {
+      // Resampling or mutation may invalidate a later schedule primitive.
+      // Reject this proposal just as a postprocessor rejects an illegal one;
+      // unrelated internal errors must still propagate to the caller.
+      trace_fail_counter_++;
+      return NullOpt;
+    }
     sch->EnterPostproc();
 
     for (int i = 0; i < n_; ++i) {
@@ -346,6 +355,8 @@ struct ThreadedTraceApply {
   /*! \brief Returns a string summarizing the failures on each postprocessor */
   std::string SummarizeFailures() const {
     std::ostringstream os;
+    os << "Trace replay: " << trace_fail_counter_.load() << " legality failure(s)";
+    if (n_ != 0) os << "\n";
     for (int i = 0; i < n_; ++i) {
       const Item& item = items_[i];
       os << "Postproc #" << i << " [" << item.postproc  //
@@ -370,6 +381,8 @@ struct ThreadedTraceApply {
   int n_;
   /*! \brief The pointer to the list of postprocessor items. */
   Item* items_;
+  /*! \brief The number of resampled traces rejected by a schedule primitive. */
+  std::atomic<int> trace_fail_counter_{0};
 };
 
 /*!

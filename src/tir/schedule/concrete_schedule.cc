@@ -215,11 +215,11 @@ Schedule ConcreteScheduleNode::Copy() {
   }                                                                                           \
   catch (const ScheduleError& error) {                                                        \
     if ((level) == ScheduleErrorRenderLevel::kDetail) {                                       \
-      throw tvm::runtime::Error(error.RenderReport(primitive) + "\n" + runtime::Backtrace()); \
+      throw RenderedScheduleError(error.RenderReport(primitive) + "\n" + runtime::Backtrace()); \
     } else if ((level) == ScheduleErrorRenderLevel::kFast) {                                  \
-      throw tvm::runtime::Error(error.FastErrorString());                                     \
+      throw RenderedScheduleError(error.FastErrorString());                                  \
     } else if ((level) == ScheduleErrorRenderLevel::kNone) {                                  \
-      throw tvm::runtime::Error("ScheduleError: (not rendered)");                             \
+      throw RenderedScheduleError("ScheduleError: (not rendered)");                          \
     }                                                                                         \
   }
 

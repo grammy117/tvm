@@ -29,6 +29,64 @@ from tvm.tir.schedule import Schedule, Trace
 
 MATMUL_M = 32
 
+
+@T.prim_func
+def copy_32(A: T.Buffer((32,), "float32"), B: T.Buffer((32,), "float32")):
+    for i in range(32):
+        with T.block("copy"):
+            vi = T.axis.spatial(32, i)
+            B[vi] = A[vi]
+
+
+@T.prim_func
+def copy_16_intrin(A: T.Buffer((16,), "float32"), B: T.Buffer((16,), "float32")):
+    with T.block("root"):
+        T.reads(A[0:16])
+        T.writes(B[0:16])
+        for i in range(16):
+            with T.block("copy"):
+                vi = T.axis.spatial(16, i)
+                B[vi] = A[vi]
+
+
+@pytest.mark.parametrize("strategy", ["replay", "evolutionary"])
+def test_resampled_trace_legality_failure_rejects_only_candidate(strategy):
+    """An eight-element sample cannot use a sixteen-element intrinsic."""
+    tvm.tir.TensorIntrin.register("test.trace.copy16", copy_16_intrin, copy_16_intrin,
+                                 override=True)
+
+    def schedule(sch):
+        block = sch.get_block("copy")
+        loop, = sch.get_loops(block)
+        tile = sch.sample_categorical([16, 8], [0.5, 0.5], decision=0)
+        _, inner = sch.split(loop, [None, tile])
+        sch.tensorize(inner, "test.trace.copy16")
+
+    search = (ms.search_strategy.ReplayTrace(max_fail_count=16) if strategy == "replay"
+              else ms.search_strategy.EvolutionarySearch(
+                  population_size=4, init_min_unmeasured=4, max_fail_count=16,
+                  genetic_num_iters=1, genetic_mutate_prob=0.0))
+    context = ms.TuneContext(
+        mod=tvm.IRModule({"main": copy_32}), target="llvm", num_threads=1, rand_state=1,
+        space_generator=ms.space_generator.ScheduleFn(
+            sch_fn=schedule, sch_rules=[], postprocs=[], mutator_probs={}),
+        search_strategy=search,
+    )
+    context.search_strategy.pre_tuning(
+        max_trials=4, num_trials_per_iter=4, design_spaces=context.generate_design_space(),
+        database=ms.database.MemoryDatabase(), cost_model=ms.cost_model.RandomModel(),
+    )
+    candidates = context.search_strategy.generate_measure_candidates()
+    assert candidates
+    for candidate in candidates:
+        samples = [inst for inst in candidate.sch.trace.insts
+                   if inst.kind.name == "SampleCategorical"]
+        # Decision zero selects the legal sixteen-element rectangle.
+        decision_map = dict(candidate.sch.trace.as_json()[1])
+        sample_index = list(candidate.sch.trace.insts).index(samples[0])
+        assert decision_map[sample_index] == 0
+    context.search_strategy.post_tuning()
+
 # pylint: disable=missing-class-docstring,invalid-name,no-member,line-too-long,too-many-nested-blocks,no-self-argument, unbalanced-tuple-unpacking
 # fmt: off
 
