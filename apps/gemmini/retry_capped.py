@@ -92,6 +92,7 @@ def retry(root, artifact_path, *, max_cycles, replay=False):
                post_search_retry=True, status=outcome["status"],
                original_run_error=trial.get("run_error"),
                run_error=None if outcome["status"] == "passed" else outcome["status"],
+               record_writer=measure.identity(__file__),
                cycles=outcome.get("cycles"), rtl_seconds=outcome.get("rtl_seconds"))
     if outcome["status"] == "passed":
         exists = any(record.run_secs and float(record.run_secs[0]) == outcome["cycles"]
