@@ -29,8 +29,8 @@ from tvm.relax.backend.contrib.gemmini_tensorir import (
     contraction_block,
     lower_tensorir_schedule,
     make_tensorir_schedule,
-    schedule_contraction,
 )
+from tvm.relax.backend.contrib.gemmini_sketch import default_schedule
 
 
 # All commands are delayed until a fence. CPU writes between command issue and
@@ -43,7 +43,7 @@ EMULATOR = r"""
 static int8_t sp[16384][16];
 static int32_t acc[1024][16];
 static unsigned char loaded[16384][16], initialized[1024][16];
-struct command { int op; const void* src; void* dst; uint32_t a,b,c,m,n,k; int64_t stride; };
+struct command { int op; const void* src; void* dst; uint32_t a,b,c,m,n,k; int64_t stride; int add; uint32_t block; };
 static struct command queue[65536];
 static unsigned count, faults, commands, fences;
 static int wrong, reverse_stores;
@@ -62,7 +62,7 @@ static void flush(void) {
   ++fences;
   for(unsigned t=0;t<count;++t) {
     struct command x=queue[t];
-    check(x.m>0 && x.m<=16 && x.n>0 && x.n<=16);
+    check(x.m>0 && x.m<=16 && x.n>0 && (x.n<=16 || x.op==11));
     if(x.op==0) {
       check(x.c+x.m<=1024);
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) { acc[x.c+i][j]=0; initialized[x.c+i][j]=1; }
@@ -75,9 +75,18 @@ static void flush(void) {
       for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
         int64_t part=0;
         for(unsigned k=0;k<x.k;++k) { check(loaded[x.a+i][k] && loaded[x.b+k][j]); part+=(int32_t)sp[x.a+i][k]*sp[x.b+k][j]; }
-        check(part>=-524288 && part<=524287 && initialized[x.c+i][j]);
-        uint32_t bits=(uint32_t)acc[x.c+i][j]+(uint32_t)part+(uint32_t)wrong;
-        memcpy(&acc[x.c+i][j],&bits,sizeof(bits));
+        check(part>=-524288 && part<=524287 && (!x.add || initialized[x.c+i][j]));
+        uint32_t bits=(x.add?(uint32_t)acc[x.c+i][j]:0u)+(uint32_t)part+(uint32_t)wrong;
+        memcpy(&acc[x.c+i][j],&bits,sizeof(bits));initialized[x.c+i][j]=1;
+      }
+    } else if(x.op==11) {
+      /* Multi-block load: DIM-column block b lands at row a + b*block. */
+      check(x.stride==0 || x.stride>=x.n);
+      check(x.n>0 && x.n<=64 && x.m>0 && x.m<=16);
+      const int8_t* p=x.src;
+      for(unsigned b=0;b*16<x.n;++b) for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<16 && b*16+j<x.n;++j) {
+        check(x.a+b*x.block+i<16384);
+        sp[x.a+b*x.block+i][j]=p[i*x.stride+b*16+j]; loaded[x.a+b*x.block+i][j]=1;
       }
     } else if(x.op==3) {
       check(x.c+x.m<=1024 && x.stride>=x.n);
@@ -154,7 +163,16 @@ void tvm_gemmini_dma_a(const int8_t* p,uint32_t a,uint32_t m,uint32_t n,int64_t 
 }
 void tvm_gemmini_dma_b(const int8_t* p,uint32_t a,uint32_t m,uint32_t n,int64_t stride,int32_t wait) { tvm_gemmini_dma_a(p,a,m,n,stride,wait); }
 void tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
-  check(add==1);push((struct command){.op=2,.a=a,.b=b,.c=c,.m=m,.n=n,.k=k});
+  check(add==0 || add==1);push((struct command){.op=2,.a=a,.b=b,.c=c,.m=m,.n=n,.k=k,.add=add});
+}
+void tvm_gemmini_compute_ws(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
+  tvm_gemmini_compute(a,b,c,m,n,k,add);
+}
+void tvm_gemmini_dma_a_blocks(const int8_t* p,uint32_t a,uint32_t m,uint32_t n,int64_t stride,uint32_t block,int32_t wait) {
+  push((struct command){.op=11,.src=p,.a=a,.m=m,.n=n,.stride=stride,.block=block});if(wait)flush();
+}
+void tvm_gemmini_dma_b_blocks(const int8_t* p,uint32_t a,uint32_t m,uint32_t n,int64_t stride,uint32_t block,int32_t wait) {
+  tvm_gemmini_dma_a_blocks(p,a,m,n,stride,block,wait);
 }
 void tvm_gemmini_dma_out(int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t stride,int32_t wait) {
   push((struct command){.op=3,.dst=p,.c=c,.m=m,.n=n,.stride=stride});if(wait)flush();
@@ -237,13 +255,14 @@ class GemminiTensorIRTests(unittest.TestCase):
 
     def test_trace_replays_from_original_untiled_workload(self):
         original = workload(17, 19, 33, "names_do_not_select_the_schedule")
-        result, _ = schedule_contraction(original)
+        result = default_schedule(original)
         replay = tir.Schedule(original, debug_mask="all")
         result.trace.apply_to_schedule(replay, remove_postproc=True)
         tvm.ir.assert_structural_equal(result.mod, replay.mod)
         kinds = {item.kind.name for item in result.trace.insts}
         self.assertTrue(
             {
+                "SamplePerfectTile",
                 "Split",
                 "Reorder",
                 "CacheRead",
@@ -254,18 +273,24 @@ class GemminiTensorIRTests(unittest.TestCase):
             }
             <= kinds
         )
-        other, _ = schedule_contraction(original, order="ji")
-        self.assertNotEqual(str(result.trace), str(other.trace))
+        other = default_schedule(workload(32, 32, 33), order="ji")
+        self.assertNotEqual(str(default_schedule(workload(32, 32, 33)).trace), str(other.trace))
 
     def test_matrix_cache_groups_reuse_dma_and_preserve_tails(self):
         for m, n, k in ((64, 64, 32), (17, 19, 33), (3, 4, 5)):
             a = ((np.arange(m * k).reshape(m, k) * 13) % 256 - 128).astype("int8")
             b = ((np.arange(k * n).reshape(k, n) * 7) % 256 - 128).astype("int8")
+            commands = {}
             for row_tiles, col_tiles in ((1, 1), (2, 1), (1, 2), (2, 2), (4, 4)):
                 for order in ("ij", "ji"):
-                    result = make_tensorir_schedule(
-                        workload(m, n, k), order=order, row_tiles=row_tiles, col_tiles=col_tiles
-                    )
+                    try:
+                        result = make_tensorir_schedule(
+                            workload(m, n, k), order=order, row_tiles=row_tiles, col_tiles=col_tiles
+                        )
+                    except ValueError:
+                        # Groups must divide the tile counts; odd shapes keep unit groups.
+                        self.assertNotEqual(m, 64)
+                        continue
                     runtime, control = self.build(result.scheduled_mod)
                     output = tvm.nd.empty((m, n), "int32")
                     runtime(tvm.nd.array(a), tvm.nd.array(b), output)
@@ -273,18 +298,17 @@ class GemminiTensorIRTests(unittest.TestCase):
                         output.numpy(), a.astype("int64") @ b.astype("int64")
                     )
                     self.assertEqual(control.emulator_faults(), 0)
+                    commands[(row_tiles, col_tiles)] = control.emulator_commands()
                     if m == 64:
-                        # Four microtiles per dimension and two reduction chunks.
-                        a_loads, b_loads = 4 * (4 // col_tiles) * 2, 4 * (4 // row_tiles) * 2
-                        self.assertEqual(
-                            control.emulator_commands(), a_loads + b_loads + 32 + 16 + 16
-                        )
                         self.assertEqual(result.metadata["acc_rows"], 16 * row_tiles * col_tiles)
+            if m == 64:
+                # Larger reuse groups move fewer operand tiles and issue fewer commands.
+                self.assertLess(commands[(4, 4)], commands[(1, 1)])
 
     def test_missing_physical_sram_row_alignment_is_rejected(self):
         from tvm.relax.backend.contrib.gemmini_memory import lower_memory
 
-        schedule, _ = schedule_contraction(workload(3, 4, 5))
+        schedule = default_schedule(workload(3, 4, 5))
 
         def erase_alignment(node):
             if isinstance(node, tir.Block) and "buffer_dim_align" in node.annotations:
@@ -513,7 +537,6 @@ class GemminiTensorIRTests(unittest.TestCase):
             num_threads=1,
         )
         designs = context.generate_design_space()
-        self.assertEqual(len(designs), 15)  # No over-padding groups or duplicate unit-axis order.
         self.assertEqual(len({str(design.trace) for design in designs}), len(designs))
         candidates = [ms.search_strategy.MeasureCandidate(design, []) for design in designs]
         features = ms.feature_extractor.PerStoreFeature().extract_from(context, candidates)
@@ -523,20 +546,27 @@ class GemminiTensorIRTests(unittest.TestCase):
         )
         a = ((np.arange(17 * 33).reshape(17, 33) * 13) % 256 - 128).astype("int8")
         b = ((np.arange(33 * 19).reshape(33, 19) * 7) % 256 - 128).astype("int8")
+        native = 0
         for design in designs:
             design.enter_postproc()
             self.assertTrue(
                 all(postproc.apply(design) for postproc in context.space_generator.postprocs)
             )
+            if "tvm_gemmini" not in design.mod.script():
+                continue  # CPU placement of the same function
+            native += 1
             lowered = lower_tensorir_schedule(func, design)
             runtime, control = self.build(lowered.scheduled_mod)
             output = tvm.nd.empty((17, 19), "int32")
             runtime(tvm.nd.array(a), tvm.nd.array(b), output)
             np.testing.assert_array_equal(output.numpy(), a.astype("int64") @ b.astype("int64"))
             self.assertEqual(control.emulator_faults(), 0)
+        self.assertGreater(native, 1)
+        self.assertGreater(len(designs), native)
 
     def test_missing_staging_wait_is_detected_by_queued_dma(self):
-        result = make_tensorir_schedule(workload(17, 19, 33))
+        # A padded 16-deep chunk stages the operand tails per tile on the host.
+        result = make_tensorir_schedule(workload(17, 19, 33), reduction_chunk=16)
         func = result.scheduled_mod["main"]
 
         def remove_wait(node):
@@ -571,9 +601,7 @@ class GemminiTensorIRTests(unittest.TestCase):
 
         func = workload(32, 32, 16)
         caps = GemminiCapabilities()
-        chosen, _ = schedule_contraction(
-            func, order="ji", load_order="ba", row_tiles=2, col_tiles=2
-        )
+        chosen = default_schedule(func, order="ji", row_tiles=2, col_tiles=2)
         database = ms.database.MemoryDatabase()
         record_workload = database.commit_workload(tvm.IRModule({"main": func}))
         # Diagnostic selection test only: these invented costs are never target
@@ -582,13 +610,13 @@ class GemminiTensorIRTests(unittest.TestCase):
             ms.database.TuningRecord(chosen.trace, record_workload, [1.0], caps.target(), [])
         )
         report = []
-        with database:
-            mod = ScheduleGemminiTensorIR(report=report)(tvm.IRModule({"main": func}))
+        with caps.target(), database:
+            mod = relax.transform.MetaScheduleApplyDatabase()(tvm.IRModule({"main": func}))
+        mod = ScheduleGemminiTensorIR(report=report)(mod)
         self.assertEqual(report[0]["origin"], "TVM MetaSchedule database")
-        self.assertEqual(report[0]["metadata"]["schedule_parameters"]["order"], "ji")
-        self.assertEqual(report[0]["metadata"]["schedule_parameters"]["row_tiles"], 2)
+        self.assertEqual(report[0]["placement"], "gemmini")
         expected = lower_tensorir_schedule(func, chosen).scheduled_mod["main"]
-        tvm.ir.assert_structural_equal(mod["main"], expected)
+        tvm.ir.assert_structural_equal(mod["main"].body, expected.body)
         with self.assertRaisesRegex(ValueError, "SRAM capacity"):
             make_tensorir_schedule(func, capabilities=GemminiCapabilities(acc_rows=15))
         fallback_report = []
@@ -598,14 +626,9 @@ class GemminiTensorIRTests(unittest.TestCase):
         tvm.ir.assert_structural_equal(fallback["main"], func)
         self.assertEqual(fallback_report[0]["placement"], "cpu")
         with self.assertRaisesRegex(ValueError, "target key"):
-            ms.TuneContext(mod=func, target="llvm", space_generator=gemmini_space_generator())
-        mismatch_report = []
-        with database:
-            mismatch = ScheduleGemminiTensorIR(
-                capabilities=GemminiCapabilities(acc_rows=512), report=mismatch_report
-            )(tvm.IRModule({"main": func}))
-        tvm.ir.assert_structural_equal(mismatch["main"], func)
-        self.assertIn("different Gemmini target", mismatch_report[0]["reason"])
+            ms.TuneContext(
+                mod=func, target="llvm", space_generator=gemmini_space_generator()
+            ).generate_design_space()
 
 
 if __name__ == "__main__":

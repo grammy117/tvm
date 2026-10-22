@@ -142,59 +142,6 @@ def _normalizable_contractions(func):
     return matches
 
 
-def _normalize_contraction(sch):
-    """Use standard layout schedules, retaining the original workload trace."""
-    matches = contraction_block(sch.mod["main"])
-    if len(matches) == 1:
-        return matches[0]
-    matches = _normalizable_contractions(sch.mod["main"])
-    if len(matches) != 1:
-        raise ValueError("Expected one structurally supported exact INT8/INT32 contraction")
-    node, shape, (batch, rows, cols, reduction) = matches[0]
-    block = sch.get_block(node.name_hint)
-    extents = [int(axis.dom.extent) for axis in node.iter_vars]
-
-    def matrix_map(*indices):
-        def flatten(group):
-            value = indices[group[0]]
-            for index in group[1:]:
-                value = value * extents[index] + indices[index]
-            return value
-
-        return tuple(indices[index] for index in batch) + tuple(
-            flatten(group) for group in (rows, cols, reduction)
-        )
-
-    index_map = tir.IndexMap.from_func(
-        matrix_map, ndim=len(extents), index_dtype=node.iter_vars[0].var.dtype
-    )
-    sch.transform_block_layout(block, index_map)
-    sch.reindex(block, ("write", 0))
-    product = _contraction_update(sch.get(block))[1]
-    a_buffer, b_buffer = product.a.value.buffer, product.b.value.buffer
-    a_copy = sch.reindex(block, a_buffer)
-    b_copy = sch.reindex(block, b_buffer)
-    b_rank = len(sch.get(b_copy).writes[0].buffer.shape)
-    transpose = tir.IndexMap.from_func(
-        lambda *indices: (*indices[:-2], indices[-1], indices[-2]),
-        ndim=b_rank,
-        index_dtype=node.iter_vars[0].var.dtype,
-    )
-    sch.transform_layout(b_copy, ("write", 0), transpose)
-    # Inline upstream index/padding expressions into the copies. compute_at
-    # below then materializes only the matrix region needed by each DMA.
-    for copy in (a_copy, b_copy):
-        for producer in sch.get_producers(copy):
-            try:
-                sch.compute_inline(producer)
-            except tir.schedule.ScheduleError:
-                pass
-    normalized = contraction_block(sch.mod["main"])
-    if len(normalized) != 1:
-        raise ValueError("TVM layout normalization did not form a canonical matrix contraction")
-    return normalized[0][0], shape
-
-
 def contraction_block(func):
     """Find an exact signed INT8 x INT8 -> INT32 matrix reduction by structure."""
     matches = []
@@ -267,237 +214,6 @@ def contraction_block(func):
     return matches
 
 
-def schedule_contraction(
-    func,
-    *,
-    order="ij",
-    load_order="ab",
-    reduction_chunk=16,
-    row_tiles=1,
-    col_tiles=1,
-    tensorize=True,
-    mark_tensorize=False,
-    sample_groups=False,
-):
-    """Schedule a canonical matrix reduction using ordinary TensorIR primitives.
-
-    Padding, cache placement and reduction initialization remain mathematical
-    operations until tensorization. Physical SRAM allocation is a separate pass.
-    """
-    sch = tir.Schedule(func, debug_mask="all")
-    node, (m, n, depth) = _normalize_contraction(sch)
-    biased = isinstance(node.init.value, tir.BufferLoad)
-    wrapping = _contraction_update(node)[2]
-    if order not in ("ij", "ji"):
-        raise ValueError("Gemmini traversal order must be ij or ji")
-    if load_order not in ("ab", "ba"):
-        raise ValueError("Gemmini DMA order must be ab or ba")
-    if type(reduction_chunk) is not int or not 2 <= reduction_chunk <= 16:
-        raise ValueError("Gemmini reduction chunks require an integer in [2,16]")
-    if any(type(value) is not int or value not in (1, 2, 4) for value in (row_tiles, col_tiles)):
-        raise ValueError("Gemmini matrix cache groups require 1, 2 or 4 tiles")
-    if tensorize and mark_tensorize:
-        raise ValueError("Choose immediate tensorization or MetaSchedule annotations")
-    if biased:
-        choices = lambda extent, groups: [x for x in range(1, 17) if extent % (x * groups) == 0]
-        if not choices(m, row_tiles) or not choices(n, col_tiles):
-            raise ValueError("Bias cache groups must divide the mathematical output")
-        rows, cols = max(choices(m, row_tiles)), max(choices(n, col_tiles))
-        chunk = max(x for x in range(1, reduction_chunk + 1) if depth % x == 0)
-    else:
-        rows, cols = (max(2, min(16, value)) for value in (m, n))
-        chunk = max(2, min(reduction_chunk, depth))
-    row_factor, col_factor = row_tiles, col_tiles
-    if sample_groups:
-        if biased:
-            raise ValueError("Sampled cache groups currently require zero-initialized contractions")
-
-        # Divisor groups retain one padding layout across all decisions. This
-        # makes replay/resampling sound: only actual split factors change.
-        def sample(extent, tile, maximum):
-            count = (extent + tile - 1) // tile
-            choices = [value for value in (1, 2, 4) if value <= maximum and count % value == 0]
-            return sch.sample_categorical(choices, [1 / len(choices)] * len(choices))
-
-        row_factor, col_factor = sample(m, rows, row_tiles), sample(n, cols, col_tiles)
-    for key, value in {
-        "order": order,
-        "load_order": load_order,
-        "reduction_chunk": chunk,
-        "row_tiles": row_factor,
-        "col_tiles": col_factor,
-    }.items():
-        sch.annotate(sch.get_block("root"), "gemmini." + key, value)
-    # Preserve nontrivial block axes through the pinned tensorization matcher.
-    # Unit axes use standard mathematical zero-padding, never out-of-range DMA.
-    block = sch.get_block(node.name_hint)
-    padding_factors = (
-        (rows, cols, chunk) if sample_groups else (rows * row_tiles, cols * col_tiles, chunk)
-    )
-    padded = any(value % factor for value, factor in zip((m, n, depth), padding_factors))
-    if padded:
-        if wrapping:
-            raise ValueError("Explicit modular contractions require divisor tiles")
-        sch.pad_einsum(block, [1] * (len(node.iter_vars) - 3) + list(padding_factors))
-    i, j, k = sch.get_loops(block)[-3:]
-    io, it, ii = sch.split(i, [None, row_factor, rows])
-    jo, jt, ji = sch.split(j, [None, col_factor, cols])
-    ko, ki = sch.split(k, [None, chunk])
-    sch.reorder(*((io, jo) if order == "ij" else (jo, io)), ko, it, jt, ii, ji, ki)
-    outer = jo if order == "ij" else io
-    write = sch.cache_write(block, 0, ACC)
-    sch.reverse_compute_at(write, outer, preserve_unit_loops=True)
-    if biased:
-        # The normalization's output copy can fold into the complete DMA
-        # writeback block. The reduction itself remains a reduction block.
-        for consumer in list(sch.get_consumers(write)):
-            copy = sch.get(consumer)
-            if (
-                isinstance(copy.body, tir.BufferStore)
-                and isinstance(copy.body.value, tir.BufferLoad)
-                and tvm.ir.structural_equal(copy.body.indices, copy.body.value.indices)
-                and tvm.ir.structural_equal(copy.body.buffer.shape, copy.body.value.buffer.shape)
-            ):
-                sch.reverse_compute_inline(consumer)
-    product = _contraction_update(sch.get(block))[1]
-    a_buffer, b_buffer = product.a.value.buffer, product.b.value.buffer
-    read_index = lambda buffer: next(
-        index for index, region in enumerate(sch.get(block).reads) if region.buffer.same_as(buffer)
-    )
-    load_a = sch.cache_read(block, read_index(a_buffer), SPAD)
-    load_b = sch.cache_read(block, read_index(b_buffer), SPAD)
-    for load in (load_a, load_b) if load_order == "ab" else (load_b, load_a):
-        sch.compute_at(load, ko, preserve_unit_loops=True)
-    # The array addresses each tile as consecutive 16-element SRAM rows. A
-    # normal row-major multi-tile B/C cache has a wider row stride, so express
-    # the hardware tile layout with standard index-map transformations.
-    if sample_groups or col_tiles > 1:
-
-        def tiled_columns(*indices):
-            return (*indices[:-2], indices[-1] // cols, indices[-2], indices[-1] % cols)
-
-        rank = len(sch.get(load_b).writes[0].buffer.shape)
-        sch.transform_layout(
-            load_b,
-            ("write", 0),
-            tir.IndexMap.from_func(
-                tiled_columns, ndim=rank, index_dtype=node.iter_vars[0].var.dtype
-            ),
-        )
-    if sample_groups or row_tiles > 1 or col_tiles > 1:
-
-        def tiled_output(*indices):
-            return (
-                *indices[:-2],
-                indices[-2] // rows,
-                indices[-1] // cols,
-                indices[-2] % rows,
-                indices[-1] % cols,
-            )
-
-        rank = len(sch.get(block).writes[0].buffer.shape)
-        sch.transform_layout(
-            block,
-            ("write", 0),
-            tir.IndexMap.from_func(
-                tiled_output, ndim=rank, index_dtype=node.iter_vars[0].var.dtype
-            ),
-        )
-    a_row, a_k = sch.get_loops(load_a)[-2:]
-    a_tile, a_inner = sch.split(a_row, [None, rows])
-    sch.reorder(a_tile, a_inner, a_k)
-    b_k, b_col = sch.get_loops(load_b)[-2:]
-    b_tile, b_inner = sch.split(b_col, [None, cols])
-    sch.reorder(b_tile, b_k, b_inner)
-    c_row, c_col = sch.get_loops(write)[-2:]
-    c_it, c_ii = sch.split(c_row, [None, rows])
-    c_jt, c_ji = sch.split(c_col, [None, cols])
-    sch.reorder(c_it, c_jt, c_ii, c_ji)
-    for cache in (load_a, load_b, block):
-        sch.storage_align(cache, 0, axis=-2, factor=16, offset=0)
-    # Materialize only the needed padding regions near each DMA consumer.
-    for load in (load_a, load_b):
-        for producer in sch.get_producers(load):
-            sch.compute_at(producer, ko, preserve_unit_loops=True)
-            # A convolution reindex can feed a padding stage. Fold that copy
-            # into the padding expression rather than retaining a full im2col.
-            for upstream in sch.get_producers(producer):
-                try:
-                    sch.compute_inline(upstream)
-                except tir.schedule.ScheduleError:
-                    pass
-    pending, placed = list(sch.get_consumers(write)), set()
-
-    def inside_tile(producer):
-        return any(sch.get(loop).same_as(sch.get(outer)) for loop in sch.get_loops(producer))
-
-    while pending:
-        consumer = pending.pop(0)
-        name = sch.get(consumer).name_hint
-        if name in placed:
-            continue
-        consumer_node = sch.get(consumer)
-        if (
-            isinstance(consumer_node.body, tir.BufferStore)
-            and isinstance(consumer_node.body.value, tir.BufferLoad)
-            and math.prod(int(x) for x in consumer_node.body.buffer.shape)
-            < math.prod(int(x) for x in consumer_node.body.value.buffer.shape)
-        ):
-            # Keep an unpadding copy at root. Moving nested unpadding/layout
-            # copies into a partial output tile breaks v0.19's region-cover
-            # invariant. DMA completion before this CPU consumer is supplied
-            # by the ordinary target memory/effect lowering.
-            continue
-        # A fused epilogue can have independent pointwise producers, such as
-        # widening a narrow bias. Inline those ordinary expressions before
-        # moving the consumer; keep non-inlineable CPU reductions outside.
-        for producer in list(sch.get_producers(consumer)):
-            if not inside_tile(producer):
-                try:
-                    sch.compute_inline(producer)
-                except tir.schedule.ScheduleError:
-                    pass
-        if not all(inside_tile(producer) for producer in sch.get_producers(consumer)):
-            continue
-        sch.reverse_compute_at(consumer, outer, preserve_unit_loops=True)
-        placed.add(name)
-        pending.extend(sch.get_consumers(consumer))
-    init = sch.decompose_reduction(block, ko)
-    bias_intrinsic = None
-    if biased:
-        from .gemmini_bias import schedule_bias_init
-
-        sch, bias_intrinsic = schedule_bias_init(sch, init, outer, rows, cols)
-    from .gemmini_epilogue import fuse_readout
-    sch, write, readout_intrinsic = fuse_readout(sch, write, rows, cols)
-    mathematical = sch.mod
-    if tensorize or mark_tensorize:
-        intrin = register_intrinsics(rows, cols, chunk, wrapping=wrapping)
-        if bias_intrinsic is not None:
-            intrin = dict(intrin, init=bias_intrinsic)
-        if readout_intrinsic is not None:
-            intrin = dict(intrin, store=readout_intrinsic)
-        for target, axes, kind in (
-            (init, 2, "init"),
-            (load_a, 2, "load_a"),
-            (load_b, 2, "load_b"),
-            (block, 3, "compute"),
-            (write, 2, "store"),
-        ):
-            loop = sch.get_loops(target)[-axes]
-            outer = sch.blockize(loop)
-            if kind != "store":
-                # Blockization changes the buffer rank seen by the outer
-                # block. Keep physical row alignment on that block, where
-                # Tensorize and allocation compaction consume the annotation.
-                sch.storage_align(outer, 0, axis=-2, factor=16, offset=0)
-            if tensorize:
-                sch.tensorize(outer, intrin[kind])
-            else:
-                sch.annotate(outer, "meta_schedule.auto_tensorize", intrin[kind])
-    return sch, mathematical
-
-
 @dataclass(frozen=True)
 class GemminiTensorIRSchedule:
     """The original workload, full transformation trace and deployable result."""
@@ -509,38 +225,54 @@ class GemminiTensorIRSchedule:
     metadata: dict
 
 
+def finalize_gemmini_function(scheduled, *, capabilities=None):
+    """Lower memory and add the admission envelope to an already scheduled function."""
+    return lower_tensorir_schedule(
+        None, tir.Schedule(scheduled), capabilities=capabilities
+    ).scheduled_mod["main"]
+
+
 def make_tensorir_schedule(
     func,
     *,
     order="ij",
-    load_order="ab",
-    reduction_chunk=16,
+    reduction_chunk=None,
     row_tiles=1,
     col_tiles=1,
     capabilities=None,
 ):
-    """Apply the structural rule and lower target scopes with admission checks."""
-    sch, mathematical = schedule_contraction(
+    """Apply the default contraction sketch and lower target scopes with admission checks."""
+    from .gemmini_sketch import default_schedule  # pylint: disable=import-outside-toplevel
+
+    sch = default_schedule(
         func,
+        capabilities=capabilities,
         order=order,
-        load_order=load_order,
-        reduction_chunk=reduction_chunk,
+        chunk=reduction_chunk,
         row_tiles=row_tiles,
         col_tiles=col_tiles,
     )
-    return lower_tensorir_schedule(
-        func, sch, mathematical=mathematical, order=order, capabilities=capabilities
-    )
+    return lower_tensorir_schedule(func, sch, order=order, capabilities=capabilities)
 
 
 def lower_tensorir_schedule(
     func, sch, *, mathematical=None, order="database", capabilities=None, workload_metadata=None
 ):
-    """Finalize a TVM-selected schedule without replacing its scheduling choices."""
+    """Finalize a TVM-selected schedule without replacing its scheduling choices.
+
+    ``func`` is the mathematical workload when available. A function already
+    scheduled elsewhere (for example replayed from a tuning database) passes
+    ``func=None``; buffer ownership then comes from the scheduled program.
+    """
     from .gemmini_memory import lower_memory  # pylint: disable=import-outside-toplevel
     from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
 
     capabilities = capabilities or GemminiCapabilities()
+    scheduled_only = func is None
+    if scheduled_only:
+        func = sch.mod["main"]
+        if workload_metadata is None:
+            workload_metadata = {}
     if any(param not in func.buffer_map for param in func.params):
         raise ValueError("Gemmini runtime ABI requires buffer parameters")
     mathematical = mathematical if mathematical is not None else tvm.IRModule({"main": func})
@@ -570,10 +302,21 @@ def lower_tensorir_schedule(
     ):
         raise ValueError("External DMA row stride exceeds the Gemmini ABI")
     written = set()
-    tir.stmt_functor.post_order_visit(
-        func.body,
-        lambda node: written.add(node.buffer.data) if isinstance(node, tir.BufferStore) else None,
-    )
+
+    def record_write(node):
+        if isinstance(node, tir.BufferStore):
+            written.add(node.buffer.data)
+        elif (
+            isinstance(node, tir.Call)
+            and node.op.same_as(tvm.ir.Op.get("tir.tvm_access_ptr"))
+            and isinstance(node.args[4], tir.IntImm)
+            and int(node.args[4]) & 2
+        ):
+            written.add(node.args[1])
+
+    # Without the mathematical function, ownership is read from the lowered
+    # program, where intrinsic views have become parameter access pointers.
+    tir.stmt_functor.post_order_visit((device if scheduled_only else func).body, record_write)
     # MetaSchedule may renew every Var while cloning a candidate. Ownership
     # comes from the original mathematical ABI's parameter positions, not
     # pointer identity shared accidentally with one scheduling path.
@@ -583,7 +326,7 @@ def lower_tensorir_schedule(
         for source, selected in zip(original_buffers, buffers)
     ):
         raise ValueError("Scheduled function changed the mathematical tensor ABI")
-    roles = [buffer.data in written for buffer in original_buffers]
+    roles = [buffer.data in written for buffer in (buffers if scheduled_only else original_buffers)]
     inputs = [(buffer, size) for buffer, size, output in zip(buffers, sizes, roles) if not output]
     outputs = [(buffer, size) for buffer, size, output in zip(buffers, sizes, roles) if output]
     if not outputs:
@@ -701,13 +444,29 @@ def lower_tensorir_schedule(
     )
 
 
+def _uses_gemmini_memory(func):
+    found = []
+    tir.stmt_functor.post_order_visit(
+        func.body,
+        lambda node: found.extend(
+            buffer for buffer in node.alloc_buffers if buffer.scope().startswith("local.gemmini_")
+        )
+        if isinstance(node, tir.Block)
+        else None,
+    )
+    return bool(found)
+
+
 @tvm.transform.module_pass(opt_level=0, name="ScheduleGemminiTensorIR")
 class ScheduleGemminiTensorIR:
-    """Schedule supported mathematical TIR; keep unsupported functions on CPU.
+    """Finalize database schedules and give untuned functions the default placement.
 
-    Run after legalization and supported graph fusion. A target-specific schedule
-    failure retains the original function and records its reason. Unexpected
-    compiler failures propagate instead of silently changing placement.
+    Run after ``relax.transform.MetaScheduleApplyDatabase``. A function it marked
+    ``tir.is_scheduled`` keeps its tuned schedule: Gemmini placements only get
+    physical memory lowering and the admission envelope, CPU placements are left
+    unchanged. Untuned supported functions get the default Gemmini sketch;
+    anything unsupported stays on the CPU. A target-specific schedule failure
+    retains the original function and records its reason.
     """
 
     def __init__(
@@ -727,7 +486,7 @@ class ScheduleGemminiTensorIR:
         self.capabilities = capabilities or GemminiCapabilities()
         self.order = order
         self.schedule_options = dict(schedule_options or {})
-        if set(self.schedule_options) - {"load_order", "reduction_chunk", "row_tiles", "col_tiles"}:
+        if set(self.schedule_options) - {"reduction_chunk", "row_tiles", "col_tiles"}:
             raise ValueError("Unknown Gemmini TensorIR schedule option")
         self.report = report if report is not None else []
         self.references = references if references is not None else {}
@@ -750,6 +509,30 @@ class ScheduleGemminiTensorIR:
                 func.attrs and "gemmini.tensorir" in func.attrs
             ):
                 continue
+            if func.attrs and bool(func.attrs.get("tir.is_scheduled", False)):
+                if not _uses_gemmini_memory(func):
+                    self.report.append(
+                        {
+                            "function": gv.name_hint,
+                            "placement": "cpu",
+                            "origin": "TVM MetaSchedule database",
+                            "reason": "Tuned CPU schedule selected by measurement",
+                        }
+                    )
+                    continue
+                result = lower_tensorir_schedule(
+                    None, tir.Schedule(func), capabilities=self.capabilities
+                )
+                mod.update_func(gv, result.scheduled_mod["main"])
+                self.report.append(
+                    {
+                        "function": gv.name_hint,
+                        "placement": "gemmini",
+                        "metadata": result.metadata,
+                        "origin": "TVM MetaSchedule database",
+                    }
+                )
+                continue
             matches = contraction_block(func) or _normalizable_contractions(func)
             reductions = reduction_blocks(func) if not matches else []
             pointwise = elementwise_blocks(func) if not matches and not reductions else []
@@ -763,78 +546,7 @@ class ScheduleGemminiTensorIR:
                 )
                 continue
             try:
-                database = tvm.meta_schedule.Database.current()
-                target = self.capabilities.target()
-                workload = tvm.IRModule({"main": func})
-                record = (
-                    database.query_tuning_record(workload, target, workload_name=gv.name_hint)
-                    if database is not None
-                    else None
-                )
-                # v0.19's default database query ignores its target argument.
-                # Check the returned record before using the standard replay.
-                if record is not None and (
-                    record.target is None or not tvm.ir.structural_equal(record.target, target)
-                ):
-                    raise ValueError(
-                        "MetaSchedule record belongs to a different Gemmini target profile"
-                    )
-                selected = (
-                    database.query_schedule(workload, target, workload_name=gv.name_hint)
-                    if record is not None
-                    else None
-                )
-                if selected is not None:
-                    bound_profile = selected.mod["main"].body.block.annotations.get(
-                        "gemmini_measurement_profile"
-                    )
-                    if (
-                        bound_profile is not None
-                        and str(bound_profile) != self.capabilities.fingerprint
-                    ):
-                        raise ValueError(
-                            "Selected cycle schedule belongs to another hardware profile"
-                        )
-                    native_calls = []
-                    tir.stmt_functor.post_order_visit(
-                        selected.mod["main"].body,
-                        lambda node: native_calls.append(node)
-                        if isinstance(node, tir.Call)
-                        and node.op == tvm.ir.Op.get("tir.call_extern")
-                        and node.args[0].value.startswith("tvm_gemmini_")
-                        else None,
-                    )
-                    if not native_calls:
-                        # The target rule can also expose an ordinary CPU
-                        # candidate. Never label it native or insert an
-                        # accelerator envelope merely because its database
-                        # record carries this target's measurement identity.
-                        mod.update_func(gv, selected.mod["main"])
-                        self.report.append(
-                            {
-                                "function": gv.name_hint,
-                                "placement": "cpu",
-                                "origin": "TVM MetaSchedule database",
-                                "reason": "Selected CPU schedule from matching tuning record",
-                                "trace": selected.trace.as_json(),
-                            }
-                        )
-                        continue
-                if selected is not None:
-                    result = lower_tensorir_schedule(
-                        func,
-                        selected,
-                        capabilities=self.capabilities,
-                        workload_metadata=(
-                            {"operation": pointwise[0][1]}
-                            if pointwise
-                            else reduction_metadata(reductions[0])
-                            if reductions
-                            else None
-                        ),
-                    )
-                    origin = "TVM MetaSchedule database"
-                elif (
+                if (
                     pointwise
                     and not self.offload_copies
                     and any(
@@ -850,7 +562,7 @@ class ScheduleGemminiTensorIR:
                         }
                     )
                     continue
-                elif reductions:
+                if reductions:
                     result = make_reduction_schedule(func, capabilities=self.capabilities)
                     origin = "deterministic TensorIR reduction rule"
                 elif pointwise:
@@ -871,8 +583,8 @@ class ScheduleGemminiTensorIR:
                         order=self.order,
                         **self.schedule_options,
                     )
-                    origin = "deterministic TensorIR rule"
-            except (ValueError, tir.schedule.ScheduleError) as error:
+                    origin = "default Gemmini contraction sketch"
+            except (ValueError, tvm.TVMError) as error:
                 if gv.name_hint in self.references:
                     mod.update_func(gv, self.references[gv.name_hint])
                 self.report.append(
@@ -931,7 +643,12 @@ def prepare_gemmini_tensorir_workloads(
     if bias_preload:
         mod = CanonicalizeGemminiBias(references=references, report=normalizations)(mod)
     from .gemmini_epilogue import NormalizeGemminiReadout
+    from .gemmini_search import AnnotateGemminiWorkloads
+
     mod = NormalizeGemminiReadout()(mod)
+    # Workload identity for tuning records; extraction and application both
+    # see functions prepared by this same pipeline.
+    mod = AnnotateGemminiWorkloads()(mod)
     return mod, references, normalizations
 
 
@@ -947,13 +664,24 @@ def prepare_gemmini_tensorir_graph(
     offload_copies=False,
     prepack_weights=True,
     movement_strategy="rectangular",
+    database=None,
 ):
-    """Use normal mathematical legalization/fusion before Gemmini scheduling."""
+    """Use normal mathematical legalization/fusion before Gemmini scheduling.
+
+    Tuned schedules come from ``database`` (or the current MetaSchedule
+    database) through the stock ``MetaScheduleApplyDatabase`` pass.
+    """
     from .gemmini import _inline_cpu_producers  # pylint: disable=import-outside-toplevel
+    from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
 
     mod, references, normalizations = prepare_gemmini_tensorir_workloads(
         mod, optimize=optimize, bias_preload=bias_preload, prepack_weights=prepack_weights
     )
+    database = database if database is not None else tvm.meta_schedule.Database.current()
+    if database is not None:
+        target = (capabilities or GemminiCapabilities()).target()
+        with target, database:
+            mod = tvm.relax.transform.MetaScheduleApplyDatabase()(mod)
     mod = ScheduleGemminiTensorIR(
         capabilities=capabilities,
         order=order,

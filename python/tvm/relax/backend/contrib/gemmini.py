@@ -264,7 +264,7 @@ def prepare_gemmini_graph_legacy(mod, tile_i=1, tile_j=1, optimize=True, tile_ch
 def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None,
                           *, route="tensorir", capabilities=None, order="ij", schedule_options=None,
                           report=None, bias_preload=True, offload_copies=False, prepack_weights=True,
-                          movement_strategy="rectangular"):
+                          movement_strategy="rectangular", database=None):
     """Prepare Gemmini through mathematical TensorIR; retain explicit legacy mode.
 
     The default route legalizes/fuses ordinary computations before structural
@@ -290,7 +290,8 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
     return prepare_gemmini_tensorir_graph(mod, optimize=optimize, capabilities=capabilities,
                                          order=order, schedule_options=schedule_options, report=report,
                                          bias_preload=bias_preload, offload_copies=offload_copies,
-                                         prepack_weights=prepack_weights, movement_strategy=movement_strategy)
+                                         prepack_weights=prepack_weights, movement_strategy=movement_strategy,
+                                         database=database)
 
 
 @register_pipeline("gemmini")

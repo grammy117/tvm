@@ -1,0 +1,294 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Gemmini sketches, the MetaSchedule design space and the fixed lowering.
+
+Numerics run against the queued-command emulator: every command is delayed to
+the next fence, so a missing completion wait or a wrong accumulator overwrite
+shows up as a fault or a wrong result.
+"""
+
+import ctypes
+from pathlib import Path
+import random
+import tempfile
+import unittest
+
+import numpy as np
+import tvm
+from tvm import meta_schedule as ms, relax, te, tir
+from tvm.relax.backend.contrib.gemmini_meta_schedule import (
+    GemminiScheduleRule,
+    gemmini_space_generator,
+)
+from tvm.relax.backend.contrib.gemmini_search import (
+    AnnotateGemminiWorkloads,
+    WORKLOAD_ATTR,
+    workload_key,
+)
+from tvm.relax.backend.contrib.gemmini_sketch import (
+    ContractionSketch,
+    apply_contraction_sketch,
+    contraction_info,
+    default_schedule,
+    sketch_space,
+)
+from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
+from tvm.relax.backend.contrib.gemmini_tensorir import (
+    lower_tensorir_schedule,
+    prepare_gemmini_tensorir_graph,
+)
+
+from test_backend_contrib_gemmini_tensorir import EMULATOR
+
+
+def matmul(m, k, n):
+    a = te.placeholder((m, k), "int8", "a")
+    b = te.placeholder((k, n), "int8", "b")
+    r = te.reduce_axis((0, k), "r")
+    c = te.compute(
+        (m, n),
+        lambda i, j: te.sum(a[i, r].astype("int32") * b[r, j].astype("int32"), axis=r),
+        name="product",
+    )
+    return te.create_prim_func([a, b, c])
+
+
+class EmulatedCase(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="gemmini-sketch-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "emulator.c").write_text(EMULATOR)
+        self.index = 0
+
+    def run_lowered(self, func, lowered):
+        self.index += 1
+        path = self.root / f"kernel-{self.index}.so"
+        tvm.build(lowered, "llvm").export_library(
+            str(path), addons=[str(self.root / "emulator.c")], cc="cc", options=["-std=c11"]
+        )
+        runtime, control = tvm.runtime.load_module(str(path)), ctypes.CDLL(str(path))
+        (m, k), n = [int(x) for x in func.buffer_map[func.params[0]].shape], int(
+            func.buffer_map[func.params[1]].shape[1]
+        )
+        rng = np.random.default_rng(self.index)
+        a = rng.integers(-128, 128, (m, k), dtype="int8")
+        b = rng.integers(-128, 128, (k, n), dtype="int8")
+        out = tvm.nd.array(np.full((m, n), 7, "int32"))
+        control.emulator_reset()
+        runtime(tvm.nd.array(a), tvm.nd.array(b), out)
+        np.testing.assert_array_equal(out.numpy(), a.astype("int64") @ b.astype("int64"))
+        self.assertEqual(control.emulator_faults(), 0)
+        return control.emulator_commands(), control.emulator_fences()
+
+    def check(self, shape, sketch, decisions):
+        func = matmul(*shape)
+        sch = tir.Schedule(func, debug_mask="all")
+        sch = apply_contraction_sketch(
+            sch, sch.get_block("product"), sketch, decisions=decisions, tensorize=True
+        )
+        lowered = lower_tensorir_schedule(func, sch)
+        return (*self.run_lowered(func, lowered.scheduled_mod), lowered.metadata)
+
+
+class SketchTests(EmulatedCase):
+    def test_sketch_structures_are_exact(self):
+        cases = [
+            ((64, 64, 48), ContractionSketch(), {"i": [2, 2], "j": [3, 1], "k": [2, 2]}),
+            ((64, 64, 48), ContractionSketch(order="ji", hoist=True), {"i": [1, 4], "j": [3, 1], "k": [4, 1]}),
+            ((1, 64, 48), ContractionSketch(rows=1), {"i": [1, 1], "j": [1, 3], "k": [1, 4]}),
+            ((50, 32, 32), ContractionSketch(rows=10), {"i": [5, 1], "j": [1, 2], "k": [1, 2]}),
+            ((48, 36, 32), ContractionSketch(staging="root"), {"i": [3, 1], "j": [1, 2], "k": [3, 1]}),
+            ((48, 36, 32), ContractionSketch(depth=12), {"i": [3, 1], "j": [1, 2], "k": [1, 3]}),
+            ((64, 64, 48), ContractionSketch(dataflow="ws"), {"i": [1, 4], "j": [3, 1], "k": [2, 2]}),
+            ((64, 64, 48), ContractionSketch(pipeline=True), {"i": [2, 2], "j": [3, 1], "k": [4, 1]}),
+        ]
+        for shape, sketch, decisions in cases:
+            with self.subTest(shape=shape, sketch=sketch.name):
+                self.check(shape, sketch, decisions)
+
+    def test_double_buffered_pipeline_doubles_operand_rows(self):
+        decisions = {"i": [2, 2], "j": [3, 1], "k": [4, 1]}
+        _, _, plain = self.check((64, 64, 48), ContractionSketch(), decisions)
+        _, _, piped = self.check((64, 64, 48), ContractionSketch(pipeline=True), decisions)
+        self.assertGreater(piped["spad_rows"], plain["spad_rows"])
+
+    def test_root_staging_needs_no_per_dma_wait(self):
+        decisions = {"i": [3, 1], "j": [1, 2], "k": [3, 1]}
+        _, fences, metadata = self.check((48, 36, 32), ContractionSketch(staging="root"), decisions)
+        self.assertEqual(metadata["waited_host_buffers"], 0)
+        self.assertEqual(fences, 1)
+        _, fences, metadata = self.check((48, 36, 32), ContractionSketch(staging="tile"), decisions)
+        self.assertGreater(metadata["waited_host_buffers"], 0)
+        self.assertGreater(fences, 1)
+
+    def test_fixed_lowering_fuses_zero_fill_and_coalesces_tile_loads(self):
+        func = matmul(64, 128, 64)
+        sch = tir.Schedule(func, debug_mask="all")
+        sch = apply_contraction_sketch(
+            sch,
+            sch.get_block("product"),
+            ContractionSketch(),
+            decisions={"i": [1, 4], "j": [1, 4], "k": [2, 4]},
+            tensorize=True,
+        )
+        text = lower_tensorir_schedule(func, sch).scheduled_mod.script()
+        self.assertNotIn("tvm_gemmini_zero_acc", text)
+        self.assertIn("tvm_gemmini_dma_a_blocks", text)
+        self.assertIn("tvm_gemmini_dma_b_blocks", text)
+        self.run_lowered(func, lower_tensorir_schedule(func, sch).scheduled_mod)
+
+    def test_traces_replay_from_json(self):
+        func = matmul(64, 64, 48)
+        sch = tir.Schedule(func, debug_mask="all")
+        sch = apply_contraction_sketch(
+            sch, sch.get_block("product"), ContractionSketch(pipeline=True), decisions={"i": [2, 2], "j": [3, 1], "k": [4, 1]}
+        )
+        replay = tir.Schedule(func, debug_mask="all")
+        tir.schedule.Trace.apply_json_to_schedule(sch.trace.as_json(), replay)
+        tvm.ir.assert_structural_equal(sch.mod, replay.mod)
+        kinds = {inst.kind.name for inst in sch.trace.insts}
+        self.assertTrue({"SamplePerfectTile", "CacheRead", "CacheWrite", "Blockize", "Annotate"} <= kinds)
+
+    def test_sketch_space_prunes_redundant_structure(self):
+        decode = contraction_info(matmul(1, 2048, 256), "product")
+        prefill = contraction_info(matmul(64, 2048, 256), "product")
+        orders = {sketch.order for sketch in sketch_space(decode)}
+        self.assertEqual(orders, {"ij"})
+        self.assertEqual({sketch.order for sketch in sketch_space(prefill)}, {"ij", "ji"})
+        odd = contraction_info(matmul(50, 36, 32), "product")
+        self.assertIn(16, {sketch.depth for sketch in sketch_space(odd)})
+        self.assertIn(12, {sketch.depth for sketch in sketch_space(odd)})
+        self.assertIn("m", {sketch.tail for sketch in sketch_space(odd)})
+
+    def test_default_schedule_is_one_tile_groups(self):
+        sch = default_schedule(matmul(64, 64, 48))
+        names = [inst.kind.name for inst in sch.trace.insts]
+        self.assertIn("SamplePerfectTile", names)
+        decisions = [
+            [int(x) for x in sch.trace.get_decision(inst)]
+            for inst in sch.trace.insts
+            if inst.kind.name == "SamplePerfectTile"
+        ]
+        self.assertTrue(all(decision[1] == 1 for decision in decisions))
+
+
+class DesignSpaceTests(EmulatedCase):
+    def test_union_space_random_points_are_exact(self):
+        caps = GemminiCapabilities()
+        rng = random.Random(0)
+        for shape in ((64, 64, 48), (1, 256, 64), (50, 32, 32)):
+            func = matmul(*shape)
+            context = ms.TuneContext(
+                mod=tvm.IRModule({"main": func}),
+                target=caps.target(),
+                space_generator=gemmini_space_generator(caps),
+                search_strategy=ms.search_strategy.ReplayTrace(),
+                num_threads=1,
+                rand_state=1,
+            )
+            spaces = context.generate_design_space()
+            sketches = {
+                str(space.mod["main"].body.block.annotations.get("gemmini.sketch", "cpu"))
+                for space in spaces
+            }
+            self.assertIn("cpu", sketches)
+            self.assertGreater(len(sketches), 2)
+            for space in rng.sample(list(spaces), min(6, len(spaces))):
+                sch = tir.Schedule(tvm.IRModule({"main": func}), seed=rng.randint(0, 1 << 30))
+                trace = space.trace.simplified(remove_postproc=True)
+                tir.schedule.Trace(trace.insts, {}).apply_to_schedule(sch, remove_postproc=False)
+                if not all(post.apply(sch) for post in context.space_generator.postprocs):
+                    continue
+                if "tvm_gemmini" not in sch.mod.script():
+                    continue
+                self.run_lowered(func, lower_tensorir_schedule(func, sch).scheduled_mod)
+
+    def test_rule_requires_bound_capabilities(self):
+        rule = GemminiScheduleRule()
+        with self.assertRaisesRegex(Exception, "target key"):
+            ms.TuneContext(
+                mod=tvm.IRModule({"main": matmul(16, 16, 16)}),
+                target=tvm.target.Target("llvm"),
+                space_generator=ms.space_generator.PostOrderApply(
+                    sch_rules=[rule], postprocs=[], mutator_probs={}
+                ),
+            ).generate_design_space()
+
+
+class DatabaseTests(EmulatedCase):
+    def test_workload_key_is_structural_and_idempotent(self):
+        func = matmul(32, 32, 32)
+        key = workload_key(func)
+        annotated = func.with_attr(WORKLOAD_ATTR, key)
+        self.assertEqual(workload_key(annotated), key)
+        self.assertNotEqual(workload_key(matmul(32, 32, 48)), key)
+
+    def test_database_schedule_is_applied_by_stock_pass(self):
+        bb = relax.BlockBuilder()
+        x = relax.Var("x", relax.TensorStructInfo((64, 64), "int8"))
+        weight = relax.const(np.ones((64, 48), "int8"))
+        with bb.function("main", [x]):
+            with bb.dataflow():
+                out = bb.emit_output(relax.op.matmul(x, weight, out_dtype="int32"))
+            bb.emit_func_output(out)
+        mod = bb.get()
+        caps = GemminiCapabilities()
+        from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_workloads
+
+        prepared, _, _ = prepare_gemmini_tensorir_workloads(mod)
+        tasks = ms.relax_integration.extract_tasks(prepared, caps.target())
+        self.assertEqual(len(tasks), 1)
+        workload = tasks[0].dispatched[0]
+        sch = tir.Schedule(workload)
+        sch = apply_contraction_sketch(
+            sch,
+            sch.get_block(contraction_names(workload["main"])[0]),
+            ContractionSketch(),
+            decisions={"i": [1, 4], "j": [1, 3], "k": [1, 4]},
+        )
+        for post in (ms.postproc.RewriteTensorize(),):
+            post.apply(sch)
+        with tempfile.TemporaryDirectory() as folder:
+            database = ms.database.JSONDatabase(work_dir=folder)
+            record = ms.database.TuningRecord(
+                sch.trace, database.commit_workload(workload), [100.0], caps.target(), []
+            )
+            database.commit_tuning_record(record)
+            report = []
+            compiled = prepare_gemmini_tensorir_graph(mod, database=database, report=report)
+        origins = {row.get("origin") for row in report if row["placement"] == "gemmini"}
+        self.assertEqual(origins, {"TVM MetaSchedule database"})
+        texts = [
+            func.script() for func in compiled.functions.values() if isinstance(func, tir.PrimFunc)
+        ]
+        self.assertTrue(any("tvm_gemmini_dma_a_blocks" in text for text in texts))
+
+
+def contraction_names(func):
+    names = []
+    tir.stmt_functor.post_order_visit(
+        func.body,
+        lambda node: names.append(node.name_hint)
+        if isinstance(node, tir.Block) and node.init is not None
+        else None,
+    )
+    return [name for name in names if contraction_info(func, name) is not None]
+
+
+if __name__ == "__main__":
+    unittest.main()

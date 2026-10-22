@@ -14,57 +14,65 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Gemmini schedule rules in standard MetaSchedule design-space generation.
+"""Gemmini design space for stock MetaSchedule.
 
-Candidates remain mathematical programs until RewriteTensorize postprocessing.
-No alternative source-text templates, custom search controller or synthetic
-performance labels are needed. A deployment builder/runner must still lower
-target memory and measure on the explicitly selected target.
+The space is a ``SpaceGeneratorUnion`` of two ordinary ``PostOrderApply``
+generators over the same prepared function:
+
+* Gemmini placement: ``GemminiScheduleRule`` turns supported blocks into
+  sketches with sampled tile decisions (see ``gemmini_sketch``); stock rules
+  schedule the remaining CPU blocks of the same function.
+* CPU placement: the stock LLVM rules, configured for the bound single-core
+  RV64GC target (no parallel launch, no vector unit).
+
+Search, mutation, cost model and database are TVM's. The only Gemmini
+postprocessor is a legality check, like ``VerifyGPUCode`` for GPUs.
 """
 
-import itertools
-import random
-
+import tvm
 from tvm import meta_schedule as ms, tir
 from tvm.meta_schedule.utils import derived_object
 
 from .gemmini_memory import lower_memory
+from .gemmini_sketch import apply_contraction_sketch, contraction_info, sketch_space
 from .gemmini_target import GemminiCapabilities
-from .gemmini_tensorir import _normalizable_contractions, contraction_block, schedule_contraction
 from .gemmini_elementwise import elementwise_blocks, schedule_elementwise
 from .gemmini_reduction import reduction_blocks, schedule_reduction
 
 
+def _supported(func):
+    """Blocks the Gemmini rule can place, by name."""
+    contractions = [
+        block.name_hint
+        for block in _blocks(func)
+        if block.init is not None and contraction_info(func, block.name_hint) is not None
+    ]
+    if contractions:
+        return "contraction", contractions
+    if len(reduction_blocks(func)) == 1:
+        return "reduction", [reduction_blocks(func)[0][0].name_hint]
+    pointwise = elementwise_blocks(func)
+    if pointwise:
+        return "elementwise", [pointwise[0][0].name_hint]
+    return None, []
+
+
+def _blocks(func):
+    found = []
+    tir.stmt_functor.post_order_visit(
+        func.body, lambda node: found.append(node) if isinstance(node, tir.Block) else None
+    )
+    return found
+
+
 @derived_object
 class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
-    """Explore traversal, DMA order and PE-safe reduction chunks with TVM rules."""
+    """Expand supported blocks into Gemmini sketches on the given schedule."""
 
-    def __init__(
-        self,
-        capabilities=None,
-        orders=("ij", "ji"),
-        load_orders=("ab",),
-        chunks=(16, 8, 4),
-        row_tiles=(1, 2, 4),
-        col_tiles=(1, 2, 4),
-        include_cpu=False,
-        sample_groups=False,
-    ):
+    def __init__(self, capabilities=None, dataflows=("os", "ws")):
         self.capabilities = capabilities or GemminiCapabilities()
-        self.orders = tuple(orders)
-        self.load_orders = tuple(load_orders)
-        self.chunks = tuple(chunks)
-        self.row_tiles = tuple(row_tiles)
-        self.col_tiles = tuple(col_tiles)
-        if type(include_cpu) is not bool:
-            raise ValueError("include_cpu must be a boolean")
-        self.include_cpu = include_cpu
-        self.sample_groups = sample_groups
+        self.dataflows = tuple(dataflows)
         self.target = None
-
-    def _alternatives(self, sch, candidates):
-        """Expose CPU execution as an explicit measured placement alternative."""
-        return [sch] + candidates if self.include_cpu else candidates
 
     def __str__(self):
         return "GemminiScheduleRule"
@@ -72,142 +80,57 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
     def _initialize_with_tune_context(self, context):
         self.target = context.target
         if self.target is None or "gemmini" not in self.target.keys:
-            raise ValueError(
-                "Gemmini schedule rules require an explicitly selected Gemmini target key"
-            )
+            raise ValueError("Gemmini schedule rules require an explicitly selected Gemmini target key")
         if self.target.model != "gemmini-" + self.capabilities.fingerprint:
             raise ValueError("MetaSchedule target does not bind the selected Gemmini capabilities")
 
     def apply(self, sch, block):
         func = sch.mod["main"]
-        if sch.get(sch.get_block("root")).annotations.get("gemmini_regions_scheduled", False):
+        kind, names = _supported(func)
+        if kind is None:
+            # This generator only describes Gemmini placements. The CPU
+            # generator of the union covers functions without such blocks.
+            return []
+        name = sch.get(block).name_hint
+        if name not in names:
             return [sch]
-        matches = contraction_block(func) or _normalizable_contractions(func)
-        if not matches:
-            reductions = reduction_blocks(func)
-            if reductions and (
-                len(reductions) != 1 or not sch.get(block).same_as(reductions[0][0])
-            ):
-                return [sch]
-            if len(reductions) == 1 and sch.get(block).same_as(reductions[0][0]):
-                candidates, traces = [], set()
-                for scalar in (False, True):
-                    transformed, _, _ = schedule_reduction(
-                        func, tensorize=False, mark_tensorize=True, scalar=scalar
+        if kind == "contraction":
+            info = contraction_info(func, name)
+            results = []
+            for sketch in sketch_space(info, dataflows=self.dataflows):
+                try:
+                    candidate = apply_contraction_sketch(
+                        sch.copy(), block, sketch, capabilities=self.capabilities
                     )
-                    if str(transformed.trace) not in traces:
-                        traces.add(str(transformed.trace))
-                        candidate = sch.copy()
-                        transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
-                        candidates.append(candidate)
-                return self._alternatives(sch, candidates)
-            pointwise = elementwise_blocks(func)
-            if pointwise and sch.get(block).same_as(pointwise[0][0]):
-                candidates, traces = [], set()
-                for scalar in (False, True):
-                    try:
-                        transformed, _, _ = schedule_elementwise(
-                            func, tensorize=False, mark_tensorize=True, scalar=scalar
-                        )
-                    except (ValueError, tir.schedule.ScheduleError):
-                        continue
-                    if str(transformed.trace) not in traces:
-                        traces.add(str(transformed.trace))
-                        candidate = sch.copy()
-                        transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
-                        candidates.append(candidate)
-                return self._alternatives(sch, candidates) if candidates else [sch]
-            return [sch]
-        if len(matches) != 1 or not sch.get(block).same_as(matches[0][0]):
-            return [sch]
-        results = []
-        for order, load_order, chunk, rows, cols in itertools.product(
-            self.orders,
-            self.load_orders,
-            self.chunks,
-            (max(self.row_tiles),) if self.sample_groups else self.row_tiles,
-            (max(self.col_tiles),) if self.sample_groups else self.col_tiles,
-        ):
-            m, n, depth = matches[0][1]
-            # Groups beyond the mathematical tile count only add padded
-            # work and staging. Keep unit groups for small/tail matrices.
-            if not self.sample_groups and (rows > (m + 15) // 16 or cols > (n + 15) // 16):
-                continue
-            unit_traversal = (
-                (m <= 16 or n <= 16) if self.sample_groups else (m <= 16 * rows or n <= 16 * cols)
-            )
-            if order != self.orders[0] and unit_traversal:
-                continue
-            # Chunks collapse to the same effective depth for short products.
-            effective = max(2, min(chunk, depth))
-            if any(
-                max(2, min(prior, depth)) == effective
-                for prior in self.chunks[: self.chunks.index(chunk)]
-            ):
-                continue
-            candidate = sch.copy()
+                except (ValueError, tvm.TVMError):
+                    # A sketch whose structure this function cannot take.
+                    continue
+                results.append(candidate)
+            return results
+        # Secondary operators keep their structural rules: each candidate is
+        # a recorded trace of ordinary primitives replayed onto this schedule.
+        schedule = schedule_reduction if kind == "reduction" else schedule_elementwise
+        results, traces = [], set()
+        for scalar in (False, True):
             try:
-                transformed, _ = schedule_contraction(
-                    func,
-                    order=order,
-                    load_order=load_order,
-                    reduction_chunk=chunk,
-                    tensorize=False,
-                    mark_tensorize=True,
-                    row_tiles=rows,
-                    col_tiles=cols,
-                    sample_groups=self.sample_groups,
-                )
-            except (ValueError, tir.schedule.ScheduleError):
+                transformed, _, _ = schedule(func, tensorize=False, mark_tensorize=True, scalar=scalar)
+            except (ValueError, tvm.TVMError):
                 continue
+            if str(transformed.trace) in traces:
+                continue
+            traces.add(str(transformed.trace))
+            candidate = sch.copy()
             transformed.trace.apply_to_schedule(candidate, remove_postproc=False)
             results.append(candidate)
-        return self._alternatives(sch, results)
+        return results
 
     def clone(self):
-        return GemminiScheduleRule(
-            self.capabilities,
-            self.orders,
-            self.load_orders,
-            self.chunks,
-            self.row_tiles,
-            self.col_tiles,
-            self.include_cpu,
-            self.sample_groups,
-        )
-
-
-@derived_object
-class MutateGemminiCategorical(ms.mutator.PyMutator):
-    """Mutate real categorical split factors through ordinary trace replay."""
-
-    def _initialize_with_tune_context(self, context):
-        del context
-
-    def apply(self, trace, seed):
-        rng = random.Random(int(seed))
-        samples = [
-            (index, inst)
-            for index, inst in enumerate(trace.insts)
-            if inst.kind.name == "SampleCategorical" and len(inst.attrs[0]) > 1
-        ]
-        if not samples:
-            return None
-        index, inst = rng.choice(samples)
-        old = int(dict(trace.as_json()[1])[index])
-        choices = [i for i in range(len(inst.attrs[0])) if i != old]
-        return trace.with_decision(inst, rng.choice(choices), remove_postproc=True)
-
-    def clone(self):
-        return MutateGemminiCategorical()
-
-    def __str__(self):
-        return "MutateGemminiCategorical"
+        return GemminiScheduleRule(self.capabilities, self.dataflows)
 
 
 @derived_object
 class VerifyGemminiMemory(ms.postproc.PyPostproc):
-    """Reject untensorized CPU SRAM accesses and excessive physical allocations."""
+    """Reject untensorized CPU SRAM accesses and over-capacity row plans."""
 
     def __init__(self, capabilities=None):
         self.capabilities = capabilities or GemminiCapabilities()
@@ -220,7 +143,7 @@ class VerifyGemminiMemory(ms.postproc.PyPostproc):
             lower_memory(
                 sch.mod, spad_rows=self.capabilities.spad_rows, acc_rows=self.capabilities.acc_rows
             )
-        except ValueError:
+        except (ValueError, tvm.TVMError):
             return False
         return True
 
@@ -231,13 +154,92 @@ class VerifyGemminiMemory(ms.postproc.PyPostproc):
         return "VerifyGemminiMemory"
 
 
-def gemmini_space_generator(capabilities=None, **rule_options):
-    """Return a normal PostOrderApply generator with target-specific rules."""
+# Stock LLVM rules for the bound core: one RV64GC hart without a vector unit,
+# so parallel launch and vectorization stay disabled.
+_UNROLL_STEPS = [0, 16, 64, 512]
+
+
+def cpu_schedule_rules():
+    return [
+        ms.schedule_rule.ApplyCustomRule(),
+        ms.schedule_rule.InlineConstantScalars(),
+        ms.schedule_rule.AutoInline(
+            into_producer=False,
+            into_consumer=True,
+            inline_const_tensor=True,
+            disallow_if_then_else=True,
+            require_injective=True,
+            require_ordered=True,
+            disallow_op=["tir.exp"],
+        ),
+        ms.schedule_rule.MultiLevelTiling(
+            structure="SSRSRS",
+            tile_binds=None,
+            max_innermost_factor=64,
+            vector_load_lens=None,
+            reuse_read=None,
+            reuse_write=ms.schedule_rule.ReuseType(req="may", levels=[1, 2], scope="global"),
+        ),
+        ms.schedule_rule.ParallelizeVectorizeUnroll(
+            max_jobs_per_core=-1,
+            max_vectorize_extent=-1,
+            unroll_max_steps=_UNROLL_STEPS,
+            unroll_explicit=True,
+        ),
+        ms.schedule_rule.RandomComputeLocation(),
+    ]
+
+
+def gemmini_schedule_rules(capabilities=None, dataflows=("os", "ws")):
+    return [
+        GemminiScheduleRule(capabilities, dataflows),
+        ms.schedule_rule.ParallelizeVectorizeUnroll(
+            max_jobs_per_core=-1,
+            max_vectorize_extent=-1,
+            unroll_max_steps=_UNROLL_STEPS,
+            unroll_explicit=True,
+        ),
+    ]
+
+
+def gemmini_postprocs(capabilities=None):
+    """The stock CPU-tensorization postprocessors plus the Gemmini legality check."""
+    return [
+        ms.postproc.DisallowDynamicLoop(),
+        ms.postproc.RewriteParallelVectorizeUnroll(),
+        ms.postproc.RewriteReductionBlock(),
+        ms.postproc.RewriteTensorize(),
+        VerifyGemminiMemory(capabilities),
+    ]
+
+
+def gemmini_mutator_probs():
+    return {
+        ms.mutator.MutateTileSize(): 0.9,
+        ms.mutator.MutateComputeLocation(): 0.05,
+        ms.mutator.MutateUnroll(): 0.05,
+    }
+
+
+def gemmini_space_generator(capabilities=None, *, include_cpu=True, dataflows=("os", "ws")):
+    """Gemmini and CPU placements of one function as a stock union of spaces."""
     capabilities = capabilities or GemminiCapabilities()
-    return ms.space_generator.PostOrderApply(
-        sch_rules=[GemminiScheduleRule(capabilities, **rule_options)],
-        postprocs=[ms.postproc.RewriteTensorize(), VerifyGemminiMemory(capabilities)],
-        mutator_probs={MutateGemminiCategorical(): 1.0}
-        if rule_options.get("sample_groups")
-        else {},
+    generators = [
+        ms.space_generator.PostOrderApply(
+            sch_rules=gemmini_schedule_rules(capabilities, dataflows),
+            postprocs=[],
+            mutator_probs={},
+        )
+    ]
+    if include_cpu:
+        generators.append(
+            ms.space_generator.PostOrderApply(
+                sch_rules=cpu_schedule_rules(), postprocs=[], mutator_probs={}
+            )
+        )
+    return ms.space_generator.SpaceGeneratorUnion(
+        generators,
+        sch_rules=[],
+        postprocs=gemmini_postprocs(capabilities),
+        mutator_probs=gemmini_mutator_probs(),
     )

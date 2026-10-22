@@ -31,9 +31,9 @@ def prepack_constants(mod):
     convolution maps in this TVM revision. The schedule supplies its ordinary
     layout-rewrite annotation explicitly instead of patching that inference.
     """
+    from .gemmini_sketch import _normalize_block
     from .gemmini_tensorir import (
         _contraction_update,
-        _normalize_contraction,
         _normalizable_contractions,
         contraction_block,
     )
@@ -65,10 +65,10 @@ def prepack_constants(mod):
         # nevertheless useful for tails and is also folded here.
         sch = tir.Schedule(func, debug_mask="all")
         try:
-            node, (m, n, k) = _normalize_contraction(sch)
+            block, (m, n, k) = _normalize_block(sch, sch.get_block(matches[0][0].name_hint))
+            node = sch.get(block)
             if k > 131056:  # Padding must retain the existing prefix admission.
                 continue
-            block = sch.get_block(node.name_hint)
             # Only the right operand needs a compile-time layout. Preserve
             # logical rows and narrow column extents instead of introducing
             # extra output copies/padded lanes for small-channel convolutions.

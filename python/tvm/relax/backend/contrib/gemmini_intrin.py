@@ -189,11 +189,43 @@ def register_intrinsics(rows=16, cols=16, depth=16, wrapping=False):
                 )
             )
 
+    @T.prim_func
+    def update_ws_impl(a: T.handle, b: T.handle, c: T.handle):
+        A = T.match_buffer(
+            a, (rows, depth), "int8", scope=SPAD, strides=[T.int64(), T.int64(1)], offset_factor=1
+        )
+        B = T.match_buffer(
+            b, (depth, cols), "int8", scope=SPAD, strides=[T.int64(), T.int64(1)], offset_factor=1
+        )
+        C = T.match_buffer(
+            c, (rows, cols), "int32", scope=ACC, strides=[T.int64(), T.int64(1)], offset_factor=1
+        )
+        with T.block("root"):
+            T.block_attr({"buffer_dim_align": [[0, 0, 16, 0]]})
+            T.reads(C[0:rows, 0:cols], A[0:rows, 0:depth], B[0:depth, 0:cols])
+            T.writes(C[0:rows, 0:cols])
+            T.evaluate(
+                T.call_extern(
+                    "void",
+                    "tvm_gemmini_compute_ws",
+                    A.access_ptr("r"),
+                    B.access_ptr("r"),
+                    C.access_ptr("rw"),
+                    T.uint32(rows),
+                    T.uint32(cols),
+                    T.uint32(depth),
+                    T.int32(1),
+                )
+            )
+
     pairs = {
         "load_a": copy_intrin(rows, depth, "global", SPAD, "int8", "tvm_gemmini_dma_a"),
         "load_b": copy_intrin(depth, cols, "global", SPAD, "int8", "tvm_gemmini_dma_b"),
         "init": (init_desc, init_impl),
         "compute": (update_desc, update_impl),
+        # Same semantics in the weight-stationary dataflow; the adapter keeps
+        # weights in the array across consecutive calls naming the same B tile.
+        "compute_ws": (update_desc, update_ws_impl),
         "store": copy_intrin(rows, cols, ACC, "global", "int32", "tvm_gemmini_dma_out"),
     }
     result = {}
