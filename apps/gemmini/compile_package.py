@@ -32,8 +32,8 @@ import subprocess
 import tvm
 from tvm._ffi.base import _LIB
 from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
-from tvm.relax.backend.contrib.gemmini_dse import load_result
 from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
+from tvm.relax.backend.contrib.gemmini_search import open_gemmini_database
 from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_workloads
 
 from baremetal import export_graph, RV64_TARGET
@@ -140,39 +140,35 @@ def compile_package(args):
     if adapter["headers"]["include/gemmini_params.h"]["sha256"] != caps.params_sha256:
         raise ValueError("Adapter capability header mismatch")
     mod = import_program(args.program)
-    mathematical, _, _ = prepare_gemmini_tensorir_workloads(mod)
-    results = []
-    for path in args.tuning_result:
-        document = json.loads(path.read_text())
-        workload = tvm.ir.load_json(document["workload_json"])["main"]
-        if not any(
-            isinstance(func, tvm.tir.PrimFunc) and tvm.ir.structural_equal(func, workload)
-            for func in mathematical.functions.values()
-        ):
-            raise ValueError("Tuning result does not match a function in this program")
-        result = load_result(document, workload, capabilities=caps)
-        if not result.summary.get("baseline_complete"):
-            raise ValueError("Tuning result lacks completed CPU/default baselines")
-        results.append(result)
-
-    def replay(sch):
-        for result in results:
-            if tvm.ir.structural_equal(sch.mod["main"], result.workload["main"]):
-                result.winner.schedule.trace.apply_to_schedule(sch, remove_postproc=False)
-                sch.annotate(sch.get_block("root"), "gemmini_measurement_profile", caps.fingerprint)
-                return True
-        return False
-
+    database = None
+    database_path = getattr(args, "tuning_database", None)
+    if database_path is not None:
+        if args.cpu_only:
+            raise ValueError("CPU-only build cannot accept a tuning database")
+        # Carry the standard records in the relocatable package. Replay and
+        # workload matching belong to MetaScheduleApplyDatabase, not this CLI.
+        destination = out / "database"
+        destination.mkdir()
+        for name in ("database_workload.json", "database_tuning_record.json"):
+            shutil.copy2(database_path / name, destination / name)
+        prepared, _, _ = prepare_gemmini_tensorir_workloads(mod)
+        database = open_gemmini_database(destination, prepared, capabilities=caps)
+        records = database.get_all_tuning_records()
+        if not records:
+            raise ValueError("Tuning database contains no measurements")
+        if any(str(record.target) != str(caps.target()) for record in records):
+            raise ValueError("Tuning database target does not match Gemmini capabilities")
     report = []
     if args.cpu_only:
-        if results:
-            raise ValueError("CPU-only build cannot accept accelerator tuning records")
         selected, _, _ = prepare_gemmini_tensorir_workloads(
             mod, bias_preload=False, prepack_weights=False
         )
     else:
-        with tvm.meta_schedule.database.ScheduleFnDatabase(replay):
-            selected = prepare_gemmini_graph(mod, report=report)
+        selected = prepare_gemmini_graph(mod, report=report, database=database)
+        if database is not None and not any(
+            row.get("origin") == "TVM MetaSchedule database" for row in report
+        ):
+            raise ValueError("Tuning database does not match any function in this program")
     graph = out / "graph"
     manifest = export_graph(
         selected, graph, target=RV64_TARGET, memory_limit_bytes=args.tensor_memory_bytes
@@ -279,7 +275,8 @@ def compile_package(args):
         )
         for path in sorted(folder.glob("*.py"))
     )
-    source_bindings.extend(identity(path) for path in args.tuning_result)
+    if database_path is not None:
+        source_bindings.extend(identity(path) for path in sorted((out / "database").glob("*.json")))
     (out / "build.json").write_text(
         json.dumps(
             {
@@ -308,7 +305,12 @@ def compile_package(args):
         "placement_policy": "CPU only"
         if args.cpu_only
         else "CPU copies; exact supported arithmetic; measured overrides when supplied",
-        "unmeasured_placement_is_provisional": not args.cpu_only,
+        "tuning_database": "database" if database is not None else None,
+        "tuned_functions": [row["function"] for row in report
+                            if row.get("origin") == "TVM MetaSchedule database"],
+        "unmeasured_placement_is_provisional": any(
+            row.get("origin") != "TVM MetaSchedule database" for row in report
+        ),
         "timing_qualified_for_firesim": False,
         "deployed_hardware_verified": False,
         "deployment_requirements": [
@@ -349,7 +351,7 @@ def main():
     parser.add_argument("--adapter-receipt", type=Path)
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--tensor-memory-bytes", type=int, default=64 << 20)
-    parser.add_argument("--tuning-result", type=Path, action="append", default=[])
+    parser.add_argument("--tuning-database", type=Path, help="Standard MetaSchedule JSONDatabase directory")
     args = parser.parse_args()
     if args.verify:
         verify_package(args.verify)

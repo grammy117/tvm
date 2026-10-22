@@ -73,6 +73,26 @@ def candidate_workload(mod):
     return str(func.attrs[WORKLOAD_ATTR])
 
 
+def open_gemmini_database(path, prepared, *, capabilities=None):
+    """Register workload-dependent intrinsic families, then open stock records.
+
+    TVM validates Tensorize instructions while deserializing a JSONDatabase.
+    Generate the same target sketches first, including bias/readout families,
+    so a fresh compiler process has the registrations made during tuning.
+    The database itself owns matching and replay.
+    """
+    capabilities = capabilities or GemminiCapabilities()
+    for func in prepared.functions.values():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+        ms.TuneContext(
+            mod=tvm.IRModule({"main": func.with_attr("global_symbol", "main")}),
+            target=capabilities.target(), num_threads=1,
+            space_generator=gemmini_space_generator(capabilities, include_cpu=False),
+        ).generate_design_space()
+    return ms.database.JSONDatabase(work_dir=str(path))
+
+
 @derived_object
 class MathematicalFeatures(ms.feature_extractor.PyFeatureExtractor):
     """Stock PerStoreFeature on each candidate's trace without postprocessing.
@@ -189,6 +209,7 @@ def tune_gemmini_tasks(
     log=None,
     describe=None,
     include_cpu=True,
+    warmup=4,
 ):
     """Tune extracted tasks with stock ``tune_tasks`` and return the JSONDatabase."""
     capabilities = capabilities or GemminiCapabilities()
@@ -223,10 +244,20 @@ def tune_gemmini_tasks(
         )
         weights.append(float(task.weight))
     Path(work_dir).mkdir(parents=True, exist_ok=True)
+    if (Path(work_dir) / "database_tuning_record.json").exists():
+        for context in contexts:
+            context.generate_design_space()
     database = ms.database.JSONDatabase(work_dir=str(work_dir))
     callbacks = [ms.measure_callback.AddToDatabase(), ms.measure_callback.UpdateCostModel()]
     if log is not None:
         callbacks.append(RecordMeasurements(log, describe))
+    cost_model = ms.cost_model.XGBModel(
+        extractor=MathematicalFeatures(), adaptive_training=False, num_tuning_cores=1,
+        num_warmup_samples=warmup,
+    )
+    model_path = Path(work_dir) / "cost_model.xgb"
+    if model_path.exists():
+        cost_model.load(str(model_path))
     ms.tune_tasks(
         tasks=contexts,
         task_weights=weights,
@@ -236,12 +267,17 @@ def tune_gemmini_tasks(
         builder=builder,
         runner=runner,
         database=database,
-        cost_model=ms.cost_model.XGBModel(
-            extractor=MathematicalFeatures(), adaptive_training=False, num_tuning_cores=1
-        ),
+        cost_model=cost_model,
         measure_callbacks=callbacks,
         task_scheduler="gradient",
     )
+    if cost_model.booster is not None:
+        cost_model.save(str(model_path))
+    (Path(work_dir) / "cost-model.json").write_text(json.dumps({
+        "implementation": "TVM XGBModel", "warmup_samples": warmup,
+        "training_samples": cost_model.data_size, "booster_trained": cost_model.booster is not None,
+        "learned_predictions_enabled": cost_model.data_size >= warmup and cost_model.booster is not None,
+    }, indent=2) + "\n")
     return database
 
 

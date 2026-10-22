@@ -14,129 +14,97 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Framework mutation, measured feedback, failure isolation and replay contracts."""
+"""Stock task tuning, candidate failure isolation, features and reusable records."""
 
-import itertools
-import unittest
+import json
+from pathlib import Path
+import threading
+
 import numpy as np
+import pytest
 import tvm
-from tvm import tir, meta_schedule as ms
-from tvm.relax.backend.contrib.gemmini_dse import TrialFailure, load_result
-from tvm.relax.backend.contrib.gemmini_search import tune
+from tvm import meta_schedule as ms, tir
+from tvm.relax.backend.contrib.gemmini_search import (
+    AnnotateGemminiWorkloads, GemminiBuilder, GemminiRunner,
+    MathematicalFeatures, candidate_workload, tune_gemmini_tasks,
+)
+from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator
 from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
-from tvm.relax.backend.contrib.gemmini_tensorir import schedule_contraction, lower_tensorir_schedule
-
-import test_backend_contrib_gemmini_tensorir as reference
+from test_backend_contrib_gemmini_sketch import matmul
 
 
-class GemminiFrameworkSearchTests(unittest.TestCase):
-    setUp = reference.GemminiTensorIRTests.setUp
-    build = reference.GemminiTensorIRTests.build
+def task():
+    caps = GemminiCapabilities()
+    mod = AnnotateGemminiWorkloads()(tvm.IRModule({"main": matmul(32, 32, 48)}))
+    return ms.ExtractedTask("projection", mod, caps.target(), [mod], 7)
 
-    def test_framework_cloned_vars_preserve_buffer_ownership_by_abi_position(self):
-        func = reference.workload(3, 4, 5)
-        sch, _ = schedule_contraction(func)
-        renewed = tvm.ir.load_json(tvm.ir.save_json(sch.mod))
-        self.assertFalse(renewed["main"].params[0].same_as(func.params[0]))
-        selected = tir.Schedule(renewed)
-        lowered = lower_tensorir_schedule(func, selected)
-        runtime, control = self.build(lowered.scheduled_mod)
-        a = np.arange(15, dtype="int8").reshape(3, 5) - 7
-        b = np.arange(20, dtype="int8").reshape(5, 4) - 11
-        out = tvm.nd.empty((3, 4), "int32")
-        runtime(tvm.nd.array(a), tvm.nd.array(b), out)
-        np.testing.assert_array_equal(out.numpy(), a.astype("int64") @ b.astype("int64"))
-        self.assertEqual(control.emulator_faults(), 0)
 
-    def test_categorical_decisions_change_real_groups_and_preserve_native_math(self):
-        func = reference.workload(32, 32, 32)
-        sch, _ = schedule_contraction(
-            func, row_tiles=2, col_tiles=2, sample_groups=True, tensorize=False, mark_tensorize=True
-        )
-        samples = [inst for inst in sch.trace.insts if inst.kind.name == "SampleCategorical"]
-        self.assertEqual(len(samples), 2)
-        observed = set()
-        a = np.resize(np.array([-128, 127, -1, 0, 11], "int8"), (32, 32))
-        b = np.resize(np.array([127, -128, 3, 0], "int8"), (32, 32))
-        for row, col in itertools.product(range(2), repeat=2):
-            trace = sch.trace.with_decision(samples[0], row, remove_postproc=True)
-            trace = trace.with_decision(samples[1], col, remove_postproc=True)
-            changed = tir.Schedule(func)
-            trace.apply_to_schedule(changed, remove_postproc=True)
-            attrs = changed.mod["main"].body.block.annotations
-            observed.add((int(attrs["gemmini.row_tiles"]), int(attrs["gemmini.col_tiles"])))
-            changed.enter_postproc()
-            self.assertTrue(ms.postproc.RewriteTensorize().apply(changed))
-            lowered = lower_tensorir_schedule(func, changed)
-            runtime, control = self.build(lowered.scheduled_mod)
-            output = tvm.nd.empty((32, 32), "int32")
-            runtime(tvm.nd.array(a), tvm.nd.array(b), output)
-            np.testing.assert_array_equal(output.numpy(), a.astype("int64") @ b.astype("int64"))
-            self.assertEqual(control.emulator_faults(), 0)
-        self.assertEqual(observed, {(1, 1), (1, 2), (2, 1), (2, 2)})
+def test_builder_and_runner_isolate_failures():
+    work = task()
+    def build(mod, key):
+        assert key == candidate_workload(work.mod)
+        raise ValueError("intentional build refusal")
+    result = GemminiBuilder(build).build([ms.builder.BuilderInput(work.mod, work.target)])[0]
+    assert result.artifact_path is None
+    assert "intentional build refusal" in result.error_msg
+    def run(path):
+        if path == "bad":
+            raise ValueError("intentional run refusal")
+        return 123
+    futures = GemminiRunner(run).run([
+        ms.runner.RunnerInput(name, "cpu", []) for name in ("good", "bad")
+    ])
+    assert float(futures[0].result().run_secs[0]) == 123
+    assert "intentional run refusal" in futures[1].result().error_msg
 
-    def test_standard_controller_trains_continues_after_failure_and_replays(self):
-        caps, artifacts, calls, journal = GemminiCapabilities(), {}, [], []
 
-        def build(candidate):
-            calls.append(candidate.id)
-            if len(calls) == 3:
-                raise TrialFailure("diagnostic build timeout")
-            key = str(self.root / f"diagnostic-{len(calls)}")
-            artifacts[key] = candidate
-            return {"folder": key}
+@pytest.mark.parametrize("strategy", ["evolutionary", "replay"])
+def test_stock_tuning_persists_queryable_records_and_failure_log(tmp_path, strategy):
+    work = task()
+    built, lock = [], threading.Lock()
+    def build(mod, key):
+        assert key == candidate_workload(work.mod)
+        with lock:
+            index = len(built)
+            built.append(mod)
+        if index == 1:
+            raise ValueError("test build failure")
+        return str(index)
+    # Deliberately diagnostic labels; these tests make no hardware claim.
+    def run(path):
+        return 100 + int(path)
+    database = tune_gemmini_tasks(
+        [work], work_dir=tmp_path, builder=GemminiBuilder(build, max_workers=2),
+        runner=GemminiRunner(run, max_workers=2), max_trials_global=12,
+        num_trials_per_iter=3, strategy=strategy, log=tmp_path / "trials.jsonl",
+    )
+    rows = [json.loads(line) for line in (tmp_path / "trials.jsonl").read_text().splitlines()]
+    assert len(rows) == 12
+    assert sum(row["build_error"] is not None for row in rows) == 1
+    assert sum(row["cycles"] is not None for row in rows) == 11
+    reopened = ms.database.JSONDatabase(work_dir=str(tmp_path))
+    assert len(reopened.get_all_tuning_records()) == 12
+    assert sum(float(record.run_secs[0]) < 1e10 for record in reopened.get_all_tuning_records()) == 11
+    winner = reopened.query_tuning_record(work.mod, work.target, "main")
+    assert winner is not None
+    replay = tir.Schedule(work.mod)
+    winner.trace.apply_to_schedule(replay, remove_postproc=False)
+    best = min((row for row in rows if row["cycles"] is not None), key=lambda row: row["cycles"])
+    tvm.ir.assert_structural_equal(replay.mod, built[int(best["artifact"])])
 
-        def run(artifact):
-            candidate = artifacts[artifact["folder"]]
-            cost = (
-                1000
-                if candidate.placement == "cpu"
-                else 200 // int(candidate.parameters.get("row_tiles", 1))
-            )
-            return {
-                "metric": "target_cycles",
-                "engine": "diagnostic",
-                "capability_fingerprint": caps.fingerprint,
-                "measurement_profile": "framework-unit-test-only",
-                "correctness": "passed",
-                "samples": [cost] * 3,
-            }
 
-        func = reference.workload(32, 32, 32)
-        result = tune(
-            func,
-            build,
-            run,
-            work_dir=self.root / "search",
-            max_trials=6,
-            warmup=2,
-            diagnostic=True,
-            on_record=journal.append,
-            rule_options={"chunks": (16,), "row_tiles": (1, 2), "col_tiles": (1, 2)},
-        )
-        self.assertEqual(result.summary["controller"], "TVM tune_tasks/EvolutionarySearch")
-        self.assertEqual(result.summary["failed_trials"], 1)
-        self.assertGreaterEqual(result.summary["successful_trials"], 4)
-        self.assertEqual(len(journal), len(result.records))
-        self.assertTrue(
-            any(
-                event["booster_trained"] and event["distinct_predictions"] > 1
-                for event in result.summary["ranking_events"]
-            )
-        )
-        restored = load_result(result.as_json(), func, diagnostic=True)
-        self.assertEqual(restored.winner.id, result.winner.id)
-        completed = len(calls)
-        resumed = tune(
-            func,
-            build,
-            run,
-            work_dir=self.root / "resumed",
-            max_trials=6,
-            warmup=2,
-            diagnostic=True,
-            resume_records=result.records,
-            rule_options={"chunks": (16,), "row_tiles": (1, 2), "col_tiles": (1, 2)},
-        )
-        self.assertEqual(len(calls), completed)
-        self.assertEqual(resumed.winner.id, result.winner.id)
+def test_features_remain_finite_after_tensorization():
+    work = task()
+    context = ms.TuneContext(mod=work.mod, target=work.target,
+                             space_generator=gemmini_space_generator(), num_threads=1)
+    candidates = []
+    for space in context.generate_design_space():
+        sch = space.copy()
+        sch.enter_postproc()
+        if all(post.apply(sch) for post in context.space_generator.postprocs):
+            candidates.append(ms.search_strategy.MeasureCandidate(sch, []))
+        if len(candidates) == 4:
+            break
+    assert candidates
+    features = MathematicalFeatures().extract_from(context, candidates)
+    assert all(np.isfinite(feature.numpy()).all() and feature.shape[0] > 0 for feature in features)

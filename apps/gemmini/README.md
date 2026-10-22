@@ -28,7 +28,7 @@ compiler, portable archive, guarded boot ELFs and deployment bindings.
 preserved as `route="legacy"` and `prepare_gemmini_graph_legacy`; the template
 scheduling/search recipes below describe that preserved route.
 
-The current compiler branch is `gemmini/tensorir`; the older setup and template recipes below refer to `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
+The current compiler branch is `gemmini/metaschedule-dse`; the older setup and template recipes below refer to `gemmini/bringup`. The isolated host build, synthetic frontend checks and ResNet50 v1.5 host diagnostics are verified on CPU. The Gemmini C-library adapter, bounded TVM-scheduled graphs and a complete random integer ResNet graph pass numerical checks in the pinned functional simulator. Pretrained quality, deployed hardware and target timing remain pending.
 
 | Location | Integration responsibility |
 | --- | --- |
@@ -37,7 +37,7 @@ The current compiler branch is `gemmini/tensorir`; the older setup and template 
 | `python/tvm/relax/backend/contrib/gemmini_schedule.py` | Semantic tiled TIR, primitive tensorization and resource contracts. |
 | `python/tvm/relax/backend/contrib/gemmini_tuning.py` | Preserved legacy template search. |
 | `gemmini_tensorir.py`, `gemmini_intrin.py`, `gemmini_target.py` in the same contrib directory | Current mathematical scheduling, TensorIntrins, scopes and capability identity. |
-| `gemmini_meta_schedule.py`, `gemmini_search.py`, `gemmini_dse.py` | Current standard sampled/evolutionary tuning, small sweep and checked replay. |
+| `gemmini_meta_schedule.py`, `gemmini_search.py`, `gemmini_sketch.py` | Sampled sketches, stock MetaSchedule tuning and JSONDatabase/Relax integration; see [TUNING.md](TUNING.md). |
 | `gemmini_layout.py`, `gemmini_epilogue.py` | Frozen layout folding and exact scaled-readout proof/normalization. |
 | `apps/gemmini/` | C primitives, static graph export and host/simulator verification recipes. |
 | `tests/python/relax/test_backend_contrib_gemmini*.py` | Focused admission, scheduling, graph, export and search regressions. |

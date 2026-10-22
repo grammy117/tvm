@@ -1268,7 +1268,6 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
                 "gemmini_reduction",
                 "gemmini_bias",
                 "gemmini_regions",
-                "gemmini_dse",
                 "gemmini_search",
                 "gemmini_layout",
                 "gemmini_epilogue",

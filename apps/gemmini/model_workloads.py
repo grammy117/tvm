@@ -43,11 +43,18 @@ TINYLLAMA = {"hidden": 2048, "intermediate": 5632, "kv": 256, "layers": 22, "voc
 class _Program:
     """Builds one Relax function that calls each operator ``count`` times."""
 
-    def __init__(self, seed=0):
+    def __init__(self, seed=0, operators=None):
         self.rng = np.random.default_rng(seed)
         self.builder = relax.BlockBuilder()
         self.params = []
         self.operators = []
+        self.selection = None if operators is None else set(operators)
+        self.operator_index = 0
+
+    def include(self):
+        index = self.operator_index
+        self.operator_index += 1
+        return self.selection is None or index in self.selection
 
     def const(self, shape, dtype):
         if dtype == "int8":
@@ -66,6 +73,8 @@ class _Program:
 
 def _projection(bb, program, rows, k, n, count, results):
     """W8A8 IntegerProjection: int_mm, then FP32 * activation scale * weight scale."""
+    if not program.include():
+        return
     codes = program.input(f"codes_{rows}_{k}_{n}", (rows, k), "int8")
     scale = program.input(f"scale_{rows}_{k}_{n}", (rows, 1), "float32")
     weight = program.const((k, n), "int8")
@@ -80,6 +89,8 @@ def _projection(bb, program, rows, k, n, count, results):
 
 def _conv(bb, program, h, w, cin, cout, kernel, stride, count, results):
     """resnet_quantized conv site in NHWC: conv, bias, 2^e requant, saturation."""
+    if not program.include():
+        return
     padding = kernel // 2
     data = program.input(f"conv_{h}_{w}_{cin}_{cout}_{kernel}_{stride}", (1, h, w, cin), "int8")
     weight = program.const((cout, kernel, kernel, cin), "int8")
@@ -123,7 +134,7 @@ def _finish(program, emit):
     return mod, program.operators
 
 
-def tinyllama(phase="decode", *, chunk=32, seed=0):
+def tinyllama(phase="decode", *, chunk=32, seed=0, operators=None):
     rows = 1 if phase == "decode" else chunk
     c = TINYLLAMA
     shapes = [
@@ -139,10 +150,10 @@ def tinyllama(phase="decode", *, chunk=32, seed=0):
         for k, n, count in shapes:
             _projection(bb, program, rows, k, n, count, results)
 
-    return _finish(_Program(seed), emit)
+    return _finish(_Program(seed, operators), emit)
 
 
-def smolvla(part="expert", *, seed=0):
+def smolvla(part="expert", *, seed=0, operators=None):
     """SmolVLA phases: ``vision`` (per 64-token chunk), ``prefix`` (VLM), ``expert``."""
     if part == "vision":
         chunks = 16 * 3  # 1024 patches per image, three cameras
@@ -180,7 +191,7 @@ def smolvla(part="expert", *, seed=0):
         for m, k, n, count in shapes:
             _projection(bb, program, m, k, n, count, results)
 
-    return _finish(_Program(seed), emit)
+    return _finish(_Program(seed, operators), emit)
 
 
 # torchvision ResNet50 convolutions at 224x224: (H, W, Cin, Cout, kernel, stride, count).
@@ -211,7 +222,7 @@ RESNET50 = [
 ]
 
 
-def resnet50(*, seed=0, layers=None):
+def resnet50(*, seed=0, layers=None, operators=None):
     selected = RESNET50 if layers is None else [RESNET50[i] for i in layers]
 
     def emit(bb, program, results):
@@ -220,32 +231,34 @@ def resnet50(*, seed=0, layers=None):
         # Classifier: the recipe's linear site is an INT8 matmul with bias.
         _projection(bb, program, 1, 2048, 1000, 1, results)
 
-    return _finish(_Program(seed), emit)
+    return _finish(_Program(seed, operators), emit)
 
 
-def smoke(*, seed=0):
+def smoke(*, seed=0, operators=None):
     """Small shapes exercising tails, padding and both epilogue kinds."""
 
     def emit(bb, program, results):
         _projection(bb, program, 50, 32, 32, 2, results)
         _projection(bb, program, 1, 64, 48, 1, results)
 
-    return _finish(_Program(seed), emit)
+    return _finish(_Program(seed, operators), emit)
 
 
 MODELS = {
     "smoke": smoke,
-    "tinyllama-decode": lambda: tinyllama("decode"),
-    "tinyllama-prefill": lambda: tinyllama("prefill"),
-    "smolvla-vision": lambda: smolvla("vision"),
-    "smolvla-prefix": lambda: smolvla("prefix"),
-    "smolvla-expert": lambda: smolvla("expert"),
+    "tinyllama-decode": lambda **kw: tinyllama("decode", **kw),
+    "tinyllama-prefill": lambda **kw: tinyllama("prefill", **kw),
+    "smolvla-vision": lambda **kw: smolvla("vision", **kw),
+    "smolvla-prefix": lambda **kw: smolvla("prefix", **kw),
+    "smolvla-expert": lambda **kw: smolvla("expert", **kw),
     "resnet50": resnet50,
 }
 
 
-def build(name):
-    mod, operators = MODELS[name]()
+def build(name, *, operators=None):
+    mod, operators = MODELS[name](operators=operators)
+    if not operators:
+        raise ValueError("Operator selection is empty")
     if not tvm.relax.analysis.well_formed(mod):
         raise AssertionError("Representative program is not well formed")
     return mod, operators

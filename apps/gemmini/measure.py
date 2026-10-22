@@ -23,8 +23,8 @@ oracle with canaries and checks that inputs are unchanged.
 
 Spike executes the verification: the positive ELF must pass and the
 wrong-oracle ELF must fail numerically. Verilator executes the identical
-positive ELF for timing; on the RTL core (marchid 1) the guest skips the
-verification loops, whose cost would otherwise dominate the simulation. Inputs
+positive ELF for timing and output verification; on the RTL core (marchid 1)
+the guest skips input hashing and guard initialization. Inputs
 and oracle values are linked as binary blobs, so operator size does not grow
 generated C source.
 """
@@ -158,8 +158,8 @@ int main(void){
   char line[96];char* out=line;const char* text="DSE_CYCLES first=";
   while(*text)*out++=*text++;out=put_u64(out,first);text=" second=";
   while(*text)*out++=*text++;out=put_u64(out,second);*out++='\n';*out=0;puts_htif(line);
-  if(rtl)return 0;
   for(unsigned i=0;i<NUM_OUTPUTS;++i)if(compare(i)){puts_htif("TENSORIR_NUMERICAL_FAILURE\n");return 22;}
+  if(rtl){puts_htif("DSE_PASS\n");return 0;}
   for(unsigned i=0;i<GUARD;++i)if(workspace_area[i]!=0x6d||workspace_area[sizeof(workspace_area)-1-i]!=0x6d)return 23;
   for(unsigned i=0;i<NUM_OUTPUTS;++i){
     const uint8_t* p=outputs_area+output_offsets[i];
@@ -233,7 +233,7 @@ class OperatorWorkload:
 
     @property
     def manifest(self):
-        return json.loads((self.folder / "workload.json").read_text())
+        return json.loads((self.folder / "workload-manifest.json").read_text())
 
 
 def prepare_workload(func, folder, *, seed=0, rtol=1e-5, atol=1e-6):
@@ -306,6 +306,35 @@ class Toolchain:
 
     def as_json(self):
         return {key: str(value) for key, value in self.__dict__.items()}
+
+    def provenance(self):
+        """Verify the actual executable bytes against the retained qualifications."""
+        from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
+
+        hardware = json.loads(self.hardware_receipt.read_text())
+        spike = json.loads(self.spike_receipt.read_text())
+        adapter_object, adapter = self.adapter
+        caps = GemminiCapabilities()
+        if adapter["headers"]["include/gemmini_params.h"]["sha256"] != caps.params_sha256:
+            raise ValueError("Adapter header differs from the compiler capability profile")
+        if adapter["hardware_source_check"]["configs_sha256"] != caps.config_sha256:
+            raise ValueError("Adapter hardware differs from the compiler capability profile")
+        identities = {
+            "simulator": identity(hardware["simulator"]["path"]),
+            "spike": identity(spike["spike_path"]),
+            "plugin": identity(spike["plugin_path"]),
+            "adapter": identity(adapter_object),
+            "gcc": identity(self.gcc),
+        }
+        for name, expected in (("simulator", hardware["simulator"]["sha256"]),
+                               ("spike", spike["spike_sha256"]),
+                               ("plugin", spike["plugin_sha256"])):
+            if identities[name]["sha256"] != expected:
+                raise ValueError(f"{name} differs from its qualification receipt")
+        return {"hardware": hardware["hardware"], "binaries": identities,
+                "adapter_sources": adapter["source_set"],
+                "receipts": [identity(p) for p in (self.hardware_receipt, self.spike_receipt,
+                                                  self.adapter_receipt)]}
 
     @classmethod
     def from_json(cls, value):
@@ -439,6 +468,9 @@ def build_candidate(mod, workload_folder, folder, toolchain, *, timeout=300):
         "elfs": elfs,
         "workload": str(workload_folder),
         "program_sha256": hashlib.sha256((folder / "package" / "operators.ll").read_bytes()).hexdigest(),
+        "compiler": identity(tvm._ffi.base._LIB._name),
+        "runner_sha256": hashlib.sha256((folder / "runner.c").read_bytes()).hexdigest(),
+        "adapter_sha256": receipt["object_sha256"],
     }
     (folder / "artifact.json").write_text(json.dumps(artifact, indent=2) + "\n")
     return artifact
@@ -503,7 +535,7 @@ def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, sp
     text = log.read_text(errors="replace")
     record["rtl_seconds"] = time.monotonic() - started
     cycles = _parse_cycles(text)
-    if code != 0 or cycles is None or "Verilog $finish" not in text:
+    if code != 0 or cycles is None or "Verilog $finish" not in text or "DSE_PASS" not in text:
         record.update(status="rtl_timeout_or_failure", returncode=code, cycle_cap=int(max_cycles))
         return record
     first, second = cycles
@@ -515,6 +547,36 @@ def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, sp
         timing="warm second call" if second else "single cold call (long operator)",
         rtl_elf=artifact["elfs"]["valid"],
     )
+    return record
+
+
+def run_negative_rtl(artifact, toolchain, *, max_cycles=6_000_000):
+    """Require the RTL guest to detect its deliberately corrupted oracle."""
+    folder = Path(artifact["folder"])
+    elf = artifact["elfs"]["bad-oracle"]
+    if identity(elf["path"])["sha256"] != elf["sha256"]:
+        raise ValueError("Wrong-oracle ELF changed after compilation")
+    provenance = toolchain.provenance()
+    simulator = provenance["binaries"]["simulator"]["path"]
+    command = [simulator, "+permissive", f"+max-cycles={max_cycles}",
+               f"+loadmem={elf['path']}", "+permissive-off", elf["path"]]
+    log = folder / "rtl-negative.log"
+    started = time.monotonic()
+    with log.open("wb") as stream:
+        try:
+            process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
+                                     timeout=60 + max_cycles / 1500)
+            code = process.returncode
+        except subprocess.TimeoutExpired:
+            code = None
+    text = log.read_text(errors="replace")
+    detected = (code not in (None, 0) and "TENSORIR_NUMERICAL_FAILURE" in text
+                and _parse_cycles(text) is not None and "(timeout)" not in text)
+    record = {"status": "passed" if detected else "negative_not_detected",
+              "returncode": code, "elf": elf, "log": identity(log), "command": command,
+              "wall_seconds": time.monotonic() - started,
+              "hardware_provenance": provenance}
+    (folder / "rtl-negative.json").write_text(json.dumps(record, indent=2) + "\n")
     return record
 
 

@@ -30,6 +30,7 @@ measurement instead of simulating again.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
@@ -69,7 +70,8 @@ class Campaign:
         self.args, self.toolchain = args, toolchain
         self.root = args.work_dir
         self.lock = threading.Lock()
-        self.counter = 0
+        self.counter = len(list((self.root / "candidates").glob("*.request.json")))
+        self.program_locks = {}
         self.default_cycles = {}
         cache = self.root / "measurement-cache.json"
         self.cache = json.loads(cache.read_text()) if cache.exists() else {}
@@ -118,14 +120,21 @@ class Campaign:
     def run(self, artifact_path):
         artifact = json.loads(Path(artifact_path).read_text())
         key = Path(artifact["workload"]).name
-        program = artifact["program_sha256"]
+        program = key + ":" + artifact["program_sha256"]
         with self.lock:
-            cached = self.cache.get(program)
-        if cached is not None:
-            record = dict(cached, reused_from=cached["folder"])
-        else:
-            record = measure.run_candidate(artifact, self.toolchain, max_cycles=self.cap(key))
-            if record["status"] == "passed":
+            program_lock = self.program_locks.setdefault(program, threading.Lock())
+        # Search strategies can submit identical generated code concurrently.
+        # Serialize only those duplicates; distinct programs still run in parallel.
+        with program_lock:
+            with self.lock:
+                cached = self.cache.get(program)
+            if cached is not None:
+                record = dict(cached, reused_from=cached["folder"])
+            else:
+                cap = self.cap(key)
+                if not artifact["native"]:
+                    cap = min(cap, self.args.cpu_max_cycles)
+                record = measure.run_candidate(artifact, self.toolchain, max_cycles=cap)
                 with self.lock:
                     self.cache[program] = record
                     (self.root / "measurement-cache.json").write_text(json.dumps(self.cache))
@@ -154,12 +163,15 @@ def baseline(campaign, key, label, mod):
     if path.exists():
         return json.loads(path.read_text())
     path.parent.mkdir(parents=True, exist_ok=True)
+    artifact = None
     try:
         artifact = campaign.build(mod, key)
         cycles = campaign.run(artifact)
         record = {"status": "passed", "cycles": cycles, "artifact": str(artifact)}
     except Exception as error:  # pylint: disable=broad-except
         record = {"status": "failed", "error": str(error)}
+        if artifact is not None:
+            record["artifact"] = str(artifact)
     path.write_text(json.dumps(record, indent=2) + "\n")
     return record
 
@@ -173,6 +185,9 @@ def main():
     parser.add_argument("--builders", type=int, default=6)
     parser.add_argument("--strategy", choices=("evolutionary", "replay"), default="evolutionary")
     parser.add_argument("--tasks", type=int, nargs="*", help="Restrict to these task indices")
+    parser.add_argument("--operators", type=int, nargs="+", help="Select semantic operators before task extraction")
+    parser.add_argument("--baseline-workers", type=int, default=2)
+    parser.add_argument("--cpu-max-cycles", type=int, default=2_000_000)
     parser.add_argument("--cap-factor", type=float, default=3.0)
     parser.add_argument("--max-cycles", type=int, default=40_000_000)
     parser.add_argument("--build-seconds", type=int, default=900)
@@ -186,10 +201,18 @@ def main():
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     toolchain = measure.Toolchain(args.gcc, args.adapter_receipt, args.spike_receipt, args.hardware_receipt)
+    provenance = toolchain.provenance()
+    provenance_path = args.work_dir / "hardware-provenance.json"
+    if provenance_path.exists():
+        previous = json.loads(provenance_path.read_text())
+        if previous["binaries"] != provenance["binaries"]:
+            raise ValueError("A campaign cannot reuse measurements from different hardware/toolchain bytes")
+    provenance_path.write_text(json.dumps(provenance, indent=2) + "\n")
     capabilities = GemminiCapabilities()
     started = time.monotonic()
 
-    program, operators = model_workloads.build(args.model)
+    program, operators = model_workloads.build(args.model, operators=args.operators)
+    (args.work_dir / "program.json").write_text(tvm.ir.save_json(program))
     prepared, _, _ = prepare_gemmini_tensorir_workloads(program)
     prepared = AnnotateGemminiWorkloads()(prepared)
     extracted = ms.relax_integration.extract_tasks(prepared, capabilities.target())
@@ -205,13 +228,16 @@ def main():
         folder = campaign.workload_folder(key)
         if not (folder / "workload-manifest.json").exists():
             measure.prepare_workload(func, folder, seed=args.seed)
+        elif json.loads((folder / "workload-manifest.json").read_text())["seed"] != args.seed:
+            raise ValueError("A campaign cannot reuse measurements from different input seeds")
         inventory.append({"task": task.task_name, "workload": key, "weight": int(task.weight),
                           "buffers": [[int(x) for x in func.buffer_map[p].shape] + [func.buffer_map[p].dtype] for p in func.params]})
     (args.work_dir / "tasks.json").write_text(json.dumps({"model": args.model, "operators": operators, "tasks": inventory}, indent=2) + "\n")
 
     # Baselines: untuned default Gemmini schedule, then the untuned CPU
     # lowering bounded by the default's cycles.
-    for task, item in zip(tasks, inventory):
+    def measure_baselines(pair):
+        task, item = pair
         func = task.dispatched[0]["main"]
         key = item["workload"]
         try:
@@ -224,13 +250,17 @@ def main():
             campaign.default_cycles[key] = record["cycles"]
         item["cpu_untuned"] = baseline(campaign, key, "cpu-untuned", tvm.IRModule({"main": func}))
         print(json.dumps({"task": item["task"], "default": record.get("cycles"), "cpu": item["cpu_untuned"].get("cycles")}), flush=True)
+        with campaign.lock:
+            (args.work_dir / "tasks.json").write_text(json.dumps({"model": args.model, "operators": operators, "tasks": inventory}, indent=2) + "\n")
+    with ThreadPoolExecutor(args.baseline_workers) as pool:
+        list(pool.map(measure_baselines, zip(tasks, inventory)))
     (args.work_dir / "tasks.json").write_text(json.dumps({"model": args.model, "operators": operators, "tasks": inventory}, indent=2) + "\n")
 
     builder = GemminiBuilder(campaign.build, max_workers=args.builders)
     runner = GemminiRunner(campaign.run, max_workers=args.parallel)
-    tune_gemmini_tasks(
+    database = tune_gemmini_tasks(
         tasks,
-        work_dir=args.work_dir / "database",
+        work_dir=args.work_dir / ("database" if args.strategy == "evolutionary" else "replay-database"),
         builder=builder,
         runner=runner,
         max_trials_global=args.trials_per_task * len(tasks),
@@ -238,13 +268,26 @@ def main():
         capabilities=capabilities,
         strategy=args.strategy,
         seed=args.seed,
-        log=args.work_dir / "trials.jsonl",
+        log=args.work_dir / ("trials.jsonl" if args.strategy == "evolutionary" else "replay-trials.jsonl"),
         describe=describe,
         include_cpu=not args.no_cpu,
     )
-    (args.work_dir / "campaign.json").write_text(
+    # Add the verified default only after the search has finished. This gives
+    # deployment a non-regressing fallback without seeding EvolutionarySearch
+    # with baseline records it would otherwise propose measuring again.
+    for task, item in zip(tasks, inventory):
+        record = item["default"]
+        if record.get("status") == "passed":
+            sch = default_schedule(task.dispatched[0]["main"])
+            database.commit_tuning_record(ms.database.TuningRecord(
+                sch.trace, database.commit_workload(task.dispatched[0]),
+                [float(record["cycles"])], capabilities.target(), [],
+            ))
+    (args.work_dir / ("campaign.json" if args.strategy == "evolutionary" else "replay-campaign.json")).write_text(
         json.dumps({"model": args.model, "strategy": args.strategy, "wall_seconds": time.monotonic() - started,
                     "trials_per_task": args.trials_per_task, "parallel": args.parallel, "cap_factor": args.cap_factor,
+                    "max_cycles": args.max_cycles, "cpu_max_cycles": args.cpu_max_cycles,
+                    "compiler": measure.identity(tvm._ffi.base._LIB._name),
                     "toolchain": toolchain.as_json(), "capabilities": capabilities.fingerprint}, indent=2) + "\n")
 
 
