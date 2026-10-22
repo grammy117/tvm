@@ -535,6 +535,20 @@ def create_iter(name, extent):
     return tvm.tir.Var(name, "int32"), extent
 
 
+def test_subspace_division_moves_partition_base_outside_tile():
+    x, outer = tvm.tir.Var("x", "int32"), tvm.tir.Var("outer", "int32")
+    for expression, domains, expected in (
+        (x + 48, [(x, 2)], tvm.tir.const(24, "int32")),
+        (outer * 2 + x + 48, [(x, 2), (outer, 3)], outer + 24),
+    ):
+        result = tvm.arith.subspace_divide([expression], var_dom(domains), [x])
+        assert len(result) == 2
+        converted = convert_division(result)
+        tvm.ir.assert_structural_equal(converted[0][0], expected)
+        tvm.ir.assert_structural_equal(converted[0][1], x)
+        assert int(result[0][1].extent) == 2
+
+
 def test_subspace_division():
     x = tvm.tir.Var("x", "int32")
     y = tvm.tir.Var("y", "int32")

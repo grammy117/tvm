@@ -111,6 +111,16 @@ bool ProducerCoversConsumer(const Array<PrimExpr>& buffer_shape,
     produced = arith::Intersect({produced, buffer_size});
     consumed = arith::Intersect({consumed, buffer_size});
 
+    // Clipping can make a previously nonempty region empty (for example an
+    // offset partition while blockizing a tail). Empty sets use +/- infinity
+    // sentinels, which must not enter ordinary integer subtraction below.
+    if (consumed.IsNothing()) {
+      continue;
+    }
+    if (produced.IsNothing()) {
+      return false;
+    }
+
     produced = arith::IntSet::Interval(analyzer->Simplify(produced.min()),
                                        analyzer->Simplify(produced.max()));
     consumed = arith::IntSet::Interval(analyzer->Simplify(consumed.min()),
