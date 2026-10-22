@@ -134,6 +134,11 @@ the verified default trace is committed through the standard database API so a
 deployment can retain it if search found nothing faster. No custom winner replay
 is used. Fresh compilation registers the workload's intrinsic families before
 loading the database; the stock Relax pass performs matching and application.
+After both comparisons finish, `merge_comparison_records.py` can retain verified
+ReplayTrace records in the deployment JSONDatabase using its standard commit
+API. Search-only minima and matched budgets still come from the separate trial
+logs. This aggregation neither feeds measurements back into a running search nor
+implements a separate schedule replay path.
 
 The XGB warmup is four feature-bearing samples for these bounded experiments, rather
 than its upstream default of 100. The model and `cost-model.json` retain its

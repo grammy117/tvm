@@ -77,9 +77,12 @@ def summarize(root):
             winner.trace.apply_to_schedule(sch, remove_postproc=False)
             cycles = float(winner.run_secs[0])
             row["best_cycles"] = cycles
-            row["best_measurement_artifact"] = next(
-                (trial["artifact"] for trial in measured if trial.get("cycles") == cycles),
-                row.get("default", {}).get("artifact"))
+            matching = [trial for trial in measured + replay if trial.get("cycles") == cycles]
+            trace_json = json.loads(tvm.ir.save_json(winner.trace.as_json()))
+            match = next((trial for trial in matching if trial.get("trace") == trace_json),
+                         matching[0] if matching else None)
+            row["best_measurement_artifact"] = (
+                match["artifact"] if match else row.get("default", {}).get("artifact"))
             row["best_sketch"] = str(sch.mod["main"].body.block.annotations.get("gemmini.sketch", "cpu"))
             row["best_decisions"] = []
             decisions = dict(winner.trace.as_json()[1])
@@ -117,7 +120,8 @@ def summarize(root):
         "call_count_weighted_selected_ops": weighted,
         "replay_comparison": "Separate stock ReplayTrace search; compare successful trial counts and budgets. Default records are excluded from search-only minima.",
     }
-    for name in ("campaign.json", "replay-campaign.json", "database/cost-model.json"):
+    for name in ("campaign.json", "replay-campaign.json", "database/cost-model.json",
+                 "comparison-merge.json"):
         if (root / name).exists():
             result[name] = json.loads((root / name).read_text())
     provenance = root / "hardware-provenance.json"
