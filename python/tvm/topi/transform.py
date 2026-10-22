@@ -311,25 +311,27 @@ def strided_set(a, v, begin, end, strides=None):
         return tvm.tir.Select(a > b, a, b)
 
     if strides is None:
-        strides = [tvm.tir.const(1, "int32")] * n
+        strides = [tvm.tir.const(1, a.shape[i].dtype) for i in range(n)]
     else:
         strides = [
-            tvm.tir.if_then_else(strides.shape[0] > i, strides[i], tvm.tir.const(1, "int32"))
+            tvm.tir.if_then_else(strides.shape[0] > i, strides[i], tvm.tir.const(1, "int32")).astype(
+                a.shape[i].dtype
+            )
             for i in range(n)
         ]
 
     begin = [
         tvm.tir.if_then_else(
             begin.shape[0] > i,
-            begin[i],
-            tvm.tir.Select(strides[i] > 0, tvm.tir.const(0, "int32"), a.shape[i]),
+            begin[i].astype(a.shape[i].dtype),
+            tvm.tir.Select(strides[i] > 0, tvm.tir.const(0, a.shape[i].dtype), a.shape[i]),
         )
         for i in range(n)
     ]
     end = [
         tvm.tir.if_then_else(
             end.shape[0] > i,
-            end[i],
+            end[i].astype(a.shape[i].dtype),
             tvm.tir.Select(strides[i] > 0, a.shape[i] + 1, -(a.shape[i] + 1)),
         )
         for i in range(n)

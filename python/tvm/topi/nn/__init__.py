@@ -35,6 +35,7 @@ from .softmax import *
 from .conv3d_transpose import *
 from .conv2d_transpose import *
 from .conv1d_transpose import *
+from .conv_transpose import group_conv_transpose_ncx
 from .bnn import *
 from .qnn import *
 from .upsampling import *

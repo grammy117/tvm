@@ -21,6 +21,7 @@ import math
 from typing import Optional
 
 from tvm import te, tir, topi
+from tvm.arith import Analyzer
 
 from ...block_builder import BlockBuilder
 from ...expr import Call, Expr
@@ -166,11 +167,18 @@ def _nn_conv1d_transpose(bb: BlockBuilder, call: Call) -> Expr:
         return call
     dilation = call.attrs.dilation
     if len(dilation) != 1 or dilation[0] != 1:
-        logging.info(
-            "TOPI conv1d_transpose does not support dilations other than 1, "
-            "and thus cannot be legalized by TOPI"
+        return bb.call_te(
+            topi.nn.group_conv_transpose_ncx,
+            call.args[0],
+            call.args[1],
+            call.attrs.strides,
+            call.attrs.padding,
+            call.attrs.output_padding,
+            dilation,
+            call.attrs.groups,
+            call.struct_info.dtype,
+            primfunc_name_hint="conv1d_transpose",
         )
-        return call
 
     return bb.call_te(
         topi.nn.group_conv1d_transpose_ncw,
@@ -201,11 +209,18 @@ def _nn_conv2d_transpose(bb: BlockBuilder, call: Call) -> Expr:
         return call
     dilation = call.attrs.dilation
     if len(dilation) != 2 or dilation[0] != 1 or dilation[1] != 1:
-        logging.info(
-            "TOPI conv2d_transpose does not support dilations other than 1, "
-            "and thus cannot be legalized by TOPI"
+        return bb.call_te(
+            topi.nn.group_conv_transpose_ncx,
+            call.args[0],
+            call.args[1],
+            call.attrs.strides,
+            call.attrs.padding,
+            call.attrs.output_padding,
+            dilation,
+            call.attrs.groups,
+            call.struct_info.dtype,
+            primfunc_name_hint="conv2d_transpose",
         )
-        return call
 
     return bb.call_te(
         topi.nn.group_conv2d_transpose_nchw,
@@ -226,6 +241,55 @@ def _nn_pad(bb: BlockBuilder, call: Call) -> Expr:
     pad_widths = call.attrs.pad_width
     pad_before = pad_widths[::2]
     pad_after = pad_widths[1::2]
+    mode = call.attrs.pad_mode
+    if mode not in ("constant", "edge", "reflect"):
+        raise ValueError(f"Unsupported relax.nn.pad mode: {mode}")
+    if mode != "constant":
+        # A reflected index must stay within the input after one reflection.
+        # TOPI mirror_pad does not implement repeated reflection for wider pads.
+        analyzer = Analyzer()
+        shape = call.args[0].struct_info.shape.values
+        if any(
+            not analyzer.can_prove(dim > 0)
+            or not analyzer.can_prove(dim + before + after >= 0)
+            for dim, before, after in zip(shape, pad_before, pad_after)
+        ) or (
+            mode == "reflect"
+            and any(
+                not analyzer.can_prove(before < dim)
+                or not analyzer.can_prove(after < dim)
+                for dim, before, after in zip(shape, pad_before, pad_after)
+            )
+        ):
+            logging.info("Cannot prove safe %s padding bounds; retaining relax.nn.pad", mode)
+            return call
+        if mode == "reflect":
+            return bb.call_te(
+                topi.nn.mirror_pad,
+                call.args[0],
+                pad_before=pad_before,
+                pad_after=pad_after,
+                mode="REFLECT",
+                primfunc_name_hint="pad",
+            )
+
+        def edge_pad(data):
+            out_shape = [
+                dim + before + after
+                for dim, before, after in zip(data.shape, pad_before, pad_after)
+            ]
+
+            def value(*indices):
+                return data[
+                    tuple(
+                        tir.max(0, tir.min(index - before, dim - 1))
+                        for index, before, dim in zip(indices, pad_before, data.shape)
+                    )
+                ]
+
+            return te.compute(out_shape, value, name="EdgePadInput")
+
+        return bb.call_te(edge_pad, call.args[0], primfunc_name_hint="pad")
     return bb.call_te(
         topi.nn.pad,
         call.args[0],

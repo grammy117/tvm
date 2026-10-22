@@ -1199,8 +1199,8 @@ kernel_layout, out_layout, out_dtype)`
     stride_h, stride_w = attrs.strides
     dilation_h, dilation_w = attrs.dilation
 
-    out_h = (grad_h - 1) * stride_h - pad_top - pad_bottom + filter_h
-    out_w = (grad_w - 1) * stride_w - pad_left - pad_right + filter_w
+    out_h = (grad_h - 1) * stride_h - pad_top - pad_bottom + dilation_h * (filter_h - 1) + 1
+    out_w = (grad_w - 1) * stride_w - pad_left - pad_right + dilation_w * (filter_w - 1) + 1
 
     output_padding = (in_h - out_h, in_w - out_w)
 
