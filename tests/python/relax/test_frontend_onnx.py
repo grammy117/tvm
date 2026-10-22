@@ -21,6 +21,7 @@ ONNX testcases
 This file is a test script to test Relax ONNX frontend coverage.
 """
 
+import math
 from typing import Dict, List, Literal, Optional
 
 import numpy as np
@@ -363,6 +364,34 @@ def test_binary(op_name: str):
     verify_binary_scalar(op_name)
 
 
+@pytest.mark.parametrize("op_name", ["Add", "Sub", "Mul", "Div"])
+def test_binary_primvalue_broadcast_to_array(op_name):
+    """A scalar ``PrimValue`` operand combined with a constant *array* must fold to a Constant
+    tensor, not crash. numpy broadcasting produces a non-scalar ndarray which ``relax.PrimValue``
+    cannot wrap ("Don't know how to handle type numpy.ndarray"); the frontend must emit a Constant
+    in that case. Regression for the BinaryBase PrimValue fast-path."""
+    import numpy as np
+    import tvm
+    from tvm import relax, tir
+    from tvm.relax.frontend.onnx.onnx_frontend import (
+        Add as _Add,
+        Sub as _Sub,
+        Mul as _Mul,
+        Div as _Div,
+    )
+
+    conv = {"Add": _Add, "Sub": _Sub, "Mul": _Mul, "Div": _Div}[op_name]
+    scalar = relax.PrimValue(tir.IntImm("int64", 3))
+    arr = relax.const(np.array([1.0, 2.0, 3.0, 4.0], dtype="float32"))
+    out = conv.base_impl(None, [scalar, arr], {}, [{}, {}])
+    assert isinstance(out, relax.Constant), f"{op_name}: expected folded Constant, got {type(out)}"
+    got = out.data.numpy()
+    ref = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}[op_name](
+        np.array(3), np.array([1.0, 2.0, 3.0, 4.0], dtype="float32")
+    )
+    np.testing.assert_allclose(got, ref, rtol=1e-6)
+
+
 @pytest.mark.parametrize("int_mode", [True, False])
 def test_mod(int_mode: bool):
     if int_mode:
@@ -396,6 +425,30 @@ def test_multi_input(op_name: str, num_inputs: int):
 @pytest.mark.parametrize("op_name", ["Less", "LessOrEqual", "Greater", "GreaterOrEqual"])
 def test_compare(op_name: str):
     verify_compare(op_name, [1, 32])
+
+
+@pytest.mark.parametrize("op_name", ["Less", "LessOrEqual", "Greater", "GreaterOrEqual"])
+@pytest.mark.parametrize("dtype", ["int64", "float32"])
+def test_constant_comparison_keeps_boolean_condition(op_name, dtype):
+    lhs = np.array([[-2], [0], [2]], dtype=dtype)
+    rhs = np.array([[-2, -1, 0, 1, 2]], dtype=dtype)
+    input_value = np.arange(15, dtype=np.float32).reshape(3, 5)
+    graph = helper.make_graph(
+        [helper.make_node(op_name, ["lhs", "rhs"], ["mask"]), helper.make_node("Where", ["mask", "x", "zero"], ["selected"])],
+        "constant_comparison",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [3, 5])],
+        [helper.make_tensor_value_info("mask", TensorProto.BOOL, [3, 5]), helper.make_tensor_value_info("selected", TensorProto.FLOAT, [3, 5])],
+        initializer=[onnx.numpy_helper.from_array(value, name) for name, value in (("lhs", lhs), ("rhs", rhs), ("zero", np.array(0, dtype=np.float32)))],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model, full_check=True)
+    mod = from_onnx(model, keep_params_in_input=False)
+    assert mod["main"].ret_struct_info.fields[0].dtype == "bool"
+    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+    mask, selected = vm["main"](tvm.nd.array(input_value))
+    expected = {"Less": np.less, "LessOrEqual": np.less_equal, "Greater": np.greater, "GreaterOrEqual": np.greater_equal}[op_name](lhs, rhs)
+    np.testing.assert_array_equal(mask.numpy(), expected)
+    np.testing.assert_array_equal(selected.numpy(), np.where(expected, input_value, np.float32(0)))
 
 
 @pytest.mark.parametrize("op_name", ["And", "Or", "Xor"])
@@ -542,6 +595,11 @@ def test_gather():
     _verify_gather([5, 4, 3, 2], [0, 1, 3], [3, 4, 3, 2])
     _verify_gather([3], 0, [])
     _verify_gather([3, 3], [[0, 2]], [3, 1, 2], 1)
+    # ONNX Gather permits NEGATIVE indices (count from the back); relax.op.take does not wrap them
+    # and would read out of bounds. Regression for the negative-index normalization.
+    _verify_gather([3], -1, [])
+    _verify_gather([5, 4, 3, 2], [-1, 0, -2], [3, 4, 3, 2])
+    _verify_gather([1, 1, 32, 32], -1, [1, 1, 32], 2)  # the bitvla attention-mask gather shape
 
 
 @pytest.mark.parametrize(
@@ -1103,6 +1161,46 @@ def test_pow():
     verify_binary("Pow", [32, 32], [32, 32], [32, 32])
 
 
+@pytest.mark.parametrize("dtype", ["float16", "float32", "float64"])
+def test_constant_float_pow_matches_runtime(dtype):
+    from decimal import Decimal, localcontext
+
+    base = np.array([10000] * 32 + [-1, -0.0, 0, np.inf, np.nan], dtype=dtype)
+    exponent = np.array([i / 32 for i in range(32)] + [0.5, -3, -2, -1, 0], dtype=dtype)
+    tensor_type = {"float16": TensorProto.FLOAT16, "float32": TensorProto.FLOAT, "float64": TensorProto.DOUBLE}[dtype]
+    values = []
+    for constant in (False, True):
+        inputs = [] if constant else [helper.make_tensor_value_info(name, tensor_type, [37]) for name in ("base", "exponent")]
+        initializers = [onnx.numpy_helper.from_array(value, name) for name, value in (("base", base), ("exponent", exponent))] if constant else []
+        graph = helper.make_graph([helper.make_node("Pow", ["base", "exponent"], ["y"])], "pow_rounding", inputs, [helper.make_tensor_value_info("y", tensor_type, [37])], initializer=initializers)
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        onnx.checker.check_model(model, full_check=True)
+        mod = from_onnx(model, keep_params_in_input=False)
+        arguments = [] if constant else [tvm.nd.array(base), tvm.nd.array(exponent)]
+        for optimized in (False, True):
+            prepared = relax.get_pipeline("zero")(mod) if optimized else mod
+            vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+            values.append(vm["main"](*arguments).numpy())
+    for value in values[1:]:
+        np.testing.assert_array_equal(value.view("uint" + str(value.dtype.itemsize * 8)), values[0].view("uint" + str(value.dtype.itemsize * 8)))
+    if dtype == "float32":
+        with localcontext() as context:
+            context.prec = 80
+            expected = np.float32(float(Decimal(10000) ** (Decimal(5) / 32)))
+        assert values[0][5].view("uint32") == expected.view("uint32")
+
+
+def test_integer_pow_constant_shape_arithmetic():
+    from tvm import tir
+    from tvm.relax.frontend.onnx.onnx_frontend import Pow
+
+    folded = Pow._impl_v7(None, [relax.const([2, 3, 4], "int64"), relax.const([0, 3, 2], "int64")], {}, {})
+    assert isinstance(folded, relax.Constant)
+    np.testing.assert_array_equal(folded.data.numpy(), np.array([1, 27, 16], dtype=np.int64))
+    scalar = Pow._impl_v7(None, [relax.PrimValue(tir.IntImm("int64", 2)), relax.PrimValue(tir.IntImm("int64", 3))], {}, {})
+    assert isinstance(scalar, relax.PrimValue) and scalar.value.value == 8
+
+
 @pytest.mark.parametrize("reverse", [False])
 @pytest.mark.parametrize("exclusive", [False])
 def test_cumsum(reverse, exclusive):
@@ -1285,6 +1383,51 @@ def test_instance_norm():
 def test_mean_variance_norm():
     verify_unary("MeanVarianceNormalization", [1, 3, 32, 32])
     verify_unary("MeanVarianceNormalization", [1, 3, 32, 32], attrs={"axes": (1, 2, 3)})
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_bf16_layer_norm_preserves_stash_and_affine_rounding(has_bias):
+    import ml_dtypes
+
+    def round_bf16(value):
+        bits = np.asarray(value, dtype="float32").view("uint32")
+        words = ((bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)) >> 16).astype("uint16")
+        return (words.astype("uint32") << 16).view("float32")
+
+    data = np.array([[1, 2, 4], [-2, 1, 3]], dtype="float32")
+    scale = np.array([3, 1.5, -2], dtype="float32")
+    bias = np.array([0.25, 0.5, -0.125], dtype="float32")
+    epsilon = np.float32(1e-5)
+    mean = data.mean(axis=-1, keepdims=True, dtype="float32")
+    centered = data - mean
+    variance = (centered * centered).mean(axis=-1, keepdims=True, dtype="float32")
+    inv_std = np.float32(1) / np.sqrt(variance + epsilon)
+    normalized = centered * inv_std
+    expected = round_bf16(round_bf16(normalized) * scale)
+    unrounded_affine = normalized * scale
+    if has_bias:
+        expected = round_bf16(expected + bias)
+        unrounded_affine = unrounded_affine + bias
+    assert np.any(expected != round_bf16(unrounded_affine)), "Fixture must distinguish the ONNX stash boundary"
+    names = ["x", "scale"] + (["bias"] if has_bias else [])
+    outputs = [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, [2, 3]), helper.make_tensor_value_info("mean", TensorProto.FLOAT, [2, 1]), helper.make_tensor_value_info("inv_std", TensorProto.FLOAT, [2, 1])]
+    initializers = [helper.make_tensor(name, TensorProto.BFLOAT16, value.shape, value.astype(ml_dtypes.bfloat16).tobytes(), raw=True) for name, value in zip(names[1:], (scale, bias))]
+    node = helper.make_node("LayerNormalization", names, ["y", "mean", "inv_std"], axis=-1, epsilon=float(epsilon), stash_type=1)
+    graph = helper.make_graph([node], "bf16_layer_norm_stash", [helper.make_tensor_value_info("x", TensorProto.BFLOAT16, [2, 3])], outputs, initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    onnx.checker.check_model(model)
+    mod = from_onnx(model, keep_params_in_input=False)
+    assert [field.dtype for field in mod["main"].ret_struct_info.fields] == ["bfloat16", "float32", "float32"]
+    for optimized in (False, True):
+        prepared = relax.get_pipeline("zero")(mod) if optimized else mod
+        vm = relax.VirtualMachine(relax.build(prepared, target="llvm"), tvm.cpu())
+        incoming = tvm.nd.array(data.astype(ml_dtypes.bfloat16))
+        original = incoming.numpy().copy()
+        actual = vm["main"](incoming)
+        np.testing.assert_array_equal(actual[0].numpy().view("uint16"), expected.astype(ml_dtypes.bfloat16).view("uint16"))
+        np.testing.assert_allclose(actual[1].numpy(), mean, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(actual[2].numpy(), inv_std, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(incoming.numpy().view("uint16"), original.view("uint16"))
 
 
 def test_layer_norm():
@@ -1562,6 +1705,82 @@ def test_all_reduce_funcs(func, dynamic):
 
         verify_reduce_func(
             func, np.random.randn(1, 3, 4, 1).astype(np.float32), axis=(1,), keepdims=keepdims
+        )
+
+
+@pytest.mark.parametrize("func, dynamic", create_reduce_test_parameters())
+def test_all_reduce_funcs_opset18(func, dynamic):
+    """Opset-18 reducers take ``axes`` as an optional *input* (a constant int64 tensor), not an
+    attribute. Regression test for the frontend reducing over ALL axes when it silently missed the
+    axes input (broke e.g. per-token RMSNorm ``ReduceMean(axis=-1)`` -> full reduction)."""
+
+    def verify_reduce_func_v18(func, data, axis, keepdims, noop_with_empty_axes=0):
+        inshape = data.shape
+        if axis is None:
+            if noop_with_empty_axes:
+                outshape = inshape
+            else:
+                outshape = np.sum(data, axis=None, keepdims=keepdims == 1).shape
+        else:
+            outshape = np.sum(data, axis=tuple(axis), keepdims=keepdims == 1).shape
+
+        node_inputs = ["x"]
+        initializer = []
+        if axis is not None:
+            node_inputs.append("axes")
+            initializer.append(
+                helper.make_tensor("axes", TensorProto.INT64, [len(axis)], list(axis))
+            )
+        node = onnx.helper.make_node(
+            func,
+            inputs=node_inputs,
+            outputs=["y"],
+            keepdims=keepdims,
+            noop_with_empty_axes=noop_with_empty_axes,
+        )
+
+        if dynamic:
+            in_list = ["?" for _ in range(len(inshape))]
+            out_list = ["?" for _ in range(len(outshape))]
+        else:
+            in_list = list(inshape)
+            out_list = list(outshape)
+        graph = helper.make_graph(
+            [node],
+            "reduce_test_v18",
+            inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, in_list)],
+            outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, out_list)],
+            initializer=initializer,
+        )
+        model = helper.make_model(graph, producer_name="reduce_test_v18")
+        check_correctness(model, {"x": data}, opset=18, rtol=1e-4, atol=1e-4)
+
+    for keepdims in [True, False]:
+        # the exact RMSNorm shape/axis that regressed: reduce only the last axis. torch exports this
+        # with axis=-1; for the static-shape case we keep -1 (a negative axis is what regressed).
+        # (Negative axes on a *dynamic*-rank input are a separate, pre-existing frontend limitation
+        # shared by ReduceSum, so the dynamic probes below use the equivalent positive axis.)
+        last_axis = (2,) if dynamic else (-1,)
+        verify_reduce_func_v18(
+            func, np.random.randn(1, 8, 16).astype(np.float32), axis=last_axis, keepdims=keepdims
+        )
+        verify_reduce_func_v18(
+            func, np.random.randn(3, 3, 3).astype(np.float32), axis=(1,), keepdims=keepdims
+        )
+        verify_reduce_func_v18(
+            func, np.random.randn(3, 3, 3).astype(np.float32), axis=(1, 2), keepdims=keepdims
+        )
+        # axes omitted -> reduce over all axes (default noop_with_empty_axes=0)
+        verify_reduce_func_v18(
+            func, np.random.randn(3, 2, 2).astype(np.float32), axis=None, keepdims=keepdims
+        )
+        # axes omitted + noop_with_empty_axes=1 -> identity (no reduction)
+        verify_reduce_func_v18(
+            func,
+            np.random.randn(3, 2, 2).astype(np.float32),
+            axis=None,
+            keepdims=keepdims,
+            noop_with_empty_axes=1,
         )
 
 
@@ -2940,6 +3159,462 @@ def test_shape_dim_string_expression_graph_div_2():
     # fmt: on
 
     tvm.ir.assert_structural_equal(tvm_model, Expected)
+
+
+def test_fixed_tree_fp32_contract_preserves_rounding_and_query_shape():
+    import re
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+    def tree(products):
+        values = products.copy()
+        while values.shape[-1] > 1:
+            values = np.add(values[..., ::2], values[..., 1::2], dtype=np.float32)
+        return values
+
+    generator = np.random.default_rng(181)
+    a = generator.standard_normal((1, 2, 3, 64)).astype("float32")
+    b = generator.standard_normal((1, 2, 5, 64)).astype("float32")
+    a[0, 0, 0] = 0
+    a[0, 0, 0, :4] = [33554432, 1, -33554432, 1]
+    b[0, 0, 0] = 1
+    expected = tree(np.multiply(a[..., :, None, :], b[..., None, :, :], dtype=np.float32))[..., 0]
+    assert expected[0, 0, 0, 0] == 0
+    sequential = np.float32(0)
+    for value in a[0, 0, 0]:
+        sequential = np.float32(sequential + value)
+    assert sequential == 1
+    squares = generator.standard_normal((2, 2048)).astype("float32")
+    mean = np.multiply(tree(np.multiply(squares, squares, dtype=np.float32)), np.float32(1 / 2048), dtype=np.float32)
+    cases = [("FixedTreeDot", [a, b], expected), ("FixedTreeDot", [a[:, :, -1:].copy(), b], expected[:, :, -1:]), ("FixedTreeMeanSquares", [squares], mean), ("FixedTreeMeanSquares", [np.array([[-0.0], [2.0]], dtype="float32")], np.array([[0.0], [4.0]], dtype="float32"))]
+    for op_name, inputs, reference in cases:
+        names = [f"x{i}" for i in range(len(inputs))]
+        graph = helper.make_graph([helper.make_node(op_name, names, ["y"], domain="merlin.fixed_order")], "ordered", [helper.make_tensor_value_info(name, TensorProto.FLOAT, value.shape) for name, value in zip(names, inputs)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, reference.shape)])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.fixed_order", 1)])
+        imported = from_onnx(model)
+        for optimized in (False, True):
+            prepared = prepare_gemmini_graph(imported, optimize=optimized)
+            functions = [func for name, func in prepared.functions.items() if name.name_hint.startswith("fixed_tree_") and isinstance(func, tvm.tir.PrimFunc)]
+            assert len(functions) == 1 and int(functions[0].attrs["op_pattern"]) == 8
+            llvm = tvm.build(functions[0], target="llvm").get_source("ll")
+            assert not re.search(r"\bf(?:add|mul)\s+(?:fast|reassoc|contract)\b|llvm\.(?:fma|fmuladd)", llvm)
+            assert "TVMBackendAllocWorkspace" not in llvm and "TVMBackendFreeWorkspace" not in llvm
+            vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+            for _ in range(2):
+                output = vm["main"](*[tvm.nd.array(value) for value in inputs]).numpy()
+                np.testing.assert_array_equal(output.view("uint32"), reference.view("uint32"))
+    # Different shape specializations must coexist with distinct generated symbols.
+    inputs = [a, b, a[:, :, -1:].copy(), squares]
+    names = [f"x{i}" for i in range(4)]
+    references = [expected, expected[:, :, -1:], mean]
+    nodes = [helper.make_node("FixedTreeDot", ["x0", "x1"], ["y0"], domain="merlin.fixed_order"), helper.make_node("FixedTreeDot", ["x2", "x1"], ["y1"], domain="merlin.fixed_order"), helper.make_node("FixedTreeMeanSquares", ["x3"], ["y2"], domain="merlin.fixed_order")]
+    graph = helper.make_graph(nodes, "multiple_ordered_shapes", [helper.make_tensor_value_info(name, TensorProto.FLOAT, value.shape) for name, value in zip(names, inputs)], [helper.make_tensor_value_info(f"y{i}", TensorProto.FLOAT, value.shape) for i, value in enumerate(references)])
+    imported = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.fixed_order", 1)]))
+    for optimized in (False, True):
+        vm = relax.VirtualMachine(relax.build(prepare_gemmini_graph(imported, optimize=optimized), "llvm"), tvm.cpu())
+        for output, reference in zip(vm["main"](*[tvm.nd.array(value) for value in inputs]), references):
+            np.testing.assert_array_equal(output.numpy().view("uint32"), reference.view("uint32"))
+
+
+def test_fixed_tree_fp32_contract_refuses_ambiguous_or_unsupported_models():
+    def model(op_name="FixedTreeMeanSquares", domain="merlin.fixed_order", versions=(1,), shapes=((2, 64),), dtype=TensorProto.FLOAT, attributes=None, outputs=("y",)):
+        names = [f"x{i}" for i in range(len(shapes))]
+        node = helper.make_node(op_name, names, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "ordered", [helper.make_tensor_value_info(name, dtype, shape) for name, shape in zip(names, shapes)], [helper.make_tensor_value_info(name, dtype, [2, 1]) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.fixed_order", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "tree"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"shapes": ((2, 3),)}, {"shapes": ((2, 8192),)}, {"shapes": ((2, 0),)}, {"shapes": ((2, "K"),)}, {"shapes": ((),)}, {"dtype": TensorProto.DOUBLE}, {"shapes": ((2, 64), (2, 64))}, {"op_name": "FixedTreeDot", "shapes": ((2, 64), (2, 64))}, {"op_name": "FixedTreeDot", "shapes": ((1, 2, 3, 64), (1, 3, 4, 64))}, {"op_name": "FixedTreeDot", "shapes": ((1, 2, 3, 64), (1, 2, 4, 32))}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+    for shapes in (((1, 1, 1 << 61, 1), (1, 1, 1, 1)), ((1, 1, 1 << 31, 1), (1, 1, 1 << 31, 1))):
+        with pytest.raises(ValueError, match="storage|byte span"):
+            from_onnx(model(op_name="FixedTreeDot", shapes=shapes))
+    # Inspect a byte-span-valid output exceeding int32 without allocating it.
+    large = from_onnx(model(op_name="FixedTreeDot", shapes=((1, 1, 65536, 64), (1, 1, 65536, 64))))
+    prim = next(func for func in large.functions.values() if isinstance(func, tvm.tir.PrimFunc))
+    assert all(dim.dtype == "int64" for buffer in prim.buffer_map.values() for dim in buffer.shape)
+    loops = []
+    tvm.tir.stmt_functor.post_order_visit(prim.body, lambda node: loops.append(node.loop_var.dtype) if isinstance(node, tvm.tir.For) else None)
+    assert loops and set(loops) == {"int64"}
+
+
+def test_source_silu_fp32_independent_rounding_and_modes():
+    """Exact rational rounding oracle for the declared vector-source algorithm."""
+    from fractions import Fraction
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+    def nearest(value):
+        center = np.float32(float(value))
+        candidates = [np.nextafter(center, np.float32(-np.inf)), center, np.nextafter(center, np.float32(np.inf))]
+        return min(candidates, key=lambda item: (abs(Fraction.from_float(float(item)) - value), int(item.view(np.uint32)) & 1))
+
+    def rational(value):
+        return Fraction.from_float(float(np.float32(value)))
+
+    constants = np.array([0x3fb8aa3b, 0xbf317200, 0xb5bfbe8e, 0x39502bda, 0x3ab696c9, 0x3c0888a6, 0x3d2aaa7a, 0x3e2aaaab, 0x3f000000], dtype=np.uint32).view(np.float32)
+    values = np.random.default_rng(731).uniform(-80, 80, 64).astype(np.float32).reshape(2, 32)
+    values[0, :8] = [-0.24943915009498596, -0.0, 0.0, -80, 80, -1, 1, .5]
+    values[0, 8:14] = np.array([-.5, .5, -1.5, 1.5, -2.5, 2.5], dtype=np.float32) / constants[0]
+    expected = np.empty_like(values)
+    for index in np.ndindex(values.shape):
+        x = values[index]
+        if x == 0:
+            expected[index] = x
+            continue
+        d = -x
+        reduced = nearest(rational(d) * rational(constants[0]))
+        q = round(rational(reduced))  # Python rational nearest-even, including negative ties.
+        remainder = nearest(Fraction(q) * rational(constants[1]) + rational(d))
+        remainder = nearest(Fraction(q) * rational(constants[2]) + rational(remainder))
+        polynomial = constants[3]
+        for coefficient in constants[4:]:
+            polynomial = nearest(rational(polynomial) * rational(remainder) + rational(coefficient))
+        square = nearest(rational(remainder) ** 2)
+        polynomial = nearest(rational(square) * rational(polynomial) + rational(remainder))
+        unit = nearest(Fraction(1) + rational(polynomial))
+        half = q // 2
+        first = nearest(rational(unit) * Fraction(2) ** half)
+        exponent = nearest(rational(first) * Fraction(2) ** (q - half))
+        denominator = nearest(Fraction(1) + rational(exponent))
+        expected[index] = nearest(rational(x) / rational(denominator))
+    node = helper.make_node("TorchSiluAvx512F32", ["x"], ["y"], domain="merlin.source_preserving")
+    graph = helper.make_graph([node], "source_silu", [helper.make_tensor_value_info("x", TensorProto.FLOAT, values.shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, values.shape)])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    for optimized in (False, True):
+        prepared = prepare_gemmini_graph(imported, optimize=optimized)
+        prim = next(func for name, func in prepared.functions.items() if name.name_hint.startswith("torch_silu_avx512_") and isinstance(func, tvm.tir.PrimFunc))
+        assert int(prim.attrs["op_pattern"]) == 8
+        llvm = tvm.build(prim, target="llvm").get_source("ll")
+        assert "llvm.fma." in llvm and "llvm.fmuladd" not in llvm
+        assert "fdiv" in llvm and not __import__("re").search(r"\bf(?:add|mul|div)\s+(?:fast|reassoc|contract|arcp)\b", llvm)
+        assert "TVMBackendAllocWorkspace" not in llvm and "Sleef" not in llvm and "Torch" not in llvm
+        vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+        for _ in range(2):
+            np.testing.assert_array_equal(vm["main"](tvm.nd.array(values)).numpy().view(np.uint32), expected.view(np.uint32))
+        # Invalid values cannot reach a poisonous float-to-int conversion.
+        invalid = np.resize(np.array([np.nan, np.inf, -np.inf, -0.0, 0.0, -104, 104], dtype=np.float32), values.shape)
+        output = vm["main"](tvm.nd.array(invalid)).numpy()
+        assert np.isnan(output[np.isnan(invalid) | np.isneginf(invalid)]).all()
+        assert np.isposinf(output[np.isposinf(invalid)]).all()
+        assert np.array_equal(output[invalid == 0].view(np.uint32), invalid[invalid == 0].view(np.uint32))
+        assert np.all(output[invalid == 104] == 104) and np.all(output[invalid == -104] == 0)
+
+
+def test_source_silu_refuses_ambiguous_or_unsupported_contracts():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(2, 32), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",), op_name="TorchSiluAvx512F32"):
+        node = helper.make_node(op_name, inputs, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "source_silu", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    for options in [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ("x", "z")}, {"op_name": "FixedTreeMeanSquares"}, {"shape": (2, 16)}, {"shape": (2, 0)}, {"shape": (2, "K")}, {"shape": ()}, {"shape": (1 << 61, 32)}, {"dtype": TensorProto.DOUBLE}]:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+@pytest.mark.parametrize("width", [720, 960])
+def test_source_mean_fp32_independent_rounding_and_modes(width):
+    """Independent exact-rational FP32 stage oracle, including cancellation, subnormals and width720 remainder vectors."""
+    from fractions import Fraction
+    from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
+
+    def rational(value):
+        return Fraction.from_float(float(np.float32(value)))
+
+    def nearest(value):
+        if not value:
+            return np.float32(0)
+        center = np.float32(float(value))
+        candidates = [np.nextafter(center, np.float32(-np.inf)), center, np.nextafter(center, np.float32(np.inf))]
+        return min(candidates, key=lambda item: (abs(rational(item) - value), int(item.view(np.uint32)) & 1))
+
+    def add(left, right):
+        return nearest(rational(left) + rational(right))
+
+    def mean(row):
+        lanes = []
+        for lane in range(8):
+            streams = []
+            for stream in range(4):
+                block = np.float32(0)
+                for group in range(16):
+                    block = add(block, row[(4 * group + stream) * 8 + lane])
+                block = add(np.float32(0), block)
+                tail = np.float32(0)
+                for group in range(16, width // 32):
+                    tail = add(tail, row[(4 * group + stream) * 8 + lane])
+                streams.append(add(add(add(tail, block), np.float32(0)), np.float32(0)))
+            total = streams[0]
+            for offset in range((width // 32) * 32, width, 8):
+                total = add(total, row[offset + lane])
+            for stream in streams[1:]:
+                total = add(total, stream)
+            lanes.append(total)
+        total = np.float32(0)
+        for lane in lanes:
+            total = add(total, lane)
+        return nearest(rational(add(np.float32(0), total)) / width)
+
+    values = np.random.default_rng(width * 100 + 53).standard_normal((1, 6, width)).astype(np.float32)
+    values[0, 1] = np.exp2(np.random.default_rng(51).integers(-140, 20, width)).astype(np.float32)
+    values[0, 2] = -np.float32(0)
+    values[0, 3] = np.nextafter(np.float32(0), np.float32(1))
+    values[0, 4] = 0
+    values[0, 4, [0, 511, 512, width - 17, width - 16, width - 9, width - 8, width - 1]] = [1, 2, 4, 8, 16, 32, 64, 128]
+    values[0, 5, ::3] = 1
+    values[0, 5, 1::3] = -1
+    values[0, 5, 2::3] = np.float32(2**-24)
+    expected = np.array([mean(row) for row in values.reshape(-1, width)], dtype=np.float32).reshape(1, 6, 1)
+    assert expected[0, 2, 0].view(np.uint32) == 0 and expected[0, 3, 0].view(np.uint32) == 1
+    for data, reference in [(values, expected), (values[0, 0], expected[0, 0])]:
+        node = helper.make_node(f"TorchMean{width}Fp32", ["x"], ["y"], domain="merlin.source_preserving")
+        graph = helper.make_graph([node], f"source_mean{width}", [helper.make_tensor_value_info("x", TensorProto.FLOAT, data.shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, reference.shape)])
+        imported = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)]))
+        for optimized in (False, True):
+            prepared = prepare_gemmini_graph(imported, optimize=optimized)
+            prim = next(func for name, func in prepared.functions.items() if name.name_hint.startswith(f"torch_mean{width}_") and isinstance(func, tvm.tir.PrimFunc))
+            assert int(prim.attrs["op_pattern"]) == 8
+            buffers = list(prim.buffer_map.values())
+            assert tuple(int(dim) for dim in buffers[-1].shape) == (65,)
+            assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+            llvm = tvm.build(prim, target="llvm").get_source("ll")
+            assert "fdiv" in llvm and not __import__("re").search(r"\bf(?:add|mul|div)\s+(?:fast|reassoc|contract|arcp)\b|llvm\.(?:fma|fmuladd)", llvm)
+            assert "TVMBackendAllocWorkspace" not in llvm and "Torch" not in llvm and "Sleef" not in llvm
+            vm = relax.VirtualMachine(relax.build(prepared, "llvm"), tvm.cpu())
+            for _ in range(2):
+                np.testing.assert_array_equal(vm["main"](tvm.nd.array(data)).numpy().view(np.uint32), reference.view(np.uint32))
+
+
+@pytest.mark.parametrize("width", [720, 960])
+def test_source_mean_refuses_ambiguous_or_unsupported_contracts(width):
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 50, width), dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
+        node = helper.make_node(f"TorchMean{width}Fp32", inputs, outputs, domain=domain, **(attributes or {}))
+        output_shape = tuple(shape[:-1]) + (1,) if shape else (1,)
+        graph = helper.make_graph([node], f"source_mean{width}", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs], [helper.make_tensor_value_info(name, dtype, output_shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    for options in [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"keepdims": 1}}, {"attributes": {"axes": [-1]}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("x", "z")}, {"shape": (1, 50, width - 1)}, {"shape": (0, width)}, {"shape": ("N", width)}, {"shape": ()}, {"shape": (1 << 61, width)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+@pytest.mark.parametrize("kind,reduction,columns", [("QK", 64, 177), ("PV", 177, 64)])
+def test_source_sgemm177_static_interface_and_private_scratch(kind, reduction, columns):
+    shapes = [(1, 15, 50, reduction), (1, 15, reduction, columns)]
+    inputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, shape) for name, shape in zip(("a", "b"), shapes)]
+    output = helper.make_tensor_value_info("y", TensorProto.FLOAT, (1, 15, 50, columns))
+    node = helper.make_node(f"TorchMklSgemmF32{kind}177", ["a", "b"], ["y"], domain="merlin.source_preserving")
+    model = helper.make_model(helper.make_graph([node], "source_sgemm", inputs, [output]), opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == "float32"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == (1, 15, 50, columns)
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_mkl_sgemm_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(15 * 50 * reduction,), (15 * reduction * columns,), (15 * 50 * columns,), (1,)]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert '"llvm.fma"' in prim.script()
+    ordinary = helper.make_node("MatMul", ["a", "b"], ["y"])
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_matmul", inputs, [output]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_mkl_sgemm_") for name in original.functions)
+
+
+@pytest.mark.parametrize("kind,reduction,columns", [("QK", 64, 177), ("PV", 177, 64)])
+def test_source_sgemm177_refuses_unsupported_contracts(kind, reduction, columns):
+    def model(domain="merlin.source_preserving", versions=(1,), shape_a=None, shape_b=None, dtype=TensorProto.FLOAT, attributes=None, inputs=("a", "b"), outputs=("y",)):
+        shape_a = (1, 15, 50, reduction) if shape_a is None else shape_a
+        shape_b = (1, 15, reduction, columns) if shape_b is None else shape_b
+        node = helper.make_node(f"TorchMklSgemmF32{kind}177", inputs, outputs, domain=domain, **(attributes or {}))
+        infos = [helper.make_tensor_value_info(name, dtype, shape_a if name == "a" else shape_b) for name in inputs if name]
+        graph = helper.make_graph([node], "source_sgemm", infos, [helper.make_tensor_value_info(name, dtype, (1, 15, 50, columns)) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("a",)}, {"inputs": ("a", "")}, {"inputs": ("a", "b", "c")}, {"shape_a": (15, 50, reduction)}, {"shape_a": (1, 15, 49, reduction)}, {"shape_a": (1, 15, 50, reduction + 1)}, {"shape_a": (1, 15, 0, reduction)}, {"shape_a": (1, 15, "N", reduction)}, {"shape_a": ()}, {"shape_a": (1 << 61, 15, 50, reduction)}, {"shape_b": (1, 15, reduction, columns + 1)}, {"shape_b": (1, 14, reduction, columns)}, {"shape_b": (1, 15, "K", columns)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+@pytest.mark.parametrize("kind,queries,reduction,columns,dtype", [("QK", 50, 64, 227, TensorProto.FLOAT), ("PV", 50, 227, 64, TensorProto.BFLOAT16), ("PV", 177, 177, 64, TensorProto.BFLOAT16)])
+def test_source_attention_static_interface_and_private_scratch(kind, queries, reduction, columns, dtype):
+    opname = "TorchMklSgemmF32QK227" if kind == "QK" else f"TorchOnednnGemmBf16PV{reduction}"
+    shapes = [(1, 15, queries, reduction), (1, 15, reduction, columns)]
+    inputs = [helper.make_tensor_value_info(name, dtype, shape) for name, shape in zip(("a", "b"), shapes)]
+    output = helper.make_tensor_value_info("y", dtype, (1, 15, queries, columns))
+    node = helper.make_node(opname, ["a", "b"], ["y"], domain="merlin.source_preserving")
+    model = helper.make_model(helper.make_graph([node], "source_sgemm", inputs, [output]), opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == ("float32" if kind == "QK" else "bfloat16")
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == (1, 15, queries, columns)
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith(("torch_mkl_sgemm_", "torch_onednn_gemm_")) and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(15 * queries * reduction,), (15 * reduction * columns,), (15 * queries * columns,), (1,)]
+    assert [buffer.dtype for buffer in buffers] == (["float32"] * 4 if kind == "QK" else ["bfloat16"] * 3 + ["float32"])
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert '"llvm.fma"' in prim.script()
+    ordinary = helper.make_node("MatMul", ["a", "b"], ["y"])
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_matmul", inputs, [output]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith(("torch_mkl_sgemm_", "torch_onednn_gemm_")) for name in original.functions)
+
+
+@pytest.mark.parametrize("kind,queries,reduction,columns,dtype", [("QK", 50, 64, 227, TensorProto.FLOAT), ("PV", 50, 227, 64, TensorProto.BFLOAT16), ("PV", 177, 177, 64, TensorProto.BFLOAT16)])
+def test_source_attention_refuses_unsupported_contracts(kind, queries, reduction, columns, dtype):
+    opname = "TorchMklSgemmF32QK227" if kind == "QK" else f"TorchOnednnGemmBf16PV{reduction}"
+    def model(domain="merlin.source_preserving", versions=(1,), shape_a=None, shape_b=None, dtype=dtype, attributes=None, inputs=("a", "b"), outputs=("y",)):
+        shape_a = (1, 15, queries, reduction) if shape_a is None else shape_a
+        shape_b = (1, 15, reduction, columns) if shape_b is None else shape_b
+        node = helper.make_node(opname, inputs, outputs, domain=domain, **(attributes or {}))
+        infos = [helper.make_tensor_value_info(name, dtype, shape_a if name == "a" else shape_b) for name in inputs if name]
+        graph = helper.make_graph([node], "source_sgemm", infos, [helper.make_tensor_value_info(name, dtype, (1, 15, queries, columns)) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"algorithm": "other"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("a",)}, {"inputs": ("a", "")}, {"inputs": ("a", "b", "c")}, {"shape_a": (15, queries, reduction)}, {"shape_a": (1, 15, queries - 1, reduction)}, {"shape_a": (1, 15, queries, reduction + 1)}, {"shape_a": (1, 15, 0, reduction)}, {"shape_a": (1, 15, "N", reduction)}, {"shape_a": ()}, {"shape_a": (1 << 61, 15, queries, reduction)}, {"shape_b": (1, 15, reduction, columns + 1)}, {"shape_b": (1, 14, reduction, columns)}, {"shape_b": (1, 15, "K", columns)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16 if kind == "QK" else TensorProto.FLOAT}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+def test_source_flash_vision1024_exposes_bounded_private_storage():
+    shape, mask_shape = (1, 12, 1024, 64), (1, 1, 1024, 1024)
+    names = ("q", "k", "v", "mask")
+    node = helper.make_node("TorchFlashBf16Vision1024", names, ["y"], domain="merlin.source_preserving")
+    inputs = [helper.make_tensor_value_info(name, TensorProto.BFLOAT16, mask_shape if name == "mask" else shape) for name in names]
+    graph = helper.make_graph([node], "source_flash", inputs, [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, shape)])
+    imported = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)]))
+    assert imported["main"].ret_struct_info.dtype == "bfloat16"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_flash_cpu_") and isinstance(func, tvm.tir.PrimFunc))
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [shape, shape, shape, mask_shape, shape, (180832,), (256, 512)]
+    assert [str(buffer.dtype) for buffer in buffers] == ["bfloat16"] * 5 + ["float32", "bfloat16"]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert int(prim.attrs["op_pattern"]) == 8
+
+
+def test_source_flash_vision1024_refuses_unsupported_interfaces():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 12, 1024, 64), mask_shape=(1, 1, 1024, 1024), dtype=TensorProto.BFLOAT16, attributes=None, names=("q", "k", "v", "mask"), outputs=("y",)):
+        node = helper.make_node("TorchFlashBf16Vision1024", names, outputs, domain=domain, **(attributes or {}))
+        inputs = [helper.make_tensor_value_info(name, dtype, mask_shape if name == "mask" else shape) for name in names if name]
+        graph = helper.make_graph([node], "source_flash", inputs, [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"scale": 0.125}}, {"outputs": ("y", "z")}, {"names": ("q", "k", "v")}, {"names": ("q", "k", "v", "")}, {"dtype": TensorProto.FLOAT}, {"shape": (1, 12, 1024, 63)}, {"shape": (2, 12, 1024, 64)}, {"shape": (1, 12, "N", 64)}, {"mask_shape": (1, 12, 1024, 1024)}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+@pytest.mark.parametrize("width,shape", [(177, (177,)), (177, (7, 177)), (177, (2, 3, 177)), (177, (1, 15, 50, 177)), (177, (1, 15, 177, 177)), (227, (227,)), (227, (2, 3, 227)), (227, (1, 15, 50, 227))])
+def test_source_softmax_static_interface_and_private_scratch(width, shape):
+    """Leading dimensions change row count; the row kernel keeps private scratch."""
+    operator = f"TorchSoftmaxAvx512F32LastDim{width}"
+    node = helper.make_node(operator, ["x"], ["y"], domain="merlin.source_preserving")
+    graph = helper.make_graph([node], "source_softmax", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
+    assert imported["main"].ret_struct_info.dtype == "float32"
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_softmax_avx512_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    rows = math.prod(shape[:-1])
+    buffers = list(prim.buffer_map.values())
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(rows, width), (rows, width), (width + 32,)]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    ordinary = helper.make_node("Softmax", ["x"], ["y"], axis=-1)
+    graph = helper.make_graph([ordinary], "ordinary_softmax", [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)], [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)])
+    original = from_onnx(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_softmax_avx512_") for name in original.functions)
+
+
+@pytest.mark.parametrize("width", [177, 227])
+def test_source_softmax_refuses_ambiguous_or_unsupported_contracts(width):
+    def model(domain="merlin.source_preserving", versions=(1,), shape=None, dtype=TensorProto.FLOAT, attributes=None, inputs=("x",), outputs=("y",)):
+        shape = (1, 15, 50, width) if shape is None else shape
+        node = helper.make_node(f"TorchSoftmaxAvx512F32LastDim{width}", inputs, outputs, domain=domain, **(attributes or {}))
+        graph = helper.make_graph([node], "source_softmax", [helper.make_tensor_value_info(name, dtype, shape) for name in inputs if name], [helper.make_tensor_value_info(name, dtype, shape) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"domain": "tvm.contrib.source_preserving"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"algorithm": "other"}}, {"attributes": {"tvm_custom": "ignored"}}, {"outputs": ("y", "z")}, {"inputs": ()}, {"inputs": ("",)}, {"inputs": ("x", "z")}, {"shape": (1, 15, 50, width - 1)}, {"shape": (1, 15, 50, width + 1)}, {"shape": (0, width)}, {"shape": (-1, width)}, {"shape": ("N", width)}, {"shape": ()}, {"shape": (1 << 61, width)}, {"dtype": TensorProto.DOUBLE}, {"dtype": TensorProto.BFLOAT16}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+def test_source_layernorm768_static_interface_and_private_scratch():
+    """The original scalar epsilon is constant and scratch is statically visible."""
+    shape = (1, 1024, 768)
+    node = helper.make_node("TorchLayerNormAvx2Bf16Width768", ["x", "gamma", "beta", "epsilon"], ["y"], domain="merlin.source_preserving")
+    inputs = [helper.make_tensor_value_info("x", TensorProto.BFLOAT16, shape), *[helper.make_tensor_value_info(name, TensorProto.BFLOAT16, (768,)) for name in ("gamma", "beta")]]
+    epsilon = onnx.numpy_helper.from_array(np.array(0x358637bd, dtype=np.uint32).view(np.float32), "epsilon")
+    graph = helper.make_graph([node], "source_layernorm768", inputs, [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, shape)], [epsilon])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == "bfloat16"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == shape
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_layernorm_avx2_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [(1024, 768), (768,), (768,), (), (1024, 768), (80,)]
+    assert [buffer.dtype for buffer in buffers] == ["bfloat16", "bfloat16", "bfloat16", "float32", "bfloat16", "float32"]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    # Ordinary LayerNormalization continues to use its ordinary importer.
+    ordinary = helper.make_node("LayerNormalization", ["x", "gamma", "beta"], ["y"], axis=-1, epsilon=1e-6)
+    ordinary_inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape), *[helper.make_tensor_value_info(name, TensorProto.FLOAT, (768,)) for name in ("gamma", "beta")]]
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_layernorm", ordinary_inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, shape)]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_layernorm_avx2_") for name in original.functions)
+
+
+def test_source_layernorm768_refuses_ambiguous_geometry_or_epsilon():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 1024, 768), gamma_shape=(768,), beta_shape=(768,), dtype=TensorProto.BFLOAT16, gamma_dtype=TensorProto.BFLOAT16, beta_dtype=TensorProto.BFLOAT16, attributes=None, inputs=("x", "gamma", "beta", "epsilon"), outputs=("y",), epsilon_word=0x358637bd, epsilon_shape=(), epsilon_dtype=np.float32, dynamic_epsilon=False):
+        node = helper.make_node("TorchLayerNormAvx2Bf16Width768", inputs, outputs, domain=domain, **(attributes or {}))
+        specs = {"x": (dtype, shape), "gamma": (gamma_dtype, gamma_shape), "beta": (beta_dtype, beta_shape), "epsilon": (TensorProto.FLOAT, epsilon_shape)}
+        graph_inputs = [helper.make_tensor_value_info(name, *specs[name]) for name in inputs if name and (name != "epsilon" or dynamic_epsilon)]
+        epsilon = np.array(epsilon_word, dtype=np.uint32).view(np.float32).astype(epsilon_dtype).reshape(epsilon_shape)
+        initializer = [] if dynamic_epsilon else [onnx.numpy_helper.from_array(epsilon, "epsilon")]
+        graph = helper.make_graph([node], "source_layernorm768", graph_inputs, [helper.make_tensor_value_info(name, dtype, shape) for name in outputs], initializer)
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"axis": -1}}, {"attributes": {"epsilon": 1e-6}}, {"attributes": {"tvm_custom": "ignored"}}, {"inputs": ()}, {"inputs": ("x", "gamma", "beta")}, {"inputs": ("x", "gamma", "beta", "")}, {"inputs": ("x", "gamma", "beta", "epsilon", "x")}, {"outputs": ("y", "z")}, {"shape": (1024, 768)}, {"shape": (2, 1024, 768)}, {"shape": (1, 1023, 768)}, {"shape": (1, 1024, 767)}, {"shape": (1, 0, 768)}, {"shape": (1, "N", 768)}, {"shape": (1 << 61, 1024, 768)}, {"gamma_shape": (767,)}, {"gamma_shape": (1, 768)}, {"beta_shape": (767,)}, {"beta_shape": ("K",)}, {"dtype": TensorProto.FLOAT}, {"gamma_dtype": TensorProto.FLOAT}, {"beta_dtype": TensorProto.FLOAT}, {"dynamic_epsilon": True}, {"epsilon_shape": (1,)}, {"epsilon_dtype": np.float64}, *[{"epsilon_word": word} for word in (0, 0x358637bc, 0x358637be, 0xb58637bd, 0x7f800000, 0x7fc00000)]]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
+
+
+def test_source_conv3x16_static_interface_and_private_scratch():
+    shape = (1, 3, 512, 512)
+    output = (1, 768, 32, 32)
+    node = helper.make_node("TorchConv2dAvx512Bf16IC3Kernel16Stride16", ["x", "weight", "bias"], ["y"], domain="merlin.source_preserving")
+    inputs = [helper.make_tensor_value_info(name, TensorProto.BFLOAT16, dims) for name, dims in (("x", shape), ("weight", (768, 3, 16, 16)), ("bias", (768,)))]
+    model = helper.make_model(helper.make_graph([node], "source_conv3x16", inputs, [helper.make_tensor_value_info("y", TensorProto.BFLOAT16, output)]), opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("merlin.source_preserving", 1)])
+    imported = from_onnx(model)
+    assert imported["main"].ret_struct_info.dtype == "bfloat16"
+    assert tuple(int(dim) for dim in imported["main"].ret_struct_info.shape.values) == output
+    prim = next(func for name, func in imported.functions.items() if name.name_hint.startswith("torch_conv2d_avx512_") and isinstance(func, tvm.tir.PrimFunc))
+    assert int(prim.attrs["op_pattern"]) == 8
+    buffers = [prim.buffer_map[param] for param in prim.params]
+    assert [tuple(int(dim) for dim in buffer.shape) for buffer in buffers] == [shape, (768, 3, 16, 16), (768,), output, (32,)]
+    assert [buffer.dtype for buffer in buffers] == ["bfloat16"] * 4 + ["float32"]
+    assert all(dim.dtype == "int64" for buffer in buffers for dim in buffer.shape)
+    assert prim.script().count('"llvm.fma"') == 4
+    ordinary = helper.make_node("Conv", ["x", "weight", "bias"], ["y"], strides=[16, 16], pads=[0, 0, 0, 0])
+    ordinary_inputs = [helper.make_tensor_value_info(name, TensorProto.FLOAT, dims) for name, dims in (("x", shape), ("weight", (768, 3, 16, 16)), ("bias", (768,)))]
+    original = from_onnx(helper.make_model(helper.make_graph([ordinary], "ordinary_conv", ordinary_inputs, [helper.make_tensor_value_info("y", TensorProto.FLOAT, output)]), opset_imports=[helper.make_opsetid("", 18)]))
+    assert not any(name.name_hint.startswith("torch_conv2d_avx512_") for name in original.functions)
+
+
+def test_source_conv3x16_refuses_ambiguous_geometry_or_schema():
+    def model(domain="merlin.source_preserving", versions=(1,), shape=(1, 3, 512, 512), weight_shape=(768, 3, 16, 16), bias_shape=(768,), dtype=TensorProto.BFLOAT16, weight_dtype=TensorProto.BFLOAT16, bias_dtype=TensorProto.BFLOAT16, inputs=("x", "weight", "bias"), outputs=("y",), attributes=None):
+        node = helper.make_node("TorchConv2dAvx512Bf16IC3Kernel16Stride16", inputs, outputs, domain=domain, **(attributes or {}))
+        specs = {"x": (dtype, shape), "weight": (weight_dtype, weight_shape), "bias": (bias_dtype, bias_shape)}
+        graph_inputs = [helper.make_tensor_value_info(name, *specs[name]) for name in inputs if name]
+        graph = helper.make_graph([node], "source_conv3x16", graph_inputs, [helper.make_tensor_value_info(name, TensorProto.BFLOAT16, (1, 768, 32, 32)) for name in outputs])
+        return helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18), *[helper.make_opsetid("merlin.source_preserving", version) for version in versions]])
+
+    invalid = [{"domain": ""}, {"domain": "other"}, {"versions": ()}, {"versions": (2,)}, {"versions": (1, 1)}, {"attributes": {"strides": [16, 16]}}, {"attributes": {"pads": [0, 0, 0, 0]}}, {"attributes": {"group": 1}}, {"attributes": {"tvm_custom": "ignored"}}, {"inputs": ()}, {"inputs": ("x", "weight")}, {"inputs": ("x", "weight", "")}, {"inputs": ("x", "weight", "bias", "x")}, {"outputs": ("y", "z")}, {"shape": (2, 3, 512, 512)}, {"shape": (1, 4, 512, 512)}, {"shape": (1, 3, 256, 512)}, {"shape": (1, 3, "H", 512)}, {"shape": (1 << 61, 3, 512, 512)}, {"weight_shape": (767, 3, 16, 16)}, {"weight_shape": (768, 3, 15, 16)}, {"bias_shape": (1, 768)}, {"bias_shape": (767,)}, {"dtype": TensorProto.FLOAT}, {"weight_dtype": TensorProto.FLOAT}, {"bias_dtype": TensorProto.FLOAT}]
+    for options in invalid:
+        with pytest.raises(ValueError):
+            from_onnx(model(**options))
 
 
 if __name__ == "__main__":
