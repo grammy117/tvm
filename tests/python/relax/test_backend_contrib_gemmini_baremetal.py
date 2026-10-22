@@ -120,6 +120,31 @@ class StaticGraphTests(unittest.TestCase):
         outs = (ctypes.c_void_p * len(outputs))(*(array.ctypes.data for array in outputs))
         return loaded.model_run(ins, outs, workspace.ctypes.data, workspace.nbytes if size is None else size)
 
+    def test_absolute_constant_binding_reuses_operator_and_payload(self):
+        report = export_graph(graph(), self.root, target="llvm")
+        constants = aligned((report["constants_bytes"],), "uint8")
+        constants[:] = np.fromfile(self.root / "constants.bin", dtype="uint8")
+        library = self.root / "absolute.so"
+        subprocess.run(["cc", "-shared", "-fPIC", "-std=c11", "-O2",
+                        f"-DTVM_MODEL_CONSTANTS_ADDRESS=UINT64_C({constants.ctypes.data})",
+                        self.root / "model.c", self.root / "operators.o", "-o", library],
+                       check=True, capture_output=True)
+        loaded = ctypes.CDLL(str(library))
+        self.addCleanup(dlclose, loaded._handle)
+        loaded.model_run.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint64]
+        loaded.model_run.restype = ctypes.c_int32
+        inputs = [aligned(item["shape"], item["dtype"]) for item in report["inputs"]]
+        outputs = [aligned(item["shape"], item["dtype"]) for item in report["outputs"]]
+        workspace = aligned((max(report["workspace_bytes"], 64),), "uint8")
+        inputs[0][:] = np.arange(6).reshape(2, 3)
+        expected = ((inputs[0].astype("int32") @ (np.arange(12, dtype="int32").reshape(3, 4) - 5)) + 3) * 2 - 1
+        # No constants.S/model_constants symbol is linked. Both calls must use
+        # the original bytes at the explicit address, including alias guards.
+        for _ in range(2):
+            self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+            np.testing.assert_array_equal(outputs[0], expected)
+        self.assertEqual(report["constants_binding"]["absolute_address_macro"], "TVM_MODEL_CONSTANTS_ADDRESS")
+
     def test_view_only_program_has_no_operator_calls_or_workspace(self):
         x = relax.Var("x", relax.TensorStructInfo((2, 3), "int32"))
         builder = relax.BlockBuilder()

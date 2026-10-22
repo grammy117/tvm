@@ -412,7 +412,13 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
             return f"(model_constants + {tensor.offset})"
         return f"(workspace + {tensor.offset})"
 
-    lines = ["#include <stdint.h>", "#include <stddef.h>", "extern const uint8_t model_constants[];"]
+    # The board linker may place large immutable blobs beyond medany's reach.
+    # Recompile only this pointer-array wrapper with an explicit absolute base;
+    # operator code and constant bytes remain the package's original payloads.
+    lines = ["#include <stdint.h>", "#include <stddef.h>",
+             "#ifdef TVM_MODEL_CONSTANTS_ADDRESS",
+             "#define model_constants ((const uint8_t *)(uintptr_t)(TVM_MODEL_CONSTANTS_ADDRESS))",
+             "#else", "extern const uint8_t model_constants[];", "#endif"]
     if shared_constants is None:
         lines.extend(["static const char *model_last_error;", "void TVMAPISetLastError(const char *message) { model_last_error = message; }"])
     else:
@@ -485,6 +491,8 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
     (output_dir / "graph.relax.py").write_text(mod.script(show_meta=True))
     manifest = {
         "entrypoint": prefix + "model_run", "constants_file": str(constant_path),
+        "constants_binding": {"default": "link_symbol", "symbol": "model_constants",
+                              "absolute_address_macro": "TVM_MODEL_CONSTANTS_ADDRESS"},
         "target": str(target), "alignment_bytes": ALIGNMENT, "heap_required_by_orchestration": False, "runtime_workspace_allocator_required": False,
         "workspace_bytes": plan["workspace_bytes"], "constants_bytes": plan["constants_bytes"], "explicit_tensor_bytes": tensors_bytes,
         "memory_limit_bytes": memory_limit_bytes, "memory_scope": "graph tensor storage and explicit USMP operator pools; add ELF sections, operator stack, startup and platform reservations",

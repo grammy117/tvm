@@ -157,6 +157,7 @@ Independent formulas, tails, refusal cases and runtime checks bound applicabilit
 | BF16 narrowing preservation | General fork correctness fix | TIR dtype legalizer | Logical rounding boundaries retained |
 | Strict float division | General fork correctness fix | Arith simplifier/LLVM | Removes unsafe reciprocal rewrite, may cost performance |
 | Static host-buffer reuse/constants | Custom exporter lifetime plan | Generated C/static objects | Separate from accelerator SRAM allocation |
+| Absolute constant placement | Exporter declares optional wrapper address macro; Merlin plans weights/references/arena and checks final link | Original operators/constants, rebuilt pointer wrapper, existing Merlin loader layout | Small high-address Spike controls pass; actual full-model sizes and FireSim remain unqualified; not a tuning optimization |
 | Multi-stage/session memory reuse | Session contract + Merlin planners | External orchestration | Full deployed chain still needs qualification |
 | Evolutionary proposal/mutation/task budget | Stock MetaSchedule | Stock EvolutionarySearch/gradient scheduler | Supplied legal search space and measurement budgets |
 | XGB ranking | Stock XGBModel | Stock model + mathematical feature adapter | Prove post-training proposals; do not infer from saved booster |

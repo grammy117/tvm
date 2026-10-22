@@ -24,6 +24,7 @@ The resulting archive needs a board-specific startup/loader and final ELF audit.
 import argparse
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import shutil
@@ -72,7 +73,11 @@ __attribute__((weak,noreturn)) void exit(int status){(void)status;__builtin_trap
 
 
 def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    value = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(8 << 20), b""):
+            value.update(block)
+    return value.hexdigest()
 
 
 def verify_package(folder):
@@ -232,7 +237,10 @@ def compile_package(args):
     forbidden = {
         value for name, value in policy["derived_definitions"].items() if name.startswith("k_LOOP_")
     }
-    audit = audit_instructions((out / "linked.o").read_bytes(), policy["custom_opcode"], forbidden)
+    # Constant blobs can exceed host RAM headroom. The decoder reads only ELF
+    # metadata and executable sections; do not copy the full object into Python.
+    with (out / "linked.o").open("rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        audit = audit_instructions(data, policy["custom_opcode"], forbidden)
     if audit["prohibited_hits"]:
         raise ValueError("Generated package contains prohibited hardware loop instructions")
     # Serialize relative constants for downstream tools. Its hash and storage

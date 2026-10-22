@@ -55,6 +55,23 @@ outputs and the complete memory reservation. A static graph can represent explic
 cache/state inputs and outputs; automatic multi-program session orchestration is
 not supplied by this CLI. The existing `export_graphs` API covers fixed stages.
 
+New graph manifests also declare `constants_binding`, with the default
+`model_constants` link symbol and optional `TVM_MODEL_CONSTANTS_ADDRESS` macro.
+A board adapter may recompile the delivered `graph/model.c` with that macro set
+to an explicit aligned absolute address, retaining `graph/operators.o` and the
+exact constant payload. This avoids medany relocations across multi-GB gaps.
+The board adapter owns placement, loading, bounds/overlap checks and renewed
+final-ELF auditing. The original archive remains the default near-symbol form.
+Package hashes are streamed and the package instruction audit maps the object,
+so verification need not copy an entire large weight blob into Python memory.
+
+Merlin's `build_package_session.py` implements this option using its existing
+`model_link.ld` weight region and a reserved NOLOAD arena. Its small two-stage
+control passes Spike with 9 GiB weights/references and a 13 GiB arena, including
+all-output readback, reset and wrong-oracle rejection. This establishes address
+handling on that functional engine; full model sizes and FireSim loading still
+need qualification. See the companion README for exact CLI and manifest formats.
+
 ## Build independent functional boot ELFs
 
 ```bash
@@ -146,7 +163,8 @@ path is not a TVM whole-model executor.
    runtime. The `model_run` pointer-array ABI is different from a generated
    gemmini-mlir command-buffer entrypoint. Translate the ABI explicitly and bind
    source/object/symbol hashes; do not rename a symbol and assume compatibility.
-   There is no completed automatic TVM-to-EL4 whole-session bridge here.
+   Merlin's comparison bridge now supplies these bindings and explicit routes;
+   actual selected full-model qualification remains unfinished.
 5. Bind the actual bitstream **and matching driver**, startup/console/tohost ABI,
    clock/counter, ISA, one-hart policy, DRAM base/extent and memory reservations.
    Run a small known-output positive/negative control through the queue before

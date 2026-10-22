@@ -47,8 +47,10 @@ compiler/tooling handoff, not evidence that those runs already passed.
    session stage, cache update, denoising step and reset.
 4. Compile and qualify real stages using independent fixtures. Resolve complete
    SmolVLA numerical failures before performance claims.
-5. Build the explicit package-ABI/session bridge using existing Merlin runtime
-   APIs. Verify memory/stack and all symbols/instructions on the final ELF.
+5. Use Merlin's explicit package-ABI/session bridge and existing runtime APIs.
+   Select absolute weights/arena placement for large maps and preserve operator
+   objects/constant bytes when recompiling the wrapper. Small near/high-address
+   controls pass; verify actual model memory/stack and every final ELF instruction.
 6. Recover matching FireSim driver/image/loader identities and probe the required
    memory range. Validate queued positive and wrong-oracle small controls.
 7. Run full sessions through the existing checkpoint/receipt path. Report quality,
