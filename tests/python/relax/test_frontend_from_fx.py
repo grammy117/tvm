@@ -2500,20 +2500,11 @@ def test_unary():
         def forward(self, input):
             return torch.round(input)
 
-    @tvm.script.ir_module
-    class expected5:
-        @R.function
-        def main(
-            input_1: R.Tensor((1, 3, 10, 10), dtype="float32")
-        ) -> R.Tensor((1, 3, 10, 10), dtype="float32"):
-            # block 0
-            with R.dataflow():
-                lv: R.Tensor((1, 3, 10, 10), dtype="float32") = R.round(input_1)
-                gv: R.Tensor((1, 3, 10, 10), dtype="float32") = lv
-                R.output(gv)
-            return gv
-
-    verify_model(Round(), input_info, {}, expected5)
+    values = torch.tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5], dtype=torch.float32)
+    mod = from_fx(fx.symbolic_trace(Round()), [([8], "float32")])
+    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+    tvm.testing.assert_allclose(vm["main"](tvm.nd.array(values.numpy())).numpy(),
+                               Round()(values).numpy(), rtol=0, atol=0)
 
 
 def test_gelu():
@@ -2602,18 +2593,15 @@ def test_clamp():
 
     verify_model(Clamp(), input_info, {}, expected1)
 
-    from tvm.relax.frontend.torch import from_fx
+    class Clamp_Min(Module):
+        def forward(self, input):
+            return torch.clamp(input, min=0.5, max=None)
 
-    with pytest.raises(
-        ValueError, match="TVM only supports constant max value for torch.clamp/clip"
-    ):
-
-        class Clamp_Error(Module):
-            def forward(self, input):
-                return torch.clamp(input, min=0.5, max=None)
-
-        gm = fx.symbolic_trace(Clamp_Error())
-        from_fx(gm, input_info)
+    values = torch.tensor([-1., 0.5, 2.])
+    mod = from_fx(fx.symbolic_trace(Clamp_Min()), [([3], "float32")])
+    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+    tvm.testing.assert_allclose(vm["main"](tvm.nd.array(values.numpy())).numpy(),
+                               Clamp_Min()(values).numpy(), rtol=0, atol=0)
 
     with pytest.raises(
         ValueError, match="TVM only supports constant min value for torch.clamp/clip"
@@ -3984,13 +3972,11 @@ def test_stack():
             inp_2: R.Tensor((1, 3, 10, 10), dtype="float32"),
         ) -> R.Tensor((3, 1, 3, 10, 10), dtype="float32"):
             with R.dataflow():
-                lv: R.Tensor((3, 3, 10, 10), dtype="float32") = R.concat(
-                    (inp_0, inp_1, inp_2), axis=0
-                )
-                lv1: R.Tensor((3, 1, 3, 10, 10), dtype="float32") = R.reshape(
-                    lv, R.shape([3, 1, 3, 10, 10])
-                )
-                gv: R.Tensor((3, 1, 3, 10, 10), dtype="float32") = lv1
+                lv: R.Tensor((1, 1, 3, 10, 10), dtype="float32") = R.expand_dims(inp_0, axis=[0])
+                lv1: R.Tensor((1, 1, 3, 10, 10), dtype="float32") = R.expand_dims(inp_1, axis=[0])
+                lv2: R.Tensor((1, 1, 3, 10, 10), dtype="float32") = R.expand_dims(inp_2, axis=[0])
+                lv3: R.Tensor((3, 1, 3, 10, 10), dtype="float32") = R.concat((lv, lv1, lv2), axis=0)
+                gv: R.Tensor((3, 1, 3, 10, 10), dtype="float32") = lv3
                 R.output(gv)
             return gv
 

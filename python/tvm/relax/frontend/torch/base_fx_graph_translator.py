@@ -54,12 +54,16 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         input_type = input_type.lower() if isinstance(input_type, str) else input_type
         if input_type in ["float", "float32", "torch.float32", torch.float32]:
             return "float32"
+        elif input_type in ["double", "float64", "torch.float64", torch.float64]:
+            return "float64"
         elif input_type in ["float16", "torch.float16", torch.float16]:
             return "float16"
         elif input_type in ["int64", "torch.int64", torch.int64]:
             return "int64"
         elif input_type in ["int32", "torch.int32", torch.int32]:
             return "int32"
+        elif input_type in ["int8", "torch.int8", torch.int8]:
+            return "int8"
         elif input_type in ["bool", "torch.bool", torch.bool]:
             return "bool"
         else:
@@ -113,8 +117,18 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     def _clamp(self, node: fx.Node) -> relax.Expr:
         args = self.retrieve_args(node)
-        a_min = args[1] if len(args) > 1 else node.kwargs["min"]
-        a_max = args[2] if len(args) > 2 else node.kwargs["max"]
+        a_min = args[1] if len(args) > 1 else node.kwargs.get("min")
+        a_max = args[2] if len(args) > 2 else node.kwargs.get("max")
+        if a_min is None and a_max is None:
+            raise ValueError("Clamp requires at least one bound")
+        if a_min is None or a_max is None:
+            bound = a_max if a_min is None else a_min
+            if not isinstance(bound, (int, float)):
+                raise ValueError("Clamp requires constant bounds")
+            op = relax.op.minimum if a_min is None else relax.op.maximum
+            return self.block_builder.emit(
+                op(args[0], relax.const(bound, args[0].struct_info.dtype))
+            )
         if not isinstance(a_min, (int, float)):
             raise ValueError(
                 f"TVM only supports constant min value for torch.clamp/clip, "
@@ -167,7 +181,21 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         if node.kwargs.get("decimals", 0) != 0:
             raise ValueError("specifying decimals for round is not supported yet")
         arg = self.env[node.args[0]]
-        return self.block_builder.emit(relax.op.round(arg))
+        if not arg.struct_info.dtype.startswith("float"):
+            return arg
+        from tvm import te, tir
+
+        def round_even(data):
+            # PyTorch rounds ties to even. Relax round uses llvm.round, which
+            # rounds ties away from zero. Source floating execution, including
+            # this intrinsic, requires the usual round-to-nearest-even mode.
+            return te.compute(
+                data.shape,
+                lambda *indices: tir.nearbyint(data[indices]),
+                name="round_half_even",
+            )
+
+        return self.block_builder.emit_te(round_even, arg)
 
     def _softmax(self, node: fx.Node) -> relax.Var:
         x = self.env[node.args[0]]
@@ -701,19 +729,78 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
 
     ########## Statistical ##########
 
-    def _mean(self, node: fx.Node) -> relax.Var:
+    def _reduction_args(self, node: fx.Node):
+        """Preserve PyTorch's axis, keepdim and explicit dtype contracts."""
         args = self.retrieve_args(node)
+        kwargs = self._retrieve_args(node.kwargs)
         x = args[0]
-        dim = args[1] if len(node.args) > 1 else node.kwargs.get("dim", None)
-        keepdim = args[2] if len(node.args) > 2 else node.kwargs.get("keepdim", False)
+        dim = args[1] if len(args) > 1 else kwargs.get("dim", None)
+        keepdim = args[2] if len(args) > 2 else kwargs.get("keepdim", False)
+        dtype = kwargs.get("dtype", None)
+        dtype = self._convert_data_type(dtype) if dtype is not None else None
+        # PyTorch reduces all axes for an empty dimension list. Scalar axis
+        # spellings 0/-1 likewise denote its single value without adding axes.
+        if isinstance(dim, (tuple, list)) and not dim:
+            dim = None
+        if not len(self.shape_of(x)):
+            if dim is not None and any(
+                axis not in (0, -1) for axis in ([dim] if isinstance(dim, int) else dim)
+            ):
+                raise ValueError("Reduction dimension is outside the scalar input rank")
+            dim, keepdim = None, False
+        return x, dim, keepdim, dtype
+
+    def _mean(self, node: fx.Node) -> relax.Var:
+        from tvm import topi
+
+        x, dim, keepdim, dtype = self._reduction_args(node)
+        if dtype is not None and dtype != x.struct_info.dtype:
+            x = self.block_builder.emit(relax.op.astype(x, dtype))
+        if not x.struct_info.dtype.startswith(("float", "bfloat")):
+            raise ValueError("PyTorch mean requires a floating input or explicit floating dtype")
+        if not len(self.shape_of(x)):
+            return self.block_builder.emit_te(topi.identity, x)
         return self.block_builder.emit(relax.op.mean(x, dim, keepdims=keepdim))
 
     def _sum(self, node: fx.Node) -> relax.Var:
-        args = self.retrieve_args(node)
-        keepdim = node.kwargs["keepdim"] if "keepdim" in node.kwargs else False
-        if len(args) == 1:
-            return self.block_builder.emit(relax.op.sum(args[0], keepdims=keepdim))
-        return self.block_builder.emit(relax.op.sum(args[0], args[1]))
+        from tvm import DataType, tir, topi
+
+        x, dim, keepdim, dtype = self._reduction_args(node)
+        dtype = dtype or (
+            "int64"
+            if x.struct_info.dtype.startswith(("int", "uint", "bool"))
+            else x.struct_info.dtype
+        )
+        if dtype != x.struct_info.dtype:
+            x = self.block_builder.emit(relax.op.astype(x, dtype))
+        if not len(self.shape_of(x)):
+            return self.block_builder.emit_te(topi.identity, x)
+        narrow_integer = dtype == "bool" or (dtype.startswith(("int", "uint")) and dtype != "int64")
+        if narrow_integer:
+            # Keep explicitly requested small-integer wrapping at the output
+            # conversion, instead of relying on signed INT32 overflow in LLVM.
+            shape = self.shape_of(x)
+            axes = range(len(shape)) if dim is None else [dim] if isinstance(dim, int) else dim
+            count = 1
+            for axis in axes:
+                extent = shape[axis]
+                if not isinstance(extent, tir.IntImm):
+                    raise NotImplementedError(
+                        "Explicit narrow integer sums require a static INT64 accumulation bound"
+                    )
+                count *= int(extent)
+            bits = DataType(dtype).bits
+            lower = -(1 << (bits - 1)) if dtype.startswith("int") else 0
+            upper = (1 << (bits - (1 if lower else 0))) - 1
+            if count * lower < -(1 << 63) or count * upper > (1 << 63) - 1:
+                raise NotImplementedError(
+                    "Explicit narrow integer sum exceeds the proven INT64 accumulation bound"
+                )
+            x = self.block_builder.emit(relax.op.astype(x, "int64"))
+        result = self.block_builder.emit(relax.op.sum(x, dim, keepdims=keepdim))
+        if narrow_integer:
+            result = self.block_builder.emit(relax.op.astype(result, dtype))
+        return result
 
     ########## Search ##########
 
@@ -798,40 +885,71 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         return self.block_builder.emit(relax.op.scatter_elements(x, index, src, axis=dim))
 
     def _split(self, node: fx.Node) -> relax.Var:
-        x = self.env[node.args[0]]
-        split_size = node.args[1]
-        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
+        from tvm import tir
+
+        args = self.retrieve_args(node)
+        x = args[0]
+        split_size = (
+            args[1]
+            if len(args) > 1
+            else node.kwargs.get(
+                "split_sizes",
+                node.kwargs.get("split_size_or_sections", node.kwargs.get("split_size")),
+            )
+        )
+        dim = args[2] if len(args) > 2 else node.kwargs.get("dim", 0)
         if isinstance(split_size, (list, tuple)):
             n_section = []
             for s in split_size[:-1]:
                 cum_sum = 0 if not n_section else n_section[-1]
                 n_section.append(s + cum_sum)
         else:
-            n_section = (self.shape_of(x)[dim].value + split_size - 1) // split_size
+            extent = self.shape_of(x)[dim]
+            if not isinstance(extent, tir.IntImm):
+                raise NotImplementedError("Integer split-size import requires a static axis extent")
+            if not isinstance(split_size, int) or split_size <= 0:
+                raise ValueError("Split size must be a positive integer")
+            n_section = list(range(split_size, int(extent), split_size))
         return self.block_builder.emit(relax.op.split(x, n_section, dim))
 
     def _squeeze(self, node: fx.Node) -> relax.Var:
+        from tvm import tir
+
         x = self.env[node.args[0]]
         dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", None)
+        if dim is not None:
+            shape = self.shape_of(x)
+            axes = [dim] if isinstance(dim, int) else list(dim)
+            if not shape:
+                if any(axis not in (0, -1) for axis in axes):
+                    raise ValueError("Squeeze axis is outside the scalar input rank")
+                return x
+            if any(
+                not isinstance(axis, int) or not -len(shape) <= axis < len(shape) for axis in axes
+            ):
+                raise ValueError("Squeeze axis is outside the input rank")
+            axes = [axis % len(shape) for axis in axes]
+            if len(set(axes)) != len(axes):
+                raise ValueError("Squeeze axes must be distinct")
+            if any(not isinstance(shape[axis], tir.IntImm) for axis in axes):
+                raise NotImplementedError("Explicit squeeze axes require static extents")
+            dim = [axis for axis in axes if int(shape[axis]) == 1]
+            if not dim:
+                return x
         return self.block_builder.emit(relax.op.squeeze(x, dim))
 
     def _stack(self, node: fx.Node) -> relax.Var:
         args = self.retrieve_args(node)
         axis = args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
         in_args = args[0]
-        assert all(
-            a.struct_info.shape[axis] == in_args[0].struct_info.shape[axis] for a in in_args[1:]
-        ), "Expect all dim at {} to be the same, get {}".format(
-            axis, [a.struct_info.shape for a in args]
-        )
-        cat = self.block_builder.emit(relax.op.concat(in_args, axis=axis))
-        s_shape = []
-        for idx, s in enumerate(cat.struct_info.shape):
-            if idx == axis:
-                s_shape.extend([len(in_args), in_args[0].struct_info.shape[axis]])
-            else:
-                s_shape.append(s)
-        return self.block_builder.emit(relax.op.reshape(cat, s_shape))
+        if not in_args:
+            raise ValueError("Stack requires a nonempty tensor sequence")
+        rank = len(self.shape_of(in_args[0]))
+        if not isinstance(axis, int) or not -rank - 1 <= axis <= rank:
+            raise ValueError("Stack axis is outside the output rank")
+        axis %= rank + 1
+        expanded = [self.block_builder.emit(relax.op.expand_dims(value, axis)) for value in in_args]
+        return self.block_builder.emit(relax.op.concat(expanded, axis=axis))
 
     def _tile(self, node: fx.Node) -> relax.Var:
         import torch  # type: ignore
@@ -853,7 +971,7 @@ class BaseFXGraphImporter(metaclass=abc.ABCMeta):
         import torch  # type: ignore
 
         x = self.env[node.args[0]]
-        if len(node.args) == 2:
+        if len(node.args) >= 2:
             if isinstance(node.args[1], torch.dtype):
                 dtype = self._convert_data_type(node.args[1], self.env)
                 return self.block_builder.emit(relax.op.astype(x, dtype))

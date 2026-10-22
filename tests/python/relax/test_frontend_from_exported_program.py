@@ -700,21 +700,11 @@ def test_round():
         def forward(self, input):
             return torch.round(input)
 
-    @tvm.script.ir_module
-    class expected:
-        @R.function
-        def main(
-            input_1: R.Tensor((1, 3, 10, 10), dtype="float32")
-        ) -> R.Tuple(R.Tensor((1, 3, 10, 10), dtype="float32")):
-            # block 0
-            with R.dataflow():
-                lv: R.Tensor((1, 3, 10, 10), dtype="float32") = R.round(input_1)
-                gv: R.Tuple(R.Tensor((1, 3, 10, 10), dtype="float32")) = (lv,)
-                R.output(gv)
-            return gv
-
-    example_args = (torch.randn(1, 3, 10, 10, dtype=torch.float32),)
-    verify_model(Round(), example_args, {}, expected)
+    values = torch.tensor([-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5], dtype=torch.float32)
+    mod = from_exported_program(export(Round(), args=(values,)), unwrap_unit_return_tuple=True)
+    vm = relax.VirtualMachine(relax.build(mod, "llvm"), tvm.cpu())
+    tvm.testing.assert_allclose(vm["main"](tvm.nd.array(values.numpy())).numpy(),
+                               Round()(values).numpy(), rtol=0, atol=0)
 
 
 def test_softmax():
@@ -1324,6 +1314,7 @@ def test_avg_pool2d():
                     strides=[1, 1],
                     dilation=[1, 1],
                     padding=[0, 0, 0, 0],
+                    count_include_pad=True,
                     layout="NCHW",
                     out_layout="NCHW",
                 )
@@ -1357,6 +1348,7 @@ def test_avg_pool2d():
                     dilation=[1, 1],
                     padding=[2, 2, 2, 2],
                     ceil_mode=True,
+                    count_include_pad=True,
                     layout="NCHW",
                     out_layout="NCHW",
                 )
@@ -1380,6 +1372,7 @@ def test_avg_pool2d():
                     dilation=[1, 1],
                     padding=[0, 0, 0, 0],
                     ceil_mode=False,
+                    count_include_pad=True,
                     layout="NCHW",
                     out_layout="NCHW",
                 )
@@ -1567,7 +1560,7 @@ def test_conv_transpose1d():
                     padding=[0, 0],
                     dilation=[1],
                     data_layout="NCW",
-                    kernel_layout="OIW",
+                    kernel_layout="IOW",
                     out_layout="NCW",
                     out_dtype="float32",
                 )
@@ -1601,7 +1594,7 @@ def test_conv_transpose1d():
                     padding=[0, 0],
                     dilation=[1],
                     data_layout="NCW",
-                    kernel_layout="OIW",
+                    kernel_layout="IOW",
                     out_layout="NCW",
                     out_dtype="float32",
                 )
@@ -1659,7 +1652,7 @@ def test_conv_transpose2d():
                     padding=[0, 0, 0, 0],
                     dilation=[1, 1],
                     data_layout="NCHW",
-                    kernel_layout="OIHW",
+                    kernel_layout="IOHW",
                     out_layout="NCHW",
                     out_dtype="float32",
                 )
@@ -1693,7 +1686,7 @@ def test_conv_transpose2d():
                     padding=[0, 0, 0, 0],
                     dilation=[1, 1],
                     data_layout="NCHW",
-                    kernel_layout="OIHW",
+                    kernel_layout="IOHW",
                     out_layout="NCHW",
                     out_dtype="float32",
                 )
@@ -2964,7 +2957,10 @@ def test_select_slice():
         ) -> R.Tuple(R.Tensor((1, 10, 3), dtype="float32")):
             # block 0
             with R.dataflow():
-                lv: R.Tensor((3, 10, 10), dtype="float32") = R.take(x, R.const(0, "int64"), axis=0)
+                selected: R.Tensor((1, 3, 10, 10), dtype="float32") = R.strided_slice(
+                    x, [0], [0], [1], [1]
+                )
+                lv: R.Tensor((3, 10, 10), dtype="float32") = R.squeeze(selected, axis=[0])
                 lv1: R.Tensor((1, 10, 10), dtype="float32") = R.strided_slice(
                     lv,
                     (R.prim_value(0),),
@@ -2973,16 +2969,8 @@ def test_select_slice():
                     (R.prim_value(2),),
                     assume_inbound=False,
                 )
-                lv2: R.Tensor((1, 10, 10), dtype="float32") = R.strided_slice(
-                    lv1,
-                    (R.prim_value(1),),
-                    (R.prim_value(0),),
-                    (R.prim_value(9223372036854775807),),
-                    (R.prim_value(1),),
-                    assume_inbound=False,
-                )
                 lv3: R.Tensor((1, 10, 3), dtype="float32") = R.strided_slice(
-                    lv2,
+                    lv1,
                     (R.prim_value(2),),
                     (R.prim_value(0),),
                     (R.prim_value(3),),
@@ -3004,25 +2992,9 @@ def test_select_slice():
             x: R.Tensor((8, 16), dtype="float32")
         ) -> R.Tuple(R.Tensor((8, 1, 1, 16, 1), dtype="float32")):
             with R.dataflow():
-                lv: R.Tensor((8, 16), dtype="float32") = R.strided_slice(
-                    x,
-                    (R.prim_value(0),),
-                    (R.prim_value(0),),
-                    (R.prim_value(9223372036854775807),),
-                    (R.prim_value(1),),
-                    assume_inbound=False,
-                )
-                lv1: R.Tensor((8, 1, 16), dtype="float32") = R.expand_dims(lv, axis=[1])
+                lv1: R.Tensor((8, 1, 16), dtype="float32") = R.expand_dims(x, axis=[1])
                 lv2: R.Tensor((8, 1, 1, 16), dtype="float32") = R.expand_dims(lv1, axis=[2])
-                lv3: R.Tensor((8, 1, 1, 16), dtype="float32") = R.strided_slice(
-                    lv2,
-                    (R.prim_value(3),),
-                    (R.prim_value(0),),
-                    (R.prim_value(9223372036854775807),),
-                    (R.prim_value(1),),
-                    assume_inbound=False,
-                )
-                lv4: R.Tensor((8, 1, 1, 16, 1), dtype="float32") = R.expand_dims(lv3, axis=[4])
+                lv4: R.Tensor((8, 1, 1, 16, 1), dtype="float32") = R.expand_dims(lv2, axis=[4])
                 gv: R.Tuple(R.Tensor((8, 1, 1, 16, 1), dtype="float32")) = (lv4,)
                 R.output(gv)
             return gv
@@ -3493,7 +3465,8 @@ def test_to_copy():
         ) -> R.Tuple(R.Tensor((1, 2, 3, 4), dtype="float32")):
             # block 0
             with R.dataflow():
-                gv: R.Tuple(R.Tensor((1, 2, 3, 4), dtype="float32")) = (x,)
+                lv: R.Tensor((1, 2, 3, 4), dtype="float32") = R.astype(x, dtype="float32")
+                gv: R.Tuple(R.Tensor((1, 2, 3, 4), dtype="float32")) = (lv,)
                 R.output(gv)
             return gv
 
