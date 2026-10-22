@@ -255,6 +255,56 @@ class SketchTests(EmulatedCase):
 
 
 class DesignSpaceTests(EmulatedCase):
+    def test_postorder_rule_preserves_convolution_padding_predicates(self):
+        data = te.placeholder((7, 7, 16), "int8", "data")
+        weight = te.placeholder((144, 16), "int8", "weight")
+
+        def im2col(i, k):
+            h, w = i // 7 + k // 48 - 1, i % 7 + (k // 16) % 3 - 1
+            return te.if_then_else(tir.all(h >= 0, h < 7, w >= 0, w < 7),
+                                   data[h, w, k % 16], tir.const(0, "int8"))
+
+        padded = te.compute((49, 144), im2col, name="padded")
+        from tvm.relax.backend.contrib.gemmini_elementwise import make_elementwise_schedule
+
+        with self.assertRaisesRegex(ValueError, "predicated copy"):
+            make_elementwise_schedule(te.create_prim_func([data, padded]))
+        k = te.reduce_axis((0, 144), "k")
+        product = te.compute((49, 16), lambda i, j: te.sum(
+            padded[i, k].astype("int32") * weight[k, j].astype("int32"), axis=k),
+            name="product")
+        func = te.create_prim_func([data, weight, product])
+        context = ms.TuneContext(
+            mod=tvm.IRModule({"main": func}), target=GemminiCapabilities().target(),
+            space_generator=gemmini_space_generator(include_cpu=False, dataflows=("os",)),
+            num_threads=1, rand_state=1)
+        spaces = context.generate_design_space()
+        rng = np.random.default_rng(0)
+        a, b = (rng.integers(-7, 8, shape, dtype="int8") for shape in ((7, 7, 16), (144, 16)))
+        expected = tvm.nd.empty((49, 16), "int32")
+        tvm.build(func, "llvm")(tvm.nd.array(a), tvm.nd.array(b), expected)
+        checked = 0
+        for sch in spaces:
+            name = str(sch.mod["main"].body.block.annotations.get("gemmini.sketch", ""))
+            if ".sroot." not in name:
+                continue
+            sch.enter_postproc()
+            if not all(post.apply(sch) for post in context.space_generator.postprocs):
+                continue
+            lowered = lower_tensorir_schedule(func, sch).scheduled_mod
+            # A rectangular DMA must not replace the predicated im2col read.
+            self.assertNotIn("tvm_gemmini_dma_spad_out", lowered.script())
+            path = self.root / f"padding-{checked}.so"
+            tvm.build(lowered, "llvm").export_library(
+                str(path), addons=[str(self.root / "emulator.c")], cc="cc", options=["-std=c11"])
+            actual = tvm.nd.empty((49, 16), "int32")
+            tvm.runtime.load_module(str(path))(tvm.nd.array(a), tvm.nd.array(b), actual)
+            np.testing.assert_array_equal(actual.numpy(), expected.numpy())
+            checked += 1
+            if checked == 3:
+                break
+        self.assertEqual(checked, 3)
+
     def test_shared_convolution_epilogue_survives_inlining_and_trace_replay(self):
         from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_workloads
 

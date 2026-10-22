@@ -708,6 +708,17 @@ def schedule_elementwise(
                 if kind in ("padding", "select_copy"):
                     raise ValueError("An unscheduled copy selection remains after decomposition")
                 block = block_rv(sch, original)
+                predicates = []
+                current = sch.get(block)
+                tir.stmt_functor.post_order_visit(
+                    sch.mod["main"].body,
+                    lambda stmt: predicates.append(stmt.predicate)
+                    if isinstance(stmt, tir.BlockRealize) and stmt.block.same_as(current)
+                    else None,
+                )
+                if any(not isinstance(predicate, tir.IntImm) or not int(predicate)
+                       for predicate in predicates):
+                    raise ValueError("A predicated copy region cannot become rectangular DMA")
                 if len(regions) > 1:
                     # Each region has one writer within this standard local
                     # block scope, even when the external output has many writers.

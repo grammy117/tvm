@@ -87,6 +87,13 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
     def apply(self, sch, block):
         func = sch.mod["main"]
         kind, names = _supported(func)
+        if (kind != "contraction"
+                and "gemmini.sketch" in func.body.block.annotations):
+            # Decomposing a contraction removes its reduction init. Do not
+            # then reinterpret its padding/reindexing producers as independent
+            # copy kernels: their predicates belong to the contraction sketch.
+            # Stock rules still schedule the remaining host blocks.
+            return [sch]
         if kind is None:
             # This generator only describes Gemmini placements. The CPU
             # generator of the union covers functions without such blocks.

@@ -40,6 +40,12 @@ stock search implementation; it does not replace its algorithm or mutators.
 Arith, blockize, loop-partition and both search-strategy regressions exercise
 these changes.
 
+After a contraction sketch is applied, its padding/reindexing stages remain
+part of that sketch. They are not reconsidered as standalone DMA-copy kernels
+when reduction decomposition removes the original initialization block.
+Standalone native copy scheduling also rejects residual block predicates:
+an im2col boundary condition cannot be replaced by an unconditional rectangle.
+
 ## Search space and fixed lowering
 
 `GemminiScheduleRule` operates on the supplied schedule and block. The space is a

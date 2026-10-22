@@ -213,6 +213,8 @@ def main():
     parser.add_argument("--trials-per-task", type=int, default=16,
                         help="Global budget multiplier; the stock scheduler distributes this times the task count")
     parser.add_argument("--parallel", type=int, default=14)
+    parser.add_argument("--trials-per-iteration", type=int,
+                        help="Stock search batch size; defaults to the runner concurrency")
     parser.add_argument("--builders", type=int, default=6)
     parser.add_argument("--strategy", choices=("evolutionary", "replay"), default="evolutionary")
     parser.add_argument("--tasks", type=int, nargs="*", help="Restrict to these task indices")
@@ -295,7 +297,7 @@ def main():
         builder=builder,
         runner=runner,
         max_trials_global=args.trials_per_task * len(tasks),
-        num_trials_per_iter=args.parallel,
+        num_trials_per_iter=args.trials_per_iteration or args.parallel,
         capabilities=capabilities,
         strategy=args.strategy,
         seed=args.seed,
@@ -317,6 +319,7 @@ def main():
     (args.work_dir / ("campaign.json" if args.strategy == "evolutionary" else "replay-campaign.json")).write_text(
         json.dumps({"model": args.model, "strategy": args.strategy, "wall_seconds": time.monotonic() - started,
                     "trials_per_task": args.trials_per_task, "parallel": args.parallel, "cap_factor": args.cap_factor,
+                    "trials_per_iteration": args.trials_per_iteration or args.parallel,
                     "max_cycles": args.max_cycles, "cpu_max_cycles": args.cpu_max_cycles,
                     "compiler": measure.identity(tvm._ffi.base._LIB._name),
                     "toolchain": toolchain.as_json(), "capabilities": capabilities.fingerprint}, indent=2) + "\n")
