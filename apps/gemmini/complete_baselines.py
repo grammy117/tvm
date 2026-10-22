@@ -22,6 +22,7 @@ bytes used; existing successful measurements are never simulated again.
 import argparse
 import json
 from pathlib import Path
+import shutil
 
 import tvm
 from tvm import meta_schedule as ms
@@ -68,9 +69,18 @@ def complete(root, *, commit=False, commit_only=False, max_cycles=6_000_000):
             folder.parent.mkdir(parents=True, exist_ok=True)
             artifact = measure.build_candidate(sch.mod, workload, folder, toolchain)
         measured = folder / "measurement.json"
+        outcome = None
         if measured.exists():
             outcome = json.loads(measured.read_text())
-        else:
+            if (outcome["status"] != "passed"
+                    and outcome.get("cycle_cap", max_cycles) < max_cycles):
+                suffix = f".cap{outcome['cycle_cap']}"
+                for name in ("measurement.json", "rtl-timing.log"):
+                    path = folder / name
+                    if path.exists() and not path.with_name(name + suffix).exists():
+                        shutil.copy2(path, path.with_name(name + suffix))
+                outcome = None
+        if outcome is None:
             outcome = measure.run_candidate(artifact, toolchain, max_cycles=max_cycles)
             measured.write_text(json.dumps(outcome, indent=2) + "\n")
         record = {"status": outcome["status"], "artifact": str(artifact_path),

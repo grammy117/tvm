@@ -85,7 +85,14 @@ class Campaign:
                         latest = json.loads(measurement.read_text())
                         if latest.get("status") == "passed":
                             record = latest
-                    self.cache.setdefault(self.measurement_key(artifact), record)
+                    key = self.measurement_key(artifact)
+                    previous = self.cache.get(key)
+                    if previous is None or (
+                        previous["status"] != "passed"
+                        and (record["status"] == "passed"
+                             or record.get("cycle_cap", 0) > previous.get("cycle_cap", 0))
+                    ):
+                        self.cache[key] = record
 
     @staticmethod
     def measurement_key(artifact):

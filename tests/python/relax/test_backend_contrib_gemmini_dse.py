@@ -63,6 +63,29 @@ def test_concurrent_duplicate_measurements_run_once(tmp_path, monkeypatch):
     restarted = Campaign(args, None)
     assert restarted.run(paths[0]) == 17
     assert len(calls) == 1
+    changed = json.loads(paths[0].read_text())
+    changed["elfs"]["valid"]["sha256"] = "new-input-or-wrapper-bytes"
+    paths[0].write_text(json.dumps(changed))
+    assert restarted.run(paths[0]) == 17
+    assert len(calls) == 2
+
+
+def test_cache_migration_prefers_a_successful_repaired_measurement(tmp_path):
+    args = SimpleNamespace(work_dir=tmp_path, max_cycles=1000, cap_factor=3, cpu_max_cycles=1000)
+    cache = {}
+    for index, status in enumerate(("failed", "passed")):
+        folder = tmp_path / str(index)
+        folder.mkdir()
+        (folder / "artifact.json").write_text(json.dumps({
+            "folder": str(folder), "workload": "workload", "program_sha256": str(index),
+            "elfs": {"valid": {"sha256": "same-elf"}}}))
+        cache[str(index)] = {"status": status, "folder": str(folder), "cycle_cap": 500}
+    # A later, expanded-cap repair supersedes the old cached refusal.
+    (tmp_path / "1/measurement.json").write_text(json.dumps({
+        "status": "passed", "folder": str(tmp_path / "1"), "cycles": 17, "cycle_cap": 1000}))
+    (tmp_path / "measurement-cache.json").write_text(json.dumps(cache))
+    campaign = Campaign(args, None)
+    assert campaign.cache["workload:same-elf"]["cycles"] == 17
 
 
 class GemminiDSETests(unittest.TestCase):
