@@ -1,11 +1,14 @@
 # Agent handoff: TVM Gemmini and EL4
 
 Read README.md, OWNERSHIP.md, TUNING.md and FIRESIM.md before making changes.
-The current user selection is full ResNet50 and full TinyLlama **16-token prefill
-plus one decode**, using EL4 recipes with fresh calibration/reference hashes.
-SmolVLA and exact reproduction of the old frozen run are outside this preliminary
-handoff. The execution agent runs the selected queued FireSim device. This source
-is a compiler/tooling handoff, not evidence that those runs already passed.
+The current selection is full ResNet50, TinyLlama **32-token prefill plus 32
+teacher-forced decode calls**, and SmolVLA's prefix/ten-denoise/action-decode
+chain. Use the specified EL4 recipes, one selected `visible/v00` per model and
+explicit warm/reset/measured repetitions. Prepare calibration once, then publish
+shared numerical bytes and independent references. A previous capture is needed
+only for exact historical identity. Direct FireSim transport is the current
+workhorse path. This source is a compiler/tooling handoff, not evidence that
+those full-model runs already passed.
 Select `--tuning-preset rtl-v1` for static compilation and inspect actual structural
 coverage; the preset cannot promise measured winners for every new EL4 operation.
 
@@ -45,8 +48,11 @@ coverage; the preset cannot promise measured winners for every new EL4 operation
 ## Next-agent execution order
 
 1. Reopen the handoff artifact's refs, file audit, tests and remaining gates.
-2. Recover actual model/data/reference contracts from Merlin's factories and
-   selected EL4 sources. Do not substitute synthetic operator shapes/cutouts.
+2. Read the [selected EL4 contract](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/protocol/experiment.yaml)
+   and companion shared-assets guide. Model revisions, inputs, calibration,
+   recurrence and host-math choices are already specified. Finish/publish their
+   portable prepared payloads. Older factory recipes and synthetic cutouts do
+   not replace selected EL4 capture programs.
 3. Run real-program extraction; account for all unsupported CPU tasks and each
    session stage, cache update, denoising step and reset.
 4. Compile and qualify real stages using independent fixtures. Resolve complete
@@ -55,10 +61,17 @@ coverage; the preset cannot promise measured winners for every new EL4 operation
    Select absolute weights/arena placement for large maps and preserve operator
    objects/constant bytes when recompiling the wrapper. Small near/high-address
    controls pass; verify actual model memory/stack and every final ELF instruction.
-6. Recover matching FireSim driver/image/loader identities and probe the required
-   memory range. Validate queued positive and wrong-oracle small controls.
-7. Run full sessions through the existing checkpoint/receipt path. Report quality,
-   complete output/state checks, peak memory and measured cycle boundaries.
+6. Adapt TVM's session manifest/UART to the current EL4 chain transport with real
+   package/source/route/reference bindings. The native retained-object chain
+   builder already exists, but its memref ABI is different from TVM's pointer
+   array ABI. Do not rename schemas or invent native build receipts. Add per-stage
+   counters alongside the aggregate warm/measured interval.
+7. Bind matching FireSim driver/image/loader identities and the full memory range.
+   Follow FIRESIM.md: strict staging/manager installation, lightweight boot-file
+   evidence or legacy full-array transport are distinct modes. The supplied
+   strict publisher and lightweight mode require compact all-element comparison.
+   Keep small positive/wrong-oracle controls on functional engines; paid FPGA
+   runs are complete models. Report every output/state check and timing scope.
 8. Tune only after correctness and deployment gates pass. Preserve default/CPU
    baselines, failed caps, pure-search minima, record provenance and replayability.
 
@@ -71,6 +84,6 @@ XGB booster is not proof of post-training ranking; a zero exit status is not
 complete output validation; header agreement is not whole-SoC equivalence.
 
 Do not force-push or rewrite existing published history. Curated branches are
-local reviewable deliveries. No PR is authorized. A future actual-model run may
-need operator-owned checkpoints, queue access and hardware receipts; report exact
-missing artifacts while continuing independent compilation/inventory work.
+reviewable deliveries. No new PR is authorized. A future actual-model run needs
+shared numerical payloads, the selected manager access and hardware receipts.
+Report exact missing artifacts while continuing independent compilation/inventory work.

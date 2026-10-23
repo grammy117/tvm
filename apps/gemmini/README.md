@@ -1,11 +1,14 @@
 # Gemmini TensorIR compiler and EL4 handoff
 
-Current user profile: full ResNet50 plus full TinyLlama, **16 prefill tokens + one
-decode**, prepared with EL4's checked-in recipes and fresh calibration/reference
-hashes. Another agent runs FireSim. The old numerical bundle is needed only for
-exact historical reproduction. Read the companion Merlin README's first sections
-for preparation status; this branch does not imply that both full models already
-pass their independent numerical gates.
+Current user profile: full **ResNet50, TinyLlama and SmolVLA** under the
+[EL4 protocol](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/protocol/experiment.yaml).
+One selected `visible/v00` per model is sufficient for the functional benchmark.
+ResNet is one image/one call; TinyLlama is **32-token prefill + 32 teacher-forced
+decode calls**; SmolVLA is prefix + ten denoise calls + action decode. Repetitions
+reset state. Calibration data prepares scales once; ResNet's 260 calibration
+images are not 260 benchmark passes. The old numerical bundle is needed only for
+exact historical reproduction; a fresh release needs its own shared bytes,
+hashes and independent references. Full-model numerical/FireSim gates remain open.
 
 This integration compiles semantic Relax programs through TensorIR into one-hart
 RV64GC code issuing primitive Gemmini commands. The supported tuning path uses
@@ -22,8 +25,9 @@ Start with:
 - [FIRESIM.md](FIRESIM.md): package ABI, functional gates, hardware binding and
   the remaining full-model deployment work.
 - [AGENTS.md](AGENTS.md): instructions for the agent continuing this work.
-- Merlin's `examples/gemmini/comparisons/tvm/README.md`: actual model factories,
-  source/reference gates, EL4 session contracts and queue workflow.
+- [Merlin comparison handoff](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-el4-handoff/examples/gemmini/comparisons/tvm/README.md):
+  per-workload preparation, shared numerical release, session contracts and
+  direct FireSim integration.
 
 ## Entry points
 
@@ -44,13 +48,15 @@ Start with:
 controller for new work. `prepare_gemmini_graph_legacy`, `gemmini_schedule.py`
 and the old BYOC snapshot remain regression references, outside the default path.
 
-For the preliminary handoff, pass **`--tuning-preset rtl-v1`** to static compilation.
+For this handoff, pass **`--tuning-preset rtl-v1`** to static compilation.
 The checked-in preset contains all nine verified synthetic-operator winners as
 stock MetaSchedule records. It verifies capabilities/payloads, then lets stock
 TVM apply structural matches. `placement.json` and `package.json` report actual
 coverage; zero matches is allowed for this preset and means defaults remain
-unmeasured. Explicit `--tuning-database` still rejects zero matches. The 32-row
-prefill winner cannot be applied by name to a new 16-row workload. See TUNING.md.
+unmeasured. Explicit `--tuning-database` still rejects zero matches. Even with the
+selected 32-token prefill, quantization/epilogue/IR differences can prevent the
+32-row winner from matching. Inspect coverage; do not assign winners by model
+name. See TUNING.md.
 
 ## Qualification boundary
 
@@ -66,6 +72,16 @@ ResNet50, TinyLlama or SmolVLA FireSim runs. In particular, a complete SmolVLA
 16-layer diagnostic previously failed its floating gate, and matching a generated
 header does not establish matching FireSim driver or whole-SoC behavior.
 The handoff preserves those limitations and specifies their remaining gates.
+
+Current EL4 already implements native complete-chain images, compact comparison
+of every output element, strict version-pinned upload/manager tools and a
+lightweight actual-boot-file verification mode. TVM's package-session bridge has
+different ABI/manifest/UART contracts and needs an explicit adapter to use these
+paths. It provides aggregate warm/measured timing; per-stage timing remains to be
+added. The current audit passes 218 TVM backend/CLI tests. Companion model tests
+also expose AVX512 environment requirements and a LeRobot/diffusers/TorchAO
+dependency conflict; see the Merlin audit rather than assuming a fully validated
+three-model environment. No full-model FireSim result is inferred.
 
 ## Build and verify
 

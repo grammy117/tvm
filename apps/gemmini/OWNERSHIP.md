@@ -35,7 +35,7 @@ checkpoint + data + session + numerical/quantization contract [Merlin recipes/op
   -> LLVM RV64 object code [TVM/LLVM]
   -> static call_tir graph wrapper/constants/workspace [custom exporter]
   -> primitive adapter + math/runtime archives + startup/linker [external toolchain/platform]
-  -> complete model session, independent outputs and queued FireSim receipt [Merlin/operator]
+  -> complete model session, independent outputs and FireSim evidence [Merlin/operator]
 ```
 
 TVM is responsible for:
@@ -95,7 +95,7 @@ Work outside stock TVM (current implementation, not an intrinsic impossibility):
    select libm/libgcc, link startup/stack/loader/session orchestration, and audit the
    entire archive and final ELF. Compiler output alone does not prove loadability.
 6. Execute Spike/Verilator/FireSim, validate outputs and guards, verify source and
-   deployed hardware identities, queue ownership, elapsed-cycle scope and receipts.
+   deployed hardware identities, manager ownership, elapsed-cycle scope and receipts.
 7. Interpret results, keep cap failures and negative evidence, qualify complete
    sessions and report E2E latency/memory/quality. No stock TVM pass performs these.
 

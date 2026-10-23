@@ -38,8 +38,9 @@ OS/WS, hoisting, pipelining, producer/epilogue placement and unrolling. Fixed
 lowering passes still prove packing, bias folding, config shadowing, DMA batching,
 first-K overwrite, SRAM lifetimes and fences. This preset contains selected traces,
 not a universal trained cost model. In particular, a newly calibrated EL4 recipe
-or TinyLlama 16-row prefill may require fresh task measurements. Do not count old
-32-row or differently quantized records as coverage for those tasks.
+can change structural matches even for the selected TinyLlama 32-token prefill.
+Such tasks need fresh measurements. Do not count old 32-row or differently
+quantized records as coverage for those tasks.
 
 | Responsibility | Implementation |
 | --- | --- |
@@ -287,8 +288,10 @@ called 32 times and a denoiser called ten times need external session weighting;
    censored/failed baselines separately. A trained booster alone does not prove
    that any later candidate was ranked by it.
 3. Add a FireSim implementation of the existing Builder/Runner contract, backed
-   by Merlin's queue/receipt APIs. Preserve ELF/input identity, independent output
-   checks, negative controls and one documented timing window. Keep FireSim and
+   by Merlin's selected direct transport and evidence APIs. This is future
+   tuning work; the current paid FPGA campaign runs complete models. Preserve
+   ELF/input identity, independent output checks, negative controls and one
+   documented timing window. Keep FireSim and
    Verilator labels in separate databases. Do not feed Spike wall time to XGB.
 4. Tune remaining CPU-only tasks with the same one-hart ISA policy. Expand the
    current measurement oracle only where its input/output contracts can be

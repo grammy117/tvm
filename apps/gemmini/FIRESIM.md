@@ -29,13 +29,13 @@ allowed, so inspect placement and account for every remaining default/fallback.
 `--tuning-result` was removed. Verilator choices are hints for FireSim and must
 be measured on the selected FireSim image. Compilation does not tune implicitly.
 
-The two-model preliminary handoff selects `--tuning-preset rtl-v1`. This portable
+The three-model EL4 handoff selects `--tuning-preset rtl-v1`. This portable
 stock database supplies the nine existing operator winners and verifies payload
 and capability identities. Unlike an explicit database, this preset permits zero
 structural matches, leaving those functions on unmeasured defaults. Inspect
 `tuned_functions`, `unmeasured_placement_is_provisional` and `placement.json`.
-The preset cannot transfer the 32-row prefill winner to the requested 16-row
-program or claim a differently quantized EL4 operation has been measured.
+The selected TinyLlama prefill has 32 tokens, but matching row count alone does
+not establish a structural match or a measurement for different EL4 arithmetic.
 
 The package includes `libmodel.a`, `model.h`, `matmul.h`, the selected `libm.a` and
 `libgcc.a`, generated LLVM/TIR/Relax and C, relative constant assembly, placement,
@@ -86,7 +86,7 @@ need qualification. See the companion README for exact CLI and manifest formats.
 python apps/gemmini/qualify_package.py \
   --package compiled-model --fixture arrays.npz \
   --fixture-provenance reference.json --output-dir checked-model \
-  --riscv-gcc /path/to/riscv64-unknown-elf-gcc --rtol 1e-5 --atol 1e-6
+  --riscv-gcc /path/to/riscv64-unknown-elf-gcc --rtol 1e-5 --atol 2e-6
 python apps/gemmini/verify_tensorir.py run \
   --bundle checked-model --backend spike --name spike-valid \
   --simulator-receipt spike/receipt.json --seconds 120
@@ -139,7 +139,7 @@ reserved DRAM map to the final ELF. Check all load segments, stack high-water an
 cache/state lifetimes at the intended full size; run independent inputs and
 negative controls. The 30 MHz build label is not a cycle-to-time or DRAM model
 calibration. Existing local RTL results cannot qualify these deployment facts.
-No queue submission or hardware execution is performed by these tools.
+No hardware submission or execution is performed by these compiler tools.
 
 The compiler software handoff is ready when its archive, linked boot ELF and local
 proof receipts pass. A deployed-hardware or final whole-model performance claim
@@ -150,9 +150,17 @@ inferred from the small synthetic recipe slices.
 
 ## Actual EL4 workloads: ordered handoff
 
-The companion Merlin delivery branch starts at EL4
-`0cc289de52a10bed256f32c90cfbb54a21b3c81f`. Its comparison README owns the model
-factories, data roles and complete session requirements. Do not run the stopped
+The companion Merlin delivery branch contains fetched EL4
+`0cc289de52a10bed256f32c90cfbb54a21b3c81f`. The
+[shared protocol](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/protocol/experiment.yaml)
+owns model revisions, recipes, input shapes, calibration and recurrence. The
+[comparison handoff](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-el4-handoff/examples/gemmini/comparisons/tvm/README.md)
+records their preparation/integration status. ResNet is one image/one call;
+TinyLlama is 32-token prefill plus 32 teacher-forced decode calls; SmolVLA is
+prefix + ten denoise calls + action decode. One selected `visible/v00` per
+model suffices for the functional benchmark, with explicit repetitions and reset.
+ResNet's 260 images are calibration data, used once to prepare scales.
+Do not run the stopped
 manual `el4_20261018/model_regression.py` campaign or transplant its candidate
 admission receipts into the TVM comparison. Its saved compiler-object replacement
 path is not a TVM whole-model executor.
@@ -173,10 +181,17 @@ path is not a TVM whole-model executor.
    source/object/symbol hashes; do not rename a symbol and assume compatibility.
    Merlin's comparison bridge now supplies these bindings and explicit routes;
    actual selected full-model qualification remains unfinished.
+   The newer native `merlin.model_check.chain_image` builder already packages
+   complete chains from retained Merlin program builds. Its memref/build ABI,
+   `merlin.post_freeze.firesim.chain_image.v1` manifest and compact `CHAIN_*`
+   transcript differ from the TVM bridge's `tvm_merlin_package_session_v1` and
+   `TVM_SESSION_*`/OUT_BIN output. Add explicit source/package/reference bindings
+   and compatible transport at this boundary; renaming a schema is insufficient.
 5. Bind the actual bitstream **and matching driver**, startup/console/tohost ABI,
    clock/counter, ISA, one-hart policy, DRAM base/extent and memory reservations.
-   Run a small known-output positive/negative control through the queue before
-   attempting full weights/state. A correct header alone does not qualify this.
+   Keep small positive/negative controls on functional engines. Current paid FPGA
+   execution is reserved for complete models. A correct header alone does not
+   qualify the deployed hardware or its memory model.
 6. Check all ELF LOAD spans, .bss/.noinit, stack, inputs, outputs, shared constants,
    packed copies, caches, graph workspace, host staging and verification buffers.
    The 64-MiB request and 16-GiB declaration in `firesim_target.json` are not live
@@ -184,23 +199,44 @@ path is not a TVM whole-model executor.
    loader and recheck memory after linking the entire session. RV64 medany code
    references are bounded; large blobs need the existing explicit absolute-pointer
    loader convention, not ordinary relocations over multi-GB distances.
-7. Use Merlin's existing `merlin-firesim-checkpoint`/receipt tools and raw queue
-   client. Inspect the exact command with `--dry-run`, then execute a fresh manifest
-   only after its artifacts/gates exist. Queue jobs must name the hw_config and
-   preserve kill -> infrasetup -> runworkload -> kill. Do not invoke FireSim directly
-   or create another queue/ELF harness.
-8. Preserve client/daemon/UART logs, submission argv, job ID, image/source hashes,
+7. Use the existing post-freeze direct prepare/collect tools and the selected
+   locked SSM path, one complete model at a time. Choose the mode below and fill
+   actual assets/manager pins; the checked-in selection is a template. No old
+   queue or new parallel ELF harness is required.
+8. Preserve manager/UART logs, submission argv, SSM command ID, image/source hashes,
    all numerical results, negative controls and one defined cycle interval. Report
    both model-compute and declared E2E boundaries; include every required stage and
    repeated invocation. Never add operator minima and call the sum measured E2E.
 
-The checkpoint receipt requires a specific warm/measured UART protocol. The
-functional `qualify_package.py` HTIF guest and the operator tuning harness do not
-emit that protocol by default. Integrate the existing Merlin warm-profile adapter
-or an ABI-compatible caller and validate its protocol before submission. A
-successful generic HTIF run cannot be sealed as a warm-profile checkpoint merely
-by rewriting its log. Keep one warm invocation and one measured invocation in
-one boot process when using that profile; two queue jobs do not retain warm state.
+The TVM package-session bridge already emits one warm and one measured full
+invocation in one boot, with state reset and aggregate cycle windows. It still
+needs per-stage counters and configurable counts for any different repetition
+policy. The native chain's stage counters exclude descriptor preparation and
+input transfers, so their sum is not whole-chain E2E latency. Retain both scopes.
+Generic `qualify_package.py` HTIF guests/operator harnesses do not establish
+complete-session execution by printing a pass marker.
+
+## Select the current FireSim transport
+
+The [EL4 execution guide](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/validation/README.md)
+defines three relevant direct paths:
+
+| Mode | Tool/evidence contract | Current boundary |
+| --- | --- | --- |
+| Strict version-pinned manager provenance | Offline prepare selects `elf_upload` staging. Staging writes versioned ELF/request objects to S3 and prepares an unsent SSM plan. The manager observes the actual boot file before/after and records execution/cleanup. | Requires installation and pinned hashes of the supplied manager wrapper/SSM document. Its result publisher supports compact `all_element_comparison_v1`; prepare alone can admit a full-array request that this publisher cannot finish. |
+| Lightweight `booted_elf_hash_v1` | The installed `fpga-run-elf ELF NAME` helper plus actual runtime-host `booted-elf.json`, matching simulator argv/`+prog0`, complete UART and original SSM/upload records. | Requires compact complete-chain comparison, but no strict-manager upgrade or manufactured result manifest. This establishes a separately labeled reproducibility observation. |
+| Legacy direct full arrays | Old helper, chain manifest, manager result/output-file roster, uploaded/consumed identities and shared offline numerical checker. | TVM's full-array reader can supply decoded arrays, but does not itself create manager evidence. This mode does not provide strict boot-file custody; verify timing/cleanup separately. |
+
+Sources: [strict manager integration](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/validation/manager-provenance.md)
+and [lightweight contract](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/validation/booted-elf-provenance.md).
+Both newer paths need the TVM bridge adapter described above. Compact mode
+compares every element of every declared output against admitted references
+inside the guest, then sends comparison statistics; it does not replace
+numerical checking with a digest. All modes leave `model_validation_complete`
+false until independent source, placement, instruction and hardware gates pass.
+The old helper's polling/exit/output limitations do not mean the newer strict
+helpers are unimplemented, and local tests do not prove they are installed.
+The historical queue/checkpoint path remains an explicitly separate deployment.
 
 FireSim timing is an independent backend for the existing MetaSchedule runner
 contract; it is not implemented by changing `--hardware-receipt` on the Verilator
