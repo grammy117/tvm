@@ -29,6 +29,14 @@ allowed, so inspect placement and account for every remaining default/fallback.
 `--tuning-result` was removed. Verilator choices are hints for FireSim and must
 be measured on the selected FireSim image. Compilation does not tune implicitly.
 
+The two-model preliminary handoff selects `--tuning-preset rtl-v1`. This portable
+stock database supplies the nine existing operator winners and verifies payload
+and capability identities. Unlike an explicit database, this preset permits zero
+structural matches, leaving those functions on unmeasured defaults. Inspect
+`tuned_functions`, `unmeasured_placement_is_provisional` and `placement.json`.
+The preset cannot transfer the 32-row prefill winner to the requested 16-row
+program or claim a differently quantized EL4 operation has been measured.
+
 The package includes `libmodel.a`, `model.h`, `matmul.h`, the selected `libm.a` and
 `libgcc.a`, generated LLVM/TIR/Relax and C, relative constant assembly, placement,
 explicit tensor/workspace memory plans, source/toolchain/adapter identities and a

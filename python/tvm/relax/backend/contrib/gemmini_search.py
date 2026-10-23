@@ -82,11 +82,29 @@ def open_gemmini_database(path, prepared, *, capabilities=None):
     The database itself owns matching and replay.
     """
     capabilities = capabilities or GemminiCapabilities()
-    for func in prepared.functions.values():
+    functions = []
+    # A portable database may contain winners for several programs. Register
+    # those intrinsic families too: JSONDatabase deserializes every trace,
+    # including records that will not match the current program.
+    workload_path = Path(path) / "database_workload.json"
+    if workload_path.exists():
+        for line in workload_path.read_text().splitlines():
+            if line.strip():
+                workload = ms.database.Workload.from_json(json.loads(line))
+                functions.extend(workload.mod.functions.values())
+    else:
+        functions.extend(prepared.functions.values())
+    registered = set()
+    for func in functions:
         if not isinstance(func, tir.PrimFunc):
             continue
+        func = func.with_attr("global_symbol", "main")
+        key = tvm.ir.structural_hash(func)
+        if key in registered:
+            continue
+        registered.add(key)
         ms.TuneContext(
-            mod=tvm.IRModule({"main": func.with_attr("global_symbol", "main")}),
+            mod=tvm.IRModule({"main": func}),
             target=capabilities.target(), num_threads=1,
             space_generator=gemmini_space_generator(capabilities, include_cpu=False),
         ).generate_design_space()

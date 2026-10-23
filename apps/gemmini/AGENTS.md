@@ -1,9 +1,13 @@
 # Agent handoff: TVM Gemmini and EL4
 
 Read README.md, OWNERSHIP.md, TUNING.md and FIRESIM.md before making changes.
-The objective for the next stage is actual ResNet50, TinyLlama and SmolVLA
-workloads end to end on the selected queued FireSim device. This source is a
-compiler/tooling handoff, not evidence that those runs already passed.
+The current user selection is full ResNet50 and full TinyLlama **16-token prefill
+plus one decode**, using EL4 recipes with fresh calibration/reference hashes.
+SmolVLA and exact reproduction of the old frozen run are outside this preliminary
+handoff. The execution agent runs the selected queued FireSim device. This source
+is a compiler/tooling handoff, not evidence that those runs already passed.
+Select `--tuning-preset rtl-v1` for static compilation and inspect actual structural
+coverage; the preset cannot promise measured winners for every new EL4 operation.
 
 ## Source and evidence
 

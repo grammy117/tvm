@@ -16,6 +16,31 @@ are not evidence for Gemmini performance.
 
 ## What is stock TVM and what is target-specific
 
+The portable `rtl-v1` preset in `apps/gemmini/presets/` retains the nine verified
+winners from the completed local study: two TinyLlama decode, one 32-row prefill,
+two ResNet, two SmolVLA expert and two smoke tasks. These are required reference
+records, not model weights or full-model measurements. `preset.json` binds source
+databases/results, winner measurement and ELF identities, intervals, selected
+sketches/decisions and the compiler capability fingerprint. The serialized costs
+are target cycles used for ranking, despite stock TVM's `run_secs` field name.
+
+`compile_package.py --tuning-preset rtl-v1` verifies/copies these records, registers
+intrinsic families for all stored workloads, and uses MetaScheduleApplyDatabase.
+Registration includes records for other programs because JSONDatabase validates
+all traces before it can match any. No workload names select a schedule. The
+preset does not require retuning for an exact structural match, but makes no
+coverage claim for a new numerical graph or shape. Its zero-hit case compiles
+with default schedules and reports no tuned functions; every remaining placement
+is provisional. Explicit `--tuning-database` remains strict about zero hits.
+
+The traces preconfigure sampled M/N/K reuse, traversal, intrinsic rectangle,
+OS/WS, hoisting, pipelining, producer/epilogue placement and unrolling. Fixed
+lowering passes still prove packing, bias folding, config shadowing, DMA batching,
+first-K overwrite, SRAM lifetimes and fences. This preset contains selected traces,
+not a universal trained cost model. In particular, a newly calibrated EL4 recipe
+or TinyLlama 16-row prefill may require fresh task measurements. Do not count old
+32-row or differently quantized records as coverage for those tasks.
+
 | Responsibility | Implementation |
 | --- | --- |
 | Relax legalization, fusion, extraction and call-count weights | Stock `LegalizeOps`, `FuseOps`, `FuseTIR`, `ms.relax_integration.extract_tasks` |

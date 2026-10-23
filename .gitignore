@@ -179,6 +179,9 @@ cscope*
 perf
 .bash_history
 *.json
+!apps/gemmini/presets/rtl-v1/database_workload.json
+!apps/gemmini/presets/rtl-v1/database_tuning_record.json
+!apps/gemmini/presets/rtl-v1/preset.json
 *.params
 *.ro
 *.onnx

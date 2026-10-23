@@ -38,6 +38,7 @@ from tvm.relax.backend.contrib.gemmini_search import open_gemmini_database
 from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_workloads
 
 from program_io import import_program
+from tuning_preset import materialize_preset
 from baremetal import export_graph, RV64_TARGET
 from verify_baremetal_cpu import identity
 from verify_matmul import audit_instructions
@@ -134,6 +135,11 @@ def compile_package(args):
     mod = import_program(args.program)
     database = None
     database_path = getattr(args, "tuning_database", None)
+    preset_name = getattr(args, "tuning_preset", None)
+    if preset_name and (database_path is not None or args.cpu_only):
+        raise ValueError("Tuning preset requires an accelerator build without another database")
+    if preset_name:
+        database_path = materialize_preset(preset_name, out / "preset", capabilities=caps)
     if database_path is not None:
         if args.cpu_only:
             raise ValueError("CPU-only build cannot accept a tuning database")
@@ -157,7 +163,7 @@ def compile_package(args):
         )
     else:
         selected = prepare_gemmini_graph(mod, report=report, database=database)
-        if database is not None and not any(
+        if database is not None and not preset_name and not any(
             row.get("origin") == "TVM MetaSchedule database" for row in report
         ):
             raise ValueError("Tuning database does not match any function in this program")
@@ -301,6 +307,7 @@ def compile_package(args):
         if args.cpu_only
         else "CPU copies; exact supported arithmetic; measured overrides when supplied",
         "tuning_database": "database" if database is not None else None,
+        "tuning_preset": preset_name,
         "tuned_functions": [row["function"] for row in report
                             if row.get("origin") == "TVM MetaSchedule database"],
         "unmeasured_placement_is_provisional": any(
@@ -346,7 +353,10 @@ def main():
     parser.add_argument("--adapter-receipt", type=Path)
     parser.add_argument("--cpu-only", action="store_true")
     parser.add_argument("--tensor-memory-bytes", type=int, default=64 << 20)
-    parser.add_argument("--tuning-database", type=Path, help="Standard MetaSchedule JSONDatabase directory")
+    tuning = parser.add_mutually_exclusive_group()
+    tuning.add_argument("--tuning-database", type=Path, help="Standard MetaSchedule JSONDatabase directory")
+    tuning.add_argument("--tuning-preset", choices=["rtl-v1"],
+                        help="Apply shipped RTL winners where structurally matching; report fallbacks")
     args = parser.parse_args()
     if args.verify:
         verify_package(args.verify)

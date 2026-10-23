@@ -1,5 +1,12 @@
 # Gemmini TensorIR compiler and EL4 handoff
 
+Current user profile: full ResNet50 plus full TinyLlama, **16 prefill tokens + one
+decode**, prepared with EL4's checked-in recipes and fresh calibration/reference
+hashes. Another agent runs FireSim. The old numerical bundle is needed only for
+exact historical reproduction. Read the companion Merlin README's first sections
+for preparation status; this branch does not imply that both full models already
+pass their independent numerical gates.
+
 This integration compiles semantic Relax programs through TensorIR into one-hart
 RV64GC code issuing primitive Gemmini commands. The supported tuning path uses
 stock TVM MetaSchedule and its JSONDatabase. Hardware matmul/conv loop engines
@@ -36,6 +43,14 @@ Start with:
 `--tuning-database DIRECTORY`. Do not use `gemmini_tuning.py`'s historical bounded
 controller for new work. `prepare_gemmini_graph_legacy`, `gemmini_schedule.py`
 and the old BYOC snapshot remain regression references, outside the default path.
+
+For the preliminary handoff, pass **`--tuning-preset rtl-v1`** to static compilation.
+The checked-in preset contains all nine verified synthetic-operator winners as
+stock MetaSchedule records. It verifies capabilities/payloads, then lets stock
+TVM apply structural matches. `placement.json` and `package.json` report actual
+coverage; zero matches is allowed for this preset and means defaults remain
+unmeasured. Explicit `--tuning-database` still rejects zero matches. The 32-row
+prefill winner cannot be applied by name to a new 16-row workload. See TUNING.md.
 
 ## Qualification boundary
 

@@ -1,0 +1,879 @@
+{
+  "schema": "gemmini_tuning_preset_v1",
+  "name": "rtl-v1",
+  "capability_fingerprint": "fb2281d666401792a7b5813387e82468de9832712cdcabe7d8ee47077638543d",
+  "scope": "Nine synthetic operator winners; structural matches only; not full-model or FireSim results",
+  "historical_tvm_source": "87f07883b65ee55dbd1b93f665aaab87cd8a1e50",
+  "cost_unit": "target cycles in standard run_secs; ranking only",
+  "records": [
+    {
+      "campaign": "tinyllama-decode",
+      "workload": "0eef2fd2b12d5e06",
+      "buffers": [
+        [
+          1,
+          2048,
+          "int8"
+        ],
+        [
+          2048,
+          256,
+          "int8"
+        ],
+        [
+          1,
+          1,
+          "float32"
+        ],
+        [
+          256,
+          "float32"
+        ],
+        [
+          1,
+          256,
+          "float32"
+        ]
+      ],
+      "cycles": 133169.0,
+      "sketch": "ij.1x16x16.os.h0.p0.etile.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            8
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            32,
+            4
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 3
+        }
+      ],
+      "measured_interval": "warm second call",
+      "measurement_identity": {
+        "sha256": "0434693ebfa4b6b8b894a40406ff70989074bf35b20c5c59a3685b16cb0dabf2",
+        "bytes": 779
+      },
+      "artifact_identity": {
+        "sha256": "e01f6f639934cec906ea8b16b9cae8d634340885e79f3a1b6d9ca6ae3fc5f95d",
+        "bytes": 1274
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/tinyllama-decode/metaschedule-dse_v2_20261022T100445Z_1bd6014/candidates/00017-0eef2fd2b12d5e06/valid.elf",
+        "sha256": "295896c0f681284efe4653580f5e44ae5d57283e059766b389088e9b0df93805",
+        "bytes": 568424
+      },
+      "campaign_results_identity": {
+        "sha256": "4f2856f6d8a3c4db499eb0a2afdbda68cdda127cce56fa1ba829e75a7181f778",
+        "bytes": 16802
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "9d2ce12ac7ed6cd7344350057ffbf24584679ecec0dddf13987525c708759e74",
+          "bytes": 130678
+        },
+        "database_tuning_record.json": {
+          "sha256": "bbb4fd43214d3909650bbdfc001765a57818f54e19ab63de2f474f06e9246555",
+          "bytes": 225431
+        }
+      },
+      "trace_sha256": "bf0879ad9889a259f6064051a3d701aa7879cbadba5e7ddce5885411d9f82a97",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    },
+    {
+      "campaign": "tinyllama-decode",
+      "workload": "32463c670c2921a6",
+      "buffers": [
+        [
+          1,
+          2048,
+          "int8"
+        ],
+        [
+          2048,
+          2048,
+          "int8"
+        ],
+        [
+          1,
+          1,
+          "float32"
+        ],
+        [
+          2048,
+          "float32"
+        ],
+        [
+          1,
+          2048,
+          "float32"
+        ]
+      ],
+      "cycles": 1285544.0,
+      "sketch": "ij.1x16x16.ws.h1.p0.eroot.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            32,
+            4
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            32,
+            4
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 1
+        }
+      ],
+      "measured_interval": "single cold call (long operator)",
+      "measurement_identity": {
+        "sha256": "221ad71b51428e23c0aa6fe0521b131966d92eeffa41f75c713cd4ea8917b4f1",
+        "bytes": 795
+      },
+      "artifact_identity": {
+        "sha256": "06d22b7b71b4012ef3d95d49ade5a2735a4688028152f91851e11d674e2ee451",
+        "bytes": 1276
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/tinyllama-decode/metaschedule-dse_v2_20261022T100445Z_1bd6014/candidates/00007-32463c670c2921a6/valid.elf",
+        "sha256": "7daf2731502feb08a2f54f5c23008deffb74687bd23d1ee28f5af2659704943e",
+        "bytes": 4235960
+      },
+      "campaign_results_identity": {
+        "sha256": "4f2856f6d8a3c4db499eb0a2afdbda68cdda127cce56fa1ba829e75a7181f778",
+        "bytes": 16802
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "9d2ce12ac7ed6cd7344350057ffbf24584679ecec0dddf13987525c708759e74",
+          "bytes": 130678
+        },
+        "database_tuning_record.json": {
+          "sha256": "bbb4fd43214d3909650bbdfc001765a57818f54e19ab63de2f474f06e9246555",
+          "bytes": 225431
+        }
+      },
+      "trace_sha256": "808757fb41100e993ebe8970143ad7a96ce1df0caf502922f2a533cf884e66e8",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    },
+    {
+      "campaign": "tinyllama-prefill",
+      "workload": "ac7fbce0d3202e12",
+      "buffers": [
+        [
+          32,
+          2048,
+          "int8"
+        ],
+        [
+          2048,
+          256,
+          "int8"
+        ],
+        [
+          32,
+          1,
+          "float32"
+        ],
+        [
+          256,
+          "float32"
+        ],
+        [
+          32,
+          256,
+          "float32"
+        ]
+      ],
+      "cycles": 610198.0,
+      "sketch": "ji.16x16x16.os.h0.p1.etile.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            8
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            16,
+            8
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 0
+        }
+      ],
+      "measured_interval": "single cold call (long operator)",
+      "measurement_identity": {
+        "sha256": "3d0db423b7bf7b3ee8a6b076fecc2760fb4a3214674fbcdfdf9a419173499724",
+        "bytes": 793
+      },
+      "artifact_identity": {
+        "sha256": "548119433635e39e5dec4034b724bc992a658eeabf2f94fe57b6b29502bd325a",
+        "bytes": 1278
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/tinyllama-prefill/metaschedule-dse_v2_20261022T100452Z_1bd6014/candidates/00006-ac7fbce0d3202e12/valid.elf",
+        "sha256": "d082302bc4881fd68d824f7ca44e79a7694c13ffcb8f319b1fc9fb0e41473306",
+        "bytes": 650944
+      },
+      "campaign_results_identity": {
+        "sha256": "ab90f035e6812c67998a5ef9ab5cc2187ce01656958cb3d9da04bbc784b5e3f1",
+        "bytes": 13145
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "f38731f48f3e919ad6dcf7d4eaf14f240eca4db08360056786e66699e655a749",
+          "bytes": 65156
+        },
+        "database_tuning_record.json": {
+          "sha256": "6112150287425ca97ecc90afb554b31c8750317f5c3d509fe9c90f82e1ee1875",
+          "bytes": 147717
+        }
+      },
+      "trace_sha256": "0101325bf527e5bad1241277c3f70cb763cc09ca655b2ca9de351e7c5329bddc",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    },
+    {
+      "campaign": "resnet50",
+      "workload": "4223f9d2c9f0c8a1",
+      "buffers": [
+        [
+          1,
+          7,
+          7,
+          512,
+          "int8"
+        ],
+        [
+          4608,
+          512,
+          "int8"
+        ],
+        [
+          1,
+          1,
+          1,
+          512,
+          "int32"
+        ],
+        [
+          1,
+          1,
+          1,
+          512,
+          "int64"
+        ],
+        [
+          1,
+          1,
+          1,
+          512,
+          "int64"
+        ],
+        [
+          1,
+          7,
+          7,
+          512,
+          "int8"
+        ]
+      ],
+      "cycles": 15926916.0,
+      "sketch": "ji.7x16x16.ws.h0.p0.etile.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            7
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            16
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            6,
+            48
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 3
+        }
+      ],
+      "measured_interval": "single cold call (long operator)",
+      "measurement_identity": {
+        "sha256": "f061449d46a80a6230397a0f331452bc45b69f3dd7b8f9760603920bee5bd6ca",
+        "bytes": 800
+      },
+      "artifact_identity": {
+        "sha256": "120737bf9f5f759bf95ced3902b6f0e4edcb970f9921a6ab3e787ab5adf4177d",
+        "bytes": 1921
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/resnet50/metaschedule-dse_v3_20261022T123504Z_1bd6014/candidates/00000-4223f9d2c9f0c8a1/valid.elf",
+        "sha256": "655cc42dd7d4a7a041d39b2bc5cd0a94f617a98904cf3935020405f040bd96a1",
+        "bytes": 2710552
+      },
+      "campaign_results_identity": {
+        "sha256": "d92b2ef4c1306d7f2da79eed17892116547853e0d27ba2c14a13bf6fe929ef1a",
+        "bytes": 17683
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "a7fb8c635874963fc070af2bae32623635716b94eaf7451a44575cd5c6ee2849",
+          "bytes": 495834
+        },
+        "database_tuning_record.json": {
+          "sha256": "1a98d91da28b504beaa77f17cdda65ca8aa602c188fb2860e5dafb7d21904d5a",
+          "bytes": 189662
+        }
+      },
+      "trace_sha256": "212934499fbd89270b7ef98867307cd91e89acd17d729d5850f7fa809333fa3e",
+      "compiler": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/build/baselines/tvm-gemmini/metaschedule-dse/compiler-v5/libtvm.so",
+        "sha256": "b59ac512c10e9704d6ec0e52766e1bc78b29d51bfd8c889fc8f254489b075e12",
+        "bytes": 74676856
+      },
+      "runner_sha256": "a498755dc14f3d541d41e5c4ec06c56b507db60b99aeae9290b121c4609d9610",
+      "adapter_sha256": "903b93498778998988c75854869c089da763d00509d263c02226af552977bccf"
+    },
+    {
+      "campaign": "resnet50",
+      "workload": "f1cd5efaa5fdf764",
+      "buffers": [
+        [
+          1,
+          7,
+          7,
+          2048,
+          "int8"
+        ],
+        [
+          2048,
+          512,
+          "int8"
+        ],
+        [
+          1,
+          1,
+          1,
+          512,
+          "int32"
+        ],
+        [
+          1,
+          1,
+          1,
+          512,
+          "int64"
+        ],
+        [
+          1,
+          1,
+          1,
+          512,
+          "int64"
+        ],
+        [
+          1,
+          7,
+          7,
+          512,
+          "int8"
+        ]
+      ],
+      "cycles": 5159256.0,
+      "sketch": "ji.7x16x16.os.h0.p1.etile.sroot.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            7,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            16
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            64,
+            2
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 0
+        }
+      ],
+      "measured_interval": "single cold call (long operator)",
+      "measurement_identity": {
+        "sha256": "aa33505dd6c50152d0b2361ac61ac52cc9694e41d76564d8492cc1b834599f36",
+        "bytes": 783
+      },
+      "artifact_identity": {
+        "sha256": "1554c7f0b3edfe5869defe3d364c951fc8fe78c6c8ee01fe9f5628916f5334b9",
+        "bytes": 1680
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/resnet50/metaschedule-replay_v3_20261022T124112Z_1bd6014/candidates/00003-f1cd5efaa5fdf764/valid.elf",
+        "sha256": "fe2ea56fb920d7e34b2cbc7974ae33e5022054ade796d0296d39e2e777588237",
+        "bytes": 1214368
+      },
+      "campaign_results_identity": {
+        "sha256": "d92b2ef4c1306d7f2da79eed17892116547853e0d27ba2c14a13bf6fe929ef1a",
+        "bytes": 17683
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "a7fb8c635874963fc070af2bae32623635716b94eaf7451a44575cd5c6ee2849",
+          "bytes": 495834
+        },
+        "database_tuning_record.json": {
+          "sha256": "1a98d91da28b504beaa77f17cdda65ca8aa602c188fb2860e5dafb7d21904d5a",
+          "bytes": 189662
+        }
+      },
+      "trace_sha256": "143128c95475321a6121bb85767c9098eafe9b881c4064204d5c35e03a6b014d",
+      "compiler": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/build/baselines/tvm-gemmini/metaschedule-dse/compiler-v5/libtvm.so",
+        "sha256": "b59ac512c10e9704d6ec0e52766e1bc78b29d51bfd8c889fc8f254489b075e12",
+        "bytes": 74676856
+      },
+      "runner_sha256": "619fe51e29e13afb0657a54d88b85618b6720b82d132343aeebedc9b6ff57808",
+      "adapter_sha256": "903b93498778998988c75854869c089da763d00509d263c02226af552977bccf"
+    },
+    {
+      "campaign": "smolvla-expert",
+      "workload": "83264ca07b0723cc",
+      "buffers": [
+        [
+          50,
+          720,
+          "int8"
+        ],
+        [
+          720,
+          32,
+          "int8"
+        ],
+        [
+          50,
+          1,
+          "float32"
+        ],
+        [
+          32,
+          "float32"
+        ],
+        [
+          50,
+          32,
+          "float32"
+        ]
+      ],
+      "cycles": 67956.0,
+      "sketch": "ji.10x16x16.os.h1.p0.etile.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            5,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            5,
+            9
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 2
+        }
+      ],
+      "measured_interval": "warm second call",
+      "measurement_identity": {
+        "sha256": "627175e26dfe8b04cdcd1983836fbf342d3d8aa7075d399762b2b0f926218f3c",
+        "bytes": 770
+      },
+      "artifact_identity": {
+        "sha256": "8ebc2266d0fdf9a59d8913e6fe3652284e30ad4da6a722aa08ff06e4cd584464",
+        "bytes": 1264
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/smolvla-expert/metaschedule-dse_v2_20261022T100459Z_1bd6014/candidates/00006-83264ca07b0723cc/valid.elf",
+        "sha256": "c1c81869bb53ad4d52a4aeba4a2f5b3cfb231045a120e7d404ced353ba8a98d1",
+        "bytes": 91224
+      },
+      "campaign_results_identity": {
+        "sha256": "e6da814e8cdeaa6d4d65cb4fa234b01ac0abc1aad28a28721b02dbd0f705eaef",
+        "bytes": 16358
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "48be4a82a9f944076ec2a1219e505bd0e3fdcd136ceea9c2801453999fd45f68",
+          "bytes": 130280
+        },
+        "database_tuning_record.json": {
+          "sha256": "b6e97a3a22c9f3477b9ad866b179e95e24ed0e4e6823ac77ee216bd12e4e2b90",
+          "bytes": 243206
+        }
+      },
+      "trace_sha256": "80d6e2126e909782321f57ee8cdd313a3671aab2a6a0568d7c2379afa152b059",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    },
+    {
+      "campaign": "smolvla-expert",
+      "workload": "307bc9a2654591b9",
+      "buffers": [
+        [
+          50,
+          32,
+          "int8"
+        ],
+        [
+          32,
+          720,
+          "int8"
+        ],
+        [
+          50,
+          1,
+          "float32"
+        ],
+        [
+          720,
+          "float32"
+        ],
+        [
+          50,
+          720,
+          "float32"
+        ]
+      ],
+      "cycles": 1234495.0,
+      "sketch": "ij.10x16x16.os.h1.p1.etile.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            5
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            15,
+            3
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            1
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 1
+        }
+      ],
+      "measured_interval": "single cold call (long operator)",
+      "measurement_identity": {
+        "sha256": "42a5b330fab680a09e65ed19c9ac984b5c5426f33fd0ce606413f6086743e988",
+        "bytes": 790
+      },
+      "artifact_identity": {
+        "sha256": "380bee8cd46bef12eae32fd30a00c83654384cf67136c45d0406c7eb56aca25f",
+        "bytes": 1266
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/smolvla-expert/metaschedule-dse_v2_20261022T100459Z_1bd6014/candidates/00008-307bc9a2654591b9/valid.elf",
+        "sha256": "57a2e6871061880d54cf76a31f2866f62601471731831cfa9aca7fc7beb044db",
+        "bytes": 196336
+      },
+      "campaign_results_identity": {
+        "sha256": "e6da814e8cdeaa6d4d65cb4fa234b01ac0abc1aad28a28721b02dbd0f705eaef",
+        "bytes": 16358
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "48be4a82a9f944076ec2a1219e505bd0e3fdcd136ceea9c2801453999fd45f68",
+          "bytes": 130280
+        },
+        "database_tuning_record.json": {
+          "sha256": "b6e97a3a22c9f3477b9ad866b179e95e24ed0e4e6823ac77ee216bd12e4e2b90",
+          "bytes": 243206
+        }
+      },
+      "trace_sha256": "7713d7b17c36712a8aa21e14202c6f676c796abb16f0164cec39bc9cf60e11fb",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    },
+    {
+      "campaign": "smoke",
+      "workload": "d1c779c75f3c6b7a",
+      "buffers": [
+        [
+          1,
+          64,
+          "int8"
+        ],
+        [
+          64,
+          48,
+          "int8"
+        ],
+        [
+          1,
+          1,
+          "float32"
+        ],
+        [
+          48,
+          "float32"
+        ],
+        [
+          1,
+          48,
+          "float32"
+        ]
+      ],
+      "cycles": 2496.0,
+      "sketch": "ij.1x16x16.os.h1.p0.eroot.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            3
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            2
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 2
+        }
+      ],
+      "measured_interval": "warm second call",
+      "measurement_identity": {
+        "sha256": "c3ffc5535f67290c179cd1873f08c9096e6f9fa57cff19489b9ad783564d9f1b",
+        "bytes": 750
+      },
+      "artifact_identity": {
+        "sha256": "fca32c6f556a159aa64cc7b6763db59cce1643d6e94b01e32a79a66cee6ed646",
+        "bytes": 1228
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/smoke/metaschedule-dse_v2_20261022T104407Z_1bd6014/candidates/00006-d1c779c75f3c6b7a/valid.elf",
+        "sha256": "e054e56fa6cdc46184f2762df652162dfba3870dd0d6f7097d008dd9eae05025",
+        "bytes": 26448
+      },
+      "campaign_results_identity": {
+        "sha256": "4684654b3a649cc96c1642f70e8d6e6d2950197b9521a5242fe431a91b5139b4",
+        "bytes": 16447
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "3117a0c3bb9b8da3116b9fd578fdf941e72cc155f08422d4e071fc2a21218cbd",
+          "bytes": 130442
+        },
+        "database_tuning_record.json": {
+          "sha256": "d201186755fbc77e26fb79fe2b976d4d265e83c08a0d89cdb73635a739d3d253",
+          "bytes": 521915
+        }
+      },
+      "trace_sha256": "0a39f28da95394e72836d28b55699983f57fd55b0e59b4fcfb9704ede894080c",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    },
+    {
+      "campaign": "smoke",
+      "workload": "b634c4004523ba29",
+      "buffers": [
+        [
+          50,
+          32,
+          "int8"
+        ],
+        [
+          32,
+          32,
+          "int8"
+        ],
+        [
+          50,
+          1,
+          "float32"
+        ],
+        [
+          32,
+          "float32"
+        ],
+        [
+          50,
+          32,
+          "float32"
+        ]
+      ],
+      "cycles": 35308.0,
+      "sketch": "ij.10x16x16.os.h1.p1.etile.stile.tnone",
+      "decisions": [
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            1,
+            5
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            1
+          ]
+        },
+        {
+          "instruction": "SamplePerfectTile",
+          "decision": [
+            2,
+            1
+          ]
+        },
+        {
+          "instruction": "SampleCategorical",
+          "decision": 0
+        }
+      ],
+      "measured_interval": "warm second call",
+      "measurement_identity": {
+        "sha256": "46bac5ebeb5a754b16dfd5c6f183e6d71986ee3f5c69dad911ae812067986eeb",
+        "bytes": 753
+      },
+      "artifact_identity": {
+        "sha256": "a73cda61aeb727f5789ee8bcb330894ec14073d8b29b82a1c8e21ef8041eded4",
+        "bytes": 1228
+      },
+      "elf": {
+        "path": "/home/grammy/blast/merlin-tvm-gemmini/out/artifacts/measurements/baremetal_verilator-gemminirocketconfig/smoke/metaschedule-dse_v2_20261022T104407Z_1bd6014/candidates/00009-b634c4004523ba29/valid.elf",
+        "sha256": "06cb9a1da9fad6e7f6766e5fc2c1890d7d46adebebadb64a3152a1cad12532b2",
+        "bytes": 32784
+      },
+      "campaign_results_identity": {
+        "sha256": "4684654b3a649cc96c1642f70e8d6e6d2950197b9521a5242fe431a91b5139b4",
+        "bytes": 16447
+      },
+      "source_database": {
+        "database_workload.json": {
+          "sha256": "3117a0c3bb9b8da3116b9fd578fdf941e72cc155f08422d4e071fc2a21218cbd",
+          "bytes": 130442
+        },
+        "database_tuning_record.json": {
+          "sha256": "d201186755fbc77e26fb79fe2b976d4d265e83c08a0d89cdb73635a739d3d253",
+          "bytes": 521915
+        }
+      },
+      "trace_sha256": "0302d55d2f8a7dcd653b4a90997a1609581d017e703811b68b50da39b89405ff",
+      "compiler": null,
+      "runner_sha256": null,
+      "adapter_sha256": null
+    }
+  ],
+  "files": {
+    "database_workload.json": {
+      "sha256": "9f29dc1752dab0a2e50eb2b329f6b370ca66e5a69e860a69e83ca93eb585284c",
+      "bytes": 952390
+    },
+    "database_tuning_record.json": {
+      "sha256": "6e5a7d7fdce9bd86a3967c1a8662b3b0b502f3931bf67c628f67dfbdba6a3263",
+      "bytes": 122292
+    }
+  }
+}
