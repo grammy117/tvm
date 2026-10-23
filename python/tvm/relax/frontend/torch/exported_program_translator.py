@@ -1341,6 +1341,12 @@ class ExportedProgramImporter(BaseFXGraphImporter):
                 raise ValueError("max_pool2d_with_indices: the indices output is consumed; unsupported")
         return (self._max_pool2d(node), None)
 
+    def _softmax_no_half_to_float(self, node: fx.Node):
+        """aten._softmax(x, dim, half_to_float): the ordinary softmax when half_to_float is False."""
+        if len(node.args) > 2 and node.args[2]:
+            raise ValueError("_softmax with half_to_float=True is unsupported")
+        return self._softmax(node)
+
     def create_convert_map(
         self,
     ) -> Dict[str, Callable[[fx.Node], relax.Var]]:
@@ -1435,6 +1441,10 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "rms_norm.default": self._rms_norm,
             "max_pool2d.default": self._max_pool2d,
             "max_pool2d_with_indices.default": self._max_pool2d_with_unused_indices,
+            "_softmax.default": self._softmax_no_half_to_float,
+            "arange.start_step": self._arange,
+            "le.Tensor": self._binary_op(relax.op.less_equal, operator.le),
+            "alias.default": lambda node: self.env[node.args[0]],
             "scaled_dot_product_attention.default": self._scaled_dot_product_attention,
             "unbind.int": self._unbind,
             "upsample_bilinear2d.vec": self._upsample_bilinear2d,
