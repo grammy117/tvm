@@ -19,6 +19,7 @@
 # pylint: disable=import-outside-toplevel
 """PyTorch ExportedProgram of Relax."""
 
+import operator
 from collections import ChainMap, OrderedDict
 from functools import partial
 from typing import Callable, Dict, List, Tuple
@@ -1328,6 +1329,18 @@ class ExportedProgramImporter(BaseFXGraphImporter):
 
     ########## Others ##########
 
+    def _max_pool2d_with_unused_indices(self, node: fx.Node):
+        """max_pool2d_with_indices whose indices output is dead: lower the values only.
+
+        Core-ATen export decomposes max_pool2d into this op. Refuse if any consumer reads the
+        indices rather than inventing them.
+        """
+        for user in node.users:
+            reads_values = user.target is operator.getitem and user.args[1] == 0
+            if not reads_values and len(user.users):
+                raise ValueError("max_pool2d_with_indices: the indices output is consumed; unsupported")
+        return (self._max_pool2d(node), None)
+
     def create_convert_map(
         self,
     ) -> Dict[str, Callable[[fx.Node], relax.Var]]:
@@ -1421,6 +1434,7 @@ class ExportedProgramImporter(BaseFXGraphImporter):
             "linear.default": self._linear,
             "rms_norm.default": self._rms_norm,
             "max_pool2d.default": self._max_pool2d,
+            "max_pool2d_with_indices.default": self._max_pool2d_with_unused_indices,
             "scaled_dot_product_attention.default": self._scaled_dot_product_attention,
             "unbind.int": self._unbind,
             "upsample_bilinear2d.vec": self._upsample_bilinear2d,
