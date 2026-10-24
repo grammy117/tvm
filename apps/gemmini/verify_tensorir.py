@@ -1341,6 +1341,8 @@ def parse_cycle_samples(text, *, case_count, repeats, cycle_limit=None):
 
 
 def run(args):
+    from memory_model import bind_memory_model, confirm_memory_model, runtime_environment
+
     out = args.bundle.resolve(strict=True)
     bundle = json.loads((out / "bundle.json").read_text())
     result = out / (args.name + "-result.json")
@@ -1350,6 +1352,9 @@ def run(args):
     elf = bundle["ELFs"][label]
     bindings = list(bundle["bindings"]) + [elf]
     env = dict(os.environ)
+    memory = None
+    if args.backend == "spike" and getattr(args, "memory_variant_receipt", None):
+        raise ValueError("Memory variants apply only to Verilator")
     if args.backend == "spike":
         from verify_exported_graph import guest_layout
         _, guest_map = guest_layout(bundle.get("guest_memory_bytes", 256 << 20))
@@ -1375,8 +1380,13 @@ def run(args):
         ]
     else:
         receipt = json.loads(args.hardware_receipt.read_text())
-        simulator = receipt["simulator"]
-        bindings.extend([identity(args.hardware_receipt), simulator])
+        memory = bind_memory_model(args.hardware_receipt,
+                                   getattr(args, "memory_variant_receipt", None),
+                                   getattr(args, "firesim_memory_artifact", None),
+                                   getattr(args, "memory_pin_registry", None))
+        simulator = memory["simulator"]
+        bindings.extend(memory["bindings"])
+        env = runtime_environment(memory, env)
         command = [
             simulator["path"],
             "+permissive",
@@ -1412,6 +1422,9 @@ def run(args):
         args.backend, text, code, timed_out, args.negative, bundle["case_count"],
         exact=not any(bundle.get("comparison", {}).get(key, 0) for key in ("rtol", "atol")),
     )
+    confirmation = confirm_memory_model(memory, text) if memory is not None else None
+    if confirmation is not None and not confirmation["model_confirmed"]:
+        passed = False
     timing = None
     timing_error = None
     repeats = bundle.get("timing_repeats", 0)
@@ -1424,7 +1437,7 @@ def run(args):
             timing = {
                 "metric": "target_cycles" if args.backend == "verilator" else "functional_counter",
                 "usable_for_dse": args.backend == "verilator",
-                "scope": "selected_rtl_magic_memory_model" if args.backend == "verilator" else "spike_functional_only",
+                "scope": ("selected_rtl_" + memory["kind"]) if memory else "spike_functional_only",
                 "samples_by_stage": samples,
                 "warmups": 1,
                 "cache_policy": "same buffers after one warmup; no inter-repeat cache flush",
@@ -1448,11 +1461,19 @@ def run(args):
         "performance_qualified": False,
         "timing": timing,
         "timing_error": timing_error,
+        "memory_model": memory,
+        "memory_confirmation": confirmation,
     }
     result.write_text(json.dumps(record, indent=2) + "\n")
     print(json.dumps({"status": record["status"], "receipt": str(result)}))
     if not passed:
         raise SystemExit(1)
+
+
+def validate_run_bounds(seconds, cycles):
+    """Explicit bounded allowance for model-sized chunks; defaults stay small."""
+    if not 1 <= seconds <= 3600 or not 1 <= cycles <= 100_000_000:
+        raise ValueError("Use a bounded run: seconds [1,3600], cycles [1,100000000]")
 
 
 def main():
@@ -1600,14 +1621,18 @@ def main():
     execute.add_argument("--backend", choices=("spike", "verilator"), required=True)
     execute.add_argument("--simulator-receipt", type=Path)
     execute.add_argument("--hardware-receipt", type=Path)
+    from memory_model import add_memory_arguments
+    add_memory_arguments(execute)
     execute.add_argument("--name", required=True)
     execute.add_argument("--negative", action="store_true")
     execute.add_argument("--seconds", type=int, default=60)
     execute.add_argument("--cycles", type=int, default=300000)
     args = parser.parse_args()
     if args.action == "run":
-        if not 1 <= args.seconds <= 180 or not 1 <= args.cycles <= 1000000:
-            parser.error("Use a bounded run: seconds [1,180], cycles [1,1000000]")
+        try:
+            validate_run_bounds(args.seconds, args.cycles)
+        except ValueError as error:
+            parser.error(str(error))
         if args.backend == "spike" and args.simulator_receipt is None:
             parser.error("Spike requires --simulator-receipt")
         if args.backend == "verilator" and args.hardware_receipt is None:

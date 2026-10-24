@@ -264,7 +264,8 @@ def prepare_gemmini_graph_legacy(mod, tile_i=1, tile_j=1, optimize=True, tile_ch
 def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None,
                           *, route="tensorir", capabilities=None, order="ij", schedule_options=None,
                           report=None, bias_preload=True, offload_copies=False, prepack_weights=True,
-                          movement_strategy="rectangular", database=None):
+                          movement_strategy="rectangular", database=None, fusion_level=-1,
+                          eliminate_common_subexpr=False):
     """Prepare Gemmini through mathematical TensorIR; retain explicit legacy mode.
 
     The default route legalizes/fuses ordinary computations before structural
@@ -272,6 +273,10 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
     explicitly selected regression route, never silently ignored.
     """
     if route == "legacy":
+        if eliminate_common_subexpr:
+            raise ValueError("Graph CSE choices require route='tensorir'")
+        if fusion_level != -1:
+            raise ValueError("Graph fusion choices require route='tensorir'")
         if offload_copies:
             raise ValueError("Copy offload choices require route='tensorir'")
         if bias_preload is not True:
@@ -291,7 +296,8 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
                                          order=order, schedule_options=schedule_options, report=report,
                                          bias_preload=bias_preload, offload_copies=offload_copies,
                                          prepack_weights=prepack_weights, movement_strategy=movement_strategy,
-                                         database=database)
+                                         database=database, fusion_level=fusion_level,
+                                         eliminate_common_subexpr=eliminate_common_subexpr)
 
 
 @register_pipeline("gemmini")

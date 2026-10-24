@@ -131,3 +131,42 @@ def test_mapped_elf_audits_metadata_and_instructions_beyond_four_gib(tmp_path):
         assert audit_instructions(data, 0x0b, {2})["instructions"] == 1
         data[code_offset:code_offset + 4] = struct.pack("<I", (2 << 25) | 0x0b)
         assert len(audit_instructions(data, 0x0b, {2})["prohibited_hits"]) == 1
+
+
+def test_primitive_evidence_reads_operator_object_without_shape_metadata(tmp_path):
+    from qualify_package import primitive_references
+    cc = shutil.which("cc")
+    if not cc:
+        pytest.skip("Requires host C compiler")
+    graph = tmp_path / "graph"
+    graph.mkdir()
+    source = graph / "operators.c"
+    source.write_text("extern void tvm_gemmini_compute_ws(void); void op(void){tvm_gemmini_compute_ws();}\n")
+    import subprocess
+    subprocess.run([cc, "-c", str(source), "-o", str(graph / "operators.o")], check=True)
+    evidence = primitive_references(tmp_path, Path(cc))
+    assert "tvm_gemmini_compute_ws" in evidence["symbols"]
+    assert evidence["object"]["sha256"]
+
+
+def test_ws_counter_calls_real_primitive_and_records_it(tmp_path):
+    from qualify_package import WS_COUNTER
+    cc = shutil.which("cc")
+    if not cc:
+        pytest.skip("Requires host C compiler")
+    source = tmp_path / "wrapper.c"
+    source.write_text("#include <stdint.h>\nstatic unsigned computes,real_calls;\n" + WS_COUNTER + """
+void __real_tvm_gemmini_compute_ws(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add){++real_calls;}
+int main(void){__wrap_tvm_gemmini_compute_ws(0,0,0,1,1,1,0);return !(computes==1 && real_calls==1);}
+""")
+    import subprocess
+    subprocess.run([cc, str(source), "-o", str(tmp_path / "check")], check=True)
+    subprocess.run([str(tmp_path / "check")], check=True)
+
+
+def test_chunk_run_bounds_allow_explicit_larger_caps_but_remain_bounded():
+    from verify_tensorir import validate_run_bounds
+    validate_run_bounds(900, 40_000_000)
+    for seconds, cycles in [(0, 1), (3601, 1), (1, 0), (1, 100_000_001)]:
+        with pytest.raises(ValueError, match="bounded run"):
+            validate_run_bounds(seconds, cycles)

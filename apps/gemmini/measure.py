@@ -50,6 +50,7 @@ if str(APP) not in sys.path:
 from baremetal import RV64_TARGET, export_graph  # pylint: disable=wrong-import-position
 from verify_baremetal_cpu import STARTUP, identity  # pylint: disable=wrong-import-position
 from verify_matmul import audit_instructions  # pylint: disable=wrong-import-position
+from memory_model import bind_memory_model, confirm_memory_model, runtime_environment
 
 ROCKET_MARCHID = 1
 GUEST_BASE, GUEST_BYTES = 0x80000000, 0x10000000
@@ -139,6 +140,12 @@ static int compare(unsigned index){
   for(uint64_t i=0;i<n/4;++i){
     union{uint32_t u;float f;}a,e;
     a.u=((const uint32_t*)actual)[i];e.u=((const uint32_t*)expected)[i]^(BAD_ORACLE?UINT32_C(0x40000000):0);
+    /* Reject nonfinite values before tolerance bounds can overflow. */
+    if((a.u&UINT32_C(0x7f800000))==UINT32_C(0x7f800000) ||
+       (e.u&UINT32_C(0x7f800000))==UINT32_C(0x7f800000))return 1;
+    /* BAD_ORACLE has already changed e.u. Valid configured tolerances are
+       nonnegative; preserve the old fallback for other configurations. */
+    if(a.u==e.u && ATOL>=0 && RTOL>=0)continue;
     float tolerance=ATOL+RTOL*(e.f<0?-e.f:e.f);
     if(!(a.f>=e.f-tolerance && a.f<=e.f+tolerance))return 1;
   }
@@ -170,6 +177,18 @@ int main(void){
   return 0;
 }
 """
+
+
+def render_runner(values, timing_policy="legacy"):
+    """Share the checked guest with connected-package measurements."""
+    if timing_policy not in ("legacy", "fixed-warm"):
+        raise ValueError("Unknown timing policy")
+    values = dict(values, ROCKET_MARCHID=ROCKET_MARCHID,
+                  WARM_LIMIT="UINT64_MAX" if timing_policy == "fixed-warm" else WARM_LIMIT)
+    runner = RUNNER
+    for key in sorted(values, key=len, reverse=True):
+        runner = runner.replace(key, str(values[key]))
+    return runner
 
 
 def _aligned(size, alignment=64):
@@ -236,8 +255,31 @@ class OperatorWorkload:
         return json.loads((self.folder / "workload-manifest.json").read_text())
 
 
-def prepare_workload(func, folder, *, seed=0, rtol=1e-5, atol=1e-6):
-    """Generate inputs and run the mathematical function on the host as oracle."""
+def input_binding_identity(func, input_overrides=None):
+    """Validate exact parameter bindings and describe their numerical bytes."""
+    outputs = written_parameters(func)
+    bindings = {}
+    for index, value in (input_overrides or {}).items():
+        if type(index) is not int or index < 0 or index >= len(func.params) or index in outputs:
+            raise ValueError("Input binding must name a read-only parameter index")
+        buffer = func.buffer_map[func.params[index]]
+        array = np.asarray(value)
+        if array.shape != tuple(int(x) for x in buffer.shape) or array.dtype.name != buffer.dtype:
+            raise ValueError("Input binding shape/dtype differs from the mathematical workload")
+        bindings[str(index)] = {"shape": list(array.shape), "dtype": array.dtype.name,
+                                "sha256": hashlib.sha256(array.tobytes()).hexdigest()}
+    return bindings
+
+
+def prepare_workload(func, folder, *, seed=0, rtol=1e-5, atol=1e-6,
+                     input_overrides=None, input_provenance=None):
+    """Generate unbound inputs and evaluate unscheduled mathematical TIR.
+
+    Lifted immutable graph constants and supplied boundary activations retain
+    their exact bytes. Randomizing a divisor or other domain constraint can
+    make an otherwise legal extracted operator undefined.
+    """
+    bound_inputs = input_binding_identity(func, input_overrides)
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     outputs = written_parameters(func)
@@ -250,8 +292,12 @@ def prepare_workload(func, folder, *, seed=0, rtol=1e-5, atol=1e-6):
         shape = [int(x) for x in buffer.shape]
         if index in outputs:
             arrays.append(np.zeros(shape, buffer.dtype))
+        elif input_overrides is not None and index in input_overrides:
+            arrays.append(np.array(input_overrides[index], copy=True))
         else:
             arrays.append(random_array(shape, buffer.dtype, rng))
+    from operator_inputs import check_integer_divisors
+    check_integer_divisors(func, [None if i in outputs else array for i, array in enumerate(arrays)])
     reference = tvm.build(tvm.IRModule({"main": func.with_attr("global_symbol", "main")}), "llvm")
     devices = [tvm.nd.array(array) for array in arrays]
     reference["main"](*devices)
@@ -277,6 +323,8 @@ def prepare_workload(func, folder, *, seed=0, rtol=1e-5, atol=1e-6):
         "inputs_sha256": hashlib.sha256((folder / "inputs.bin").read_bytes()).hexdigest(),
         "expected_sha256": hashlib.sha256((folder / "expected.bin").read_bytes()).hexdigest(),
     }
+    if bound_inputs or input_provenance is not None:
+        manifest.update(bound_inputs=bound_inputs, input_provenance=input_provenance)
     (folder / "workload-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return OperatorWorkload(folder, inputs, expected, outputs, rtol, atol)
 
@@ -295,6 +343,10 @@ class Toolchain:
     adapter_receipt: Path
     spike_receipt: Path
     hardware_receipt: Path
+    memory_variant_receipt: Path | None = None
+    firesim_memory_artifact: str | None = None
+    memory_pin_registry: Path | None = None
+    timing_policy: str = "legacy"
 
     @property
     def adapter(self):
@@ -305,7 +357,12 @@ class Toolchain:
         return obj, receipt
 
     def as_json(self):
-        return {key: str(value) for key, value in self.__dict__.items()}
+        return {key: str(value) if isinstance(value, Path) else value
+                for key, value in self.__dict__.items()}
+
+    def memory_configuration(self):
+        return bind_memory_model(self.hardware_receipt, self.memory_variant_receipt,
+                                 self.firesim_memory_artifact, self.memory_pin_registry)
 
     def provenance(self):
         """Verify the actual executable bytes against the retained qualifications."""
@@ -331,14 +388,21 @@ class Toolchain:
                                ("plugin", spike["plugin_sha256"])):
             if identities[name]["sha256"] != expected:
                 raise ValueError(f"{name} differs from its qualification receipt")
+        memory = self.memory_configuration()
+        if self.memory_variant_receipt:
+            identities["base_simulator"] = identities["simulator"]
+            identities["simulator"] = memory["simulator"]
         return {"hardware": hardware["hardware"], "binaries": identities,
+                "memory_model": memory, "timing_policy": self.timing_policy,
                 "adapter_sources": adapter["source_set"],
                 "receipts": [identity(p) for p in (self.hardware_receipt, self.spike_receipt,
                                                   self.adapter_receipt)]}
 
     @classmethod
     def from_json(cls, value):
-        return cls(**{key: Path(item) for key, item in value.items()})
+        return cls(**{key: Path(item) if item is not None and key not in
+                     ("firesim_memory_artifact", "timing_policy") else item
+                      for key, item in value.items()})
 
 
 def _relax_graph(func):
@@ -416,9 +480,7 @@ def build_candidate(mod, workload_folder, folder, toolchain, *, timeout=300):
         "WARM_LIMIT": WARM_LIMIT,
         "ROCKET_MARCHID": ROCKET_MARCHID,
     }
-    runner = RUNNER
-    for key in sorted(values, key=len, reverse=True):
-        runner = runner.replace(key, str(values[key]))
+    runner = render_runner(values, toolchain.timing_policy)
     (folder / "runner.c").write_text(runner)
     (folder / "start.S").write_text(STARTUP)
     (folder / "link.ld").write_text(LINKER)
@@ -471,6 +533,8 @@ def build_candidate(mod, workload_folder, folder, toolchain, *, timeout=300):
         "compiler": identity(tvm._ffi.base._LIB._name),
         "runner_sha256": hashlib.sha256((folder / "runner.c").read_bytes()).hexdigest(),
         "adapter_sha256": receipt["object_sha256"],
+        "timing_policy": toolchain.timing_policy,
+        "memory_model": toolchain.memory_configuration(),
     }
     (folder / "artifact.json").write_text(json.dumps(artifact, indent=2) + "\n")
     return artifact
@@ -503,10 +567,22 @@ def _parse_cycles(text):
     return None
 
 
-def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, spike_seconds=900):
+def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, spike_seconds=900,
+                  rtl_seconds=None):
     """Spike positive and wrong-oracle checks, then RTL timing of the positive ELF."""
     folder = Path(artifact["folder"])
-    record = {"folder": str(folder)}
+    memory = toolchain.memory_configuration()
+    if artifact.get("memory_model", {}).get("fingerprint", memory["fingerprint"]) != memory["fingerprint"]:
+        raise ValueError("Candidate memory model differs from this measurement campaign")
+    if toolchain.memory_variant_receipt and "memory_model" not in artifact:
+        raise ValueError("FASED candidate must bind its memory model before measurement")
+    if artifact.get("timing_policy", "legacy") != toolchain.timing_policy:
+        raise ValueError("Candidate timing policy differs from this measurement campaign")
+    for elf in artifact["elfs"].values():
+        if identity(elf["path"])["sha256"] != elf["sha256"]:
+            raise ValueError("Candidate ELF changed after compilation")
+    record = {"folder": str(folder), "memory_model": memory,
+              "timing_policy": toolchain.timing_policy}
     started = time.monotonic()
     code, text = _spike(artifact["elfs"]["valid"]["path"], toolchain, timeout=spike_seconds)
     (folder / "spike-valid.log").write_text(text)
@@ -519,26 +595,37 @@ def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, sp
         record.update(status="spike_negative_not_detected", returncode=code)
         return record
     record["spike_seconds"] = time.monotonic() - started
-    hardware = json.loads(toolchain.hardware_receipt.read_text())
-    simulator = hardware["simulator"]["path"]
+    simulator = memory["simulator"]["path"]
     elf = artifact["elfs"]["valid"]["path"]
     command = [simulator, "+permissive", f"+max-cycles={int(max_cycles)}", f"+loadmem={elf}", "+permissive-off", elf]
     log = folder / "rtl-timing.log"
     started = time.monotonic()
-    wall = 60 + max_cycles / cycles_per_second
+    wall = rtl_seconds if rtl_seconds is not None else 60 + max_cycles / cycles_per_second
+    if wall <= 0:
+        raise ValueError("RTL wall limit must be positive")
     with log.open("wb") as stream:
         try:
-            process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=wall)
+            process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=wall,
+                                     env=runtime_environment(memory))
             code = process.returncode
         except subprocess.TimeoutExpired:
             code = None
     text = log.read_text(errors="replace")
     record["rtl_seconds"] = time.monotonic() - started
+    confirmation = confirm_memory_model(memory, text)
+    record.update(memory_confirmation=confirmation, command=command, wall_limit_seconds=wall,
+                  cycle_cap=int(max_cycles), rtl_log=identity(log))
+    if not confirmation["model_confirmed"]:
+        record.update(status="memory_model_not_confirmed", returncode=code)
+        return record
     cycles = _parse_cycles(text)
     if code != 0 or cycles is None or "Verilog $finish" not in text or "DSE_PASS" not in text:
         record.update(status="rtl_timeout_or_failure", returncode=code, cycle_cap=int(max_cycles))
         return record
     first, second = cycles
+    if toolchain.timing_policy == "fixed-warm" and not second:
+        record.update(status="missing_fixed_warm_measurement", returncode=code)
+        return record
     record.update(
         status="passed",
         cycles=second or first,
@@ -557,6 +644,7 @@ def run_negative_rtl(artifact, toolchain, *, max_cycles=6_000_000):
     if identity(elf["path"])["sha256"] != elf["sha256"]:
         raise ValueError("Wrong-oracle ELF changed after compilation")
     provenance = toolchain.provenance()
+    memory = provenance["memory_model"]
     simulator = provenance["binaries"]["simulator"]["path"]
     command = [simulator, "+permissive", f"+max-cycles={max_cycles}",
                f"+loadmem={elf['path']}", "+permissive-off", elf["path"]]
@@ -565,16 +653,18 @@ def run_negative_rtl(artifact, toolchain, *, max_cycles=6_000_000):
     with log.open("wb") as stream:
         try:
             process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT,
-                                     timeout=60 + max_cycles / 1500)
+                                     timeout=60 + max_cycles / 1500, env=runtime_environment(memory))
             code = process.returncode
         except subprocess.TimeoutExpired:
             code = None
     text = log.read_text(errors="replace")
-    detected = (code not in (None, 0) and "TENSORIR_NUMERICAL_FAILURE" in text
+    confirmation = confirm_memory_model(memory, text)
+    detected = (confirmation["model_confirmed"] and code not in (None, 0) and "TENSORIR_NUMERICAL_FAILURE" in text
                 and _parse_cycles(text) is not None and "(timeout)" not in text)
     record = {"status": "passed" if detected else "negative_not_detected",
               "returncode": code, "elf": elf, "log": identity(log), "command": command,
               "wall_seconds": time.monotonic() - started,
+              "memory_confirmation": confirmation,
               "hardware_provenance": provenance}
     (folder / "rtl-negative.json").write_text(json.dumps(record, indent=2) + "\n")
     return record

@@ -22,6 +22,7 @@ The resulting archive needs a board-specific startup/loader and final ELF audit.
 """
 
 import argparse
+from dataclasses import replace
 import hashlib
 import json
 import mmap
@@ -35,9 +36,10 @@ from tvm._ffi.base import _LIB
 from tvm.relax.backend.contrib.gemmini import prepare_gemmini_graph
 from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
 from tvm.relax.backend.contrib.gemmini_search import open_gemmini_database
-from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_workloads
 
 from program_io import import_program
+from package_audit import audit_graph
+from graph_plans import GraphPlan
 from tuning_preset import materialize_preset
 from baremetal import export_graph, RV64_TARGET
 from verify_baremetal_cpu import identity
@@ -96,6 +98,71 @@ def verify_package(folder):
     return document
 
 
+def prepare_tuning_databases(primary_path, fallback_path, output, prepared, *,
+                             capabilities=None, require_primary_match=True):
+    """Copy validated databases and query stock first-match precedence.
+
+    Fallback costs never compete with primary costs and are not promoted to
+    current measurements. The retained selection manifest names each source.
+    """
+    caps = capabilities or GemminiCapabilities()
+    if primary_path is None:
+        raise ValueError("A fallback tuning database requires a primary tuning database")
+    databases = []
+    sources = []
+    for role, path, destination in (
+        ("primary", primary_path, "database"),
+        ("fallback", fallback_path, "fallback-database"),
+    ):
+        if path is None:
+            continue
+        folder = Path(output) / destination
+        folder.mkdir()
+        for name in ("database_workload.json", "database_tuning_record.json"):
+            shutil.copy2(Path(path) / name, folder / name)
+        for name in ("measurement-context.json", "preset.json"):
+            if (Path(path) / name).is_file():
+                shutil.copy2(Path(path) / name, folder / name)
+        database = open_gemmini_database(folder, prepared, capabilities=caps)
+        records = database.get_all_tuning_records()
+        if not records:
+            raise ValueError(f"{role.title()} tuning database contains no measurements")
+        for record in records:
+            if str(record.target) != str(caps.target()):
+                raise ValueError(f"{role.title()} tuning database target does not match Gemmini capabilities")
+            schedule = tvm.tir.Schedule(record.workload.mod)
+            record.trace.apply_to_schedule(schedule, remove_postproc=False)
+        databases.append(database)
+        sources.append({"role": role, "directory": destination, "records": len(records),
+                        "files": [{"path": str(item.relative_to(output)), "sha256": digest(item)}
+                                  for item in sorted(folder.glob("*.json"))]})
+    tasks = tvm.meta_schedule.relax_integration.extract_tasks(prepared, caps.target())
+    selections = []
+    for task in tasks:
+        row = {"task": task.task_name, "weight": int(task.weight), "source": None}
+        for database, source in zip(databases, sources):
+            record = database.query_tuning_record(task.dispatched[0], caps.target(), "main")
+            if record is not None:
+                row.update(source=source["role"], database=source["directory"],
+                           trace_sha256=hashlib.sha256(
+                               tvm.ir.save_json(record.trace.as_json()).encode()).hexdigest(),
+                           fallback_cost_is_current_measurement=False)
+                break
+        selections.append(row)
+    if require_primary_match and not any(row["source"] == "primary" for row in selections):
+        raise ValueError("Primary tuning database does not match any function in this program")
+    selection = {"schema": "gemmini_ordered_database_selection_v1", "sources": sources,
+                 "precedence": [source["role"] for source in sources], "tasks": selections,
+                 "cross_database_cost_comparison": False,
+                 "fallback_labels_promoted_to_current_measurements": False,
+                 "fallback_timing_qualified_for_current_memory_model": False,
+                 "fallback_hardware_qualification_inherited": False,
+                 "scope": "Compile-time trace selection; connected latency requires fresh measurement"}
+    database = (databases[0] if len(databases) == 1 else
+                tvm.meta_schedule.database.OrderedUnionDatabase(*databases))
+    return database, selection
+
+
 def compile_package(args):
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -133,9 +200,20 @@ def compile_package(args):
     if adapter["headers"]["include/gemmini_params.h"]["sha256"] != caps.params_sha256:
         raise ValueError("Adapter capability header mismatch")
     mod = import_program(args.program)
+    plan = GraphPlan.from_args(args)
+    if args.cpu_only:
+        plan = replace(plan, prepack_weights=False, bias_preload=False)
+    graph_trace = plan.trace(mod)
+    prepared = graph_trace.out_mod
+    (out / "graph-plan.json").write_text(
+        json.dumps(plan.identity(mod, prepared, trace=graph_trace), indent=2) + "\n"
+    )
     database = None
     database_path = getattr(args, "tuning_database", None)
+    fallback_database_path = getattr(args, "fallback_tuning_database", None)
     preset_name = getattr(args, "tuning_preset", None)
+    if fallback_database_path is not None and database_path is None:
+        raise ValueError("A fallback tuning database requires an explicit primary tuning database")
     if preset_name and (database_path is not None or args.cpu_only):
         raise ValueError("Tuning preset requires an accelerator build without another database")
     if preset_name:
@@ -145,28 +223,26 @@ def compile_package(args):
             raise ValueError("CPU-only build cannot accept a tuning database")
         # Carry the standard records in the relocatable package. Replay and
         # workload matching belong to MetaScheduleApplyDatabase, not this CLI.
-        destination = out / "database"
-        destination.mkdir()
-        for name in ("database_workload.json", "database_tuning_record.json"):
-            shutil.copy2(database_path / name, destination / name)
-        prepared, _, _ = prepare_gemmini_tensorir_workloads(mod)
-        database = open_gemmini_database(destination, prepared, capabilities=caps)
-        records = database.get_all_tuning_records()
-        if not records:
-            raise ValueError("Tuning database contains no measurements")
-        if any(str(record.target) != str(caps.target()) for record in records):
-            raise ValueError("Tuning database target does not match Gemmini capabilities")
+        database, database_selection = prepare_tuning_databases(
+            database_path, fallback_database_path, out, prepared,
+            capabilities=caps, require_primary_match=not preset_name)
+        (out / "database-selection.json").write_text(
+            json.dumps(database_selection, indent=2) + "\n")
     report = []
     if args.cpu_only:
-        selected, _, _ = prepare_gemmini_tensorir_workloads(
-            mod, bias_preload=False, prepack_weights=False
-        )
+        selected = prepared
     else:
-        selected = prepare_gemmini_graph(mod, report=report, database=database)
+        selected = prepare_gemmini_graph(mod, report=report, database=database,
+                                        **plan.preparation_options)
         if database is not None and not preset_name and not any(
             row.get("origin") == "TVM MetaSchedule database" for row in report
         ):
             raise ValueError("Tuning database does not match any function in this program")
+        if database is not None:
+            by_task = {row["task"]: row["source"] for row in database_selection["tasks"]}
+            for row in report:
+                if row.get("origin") == "TVM MetaSchedule database":
+                    row["database_source"] = by_task.get(row["function"])
     graph = out / "graph"
     manifest = export_graph(
         selected, graph, target=RV64_TARGET, memory_limit_bytes=args.tensor_memory_bytes
@@ -258,6 +334,9 @@ def compile_package(args):
         raise ValueError("FireSim target and compiler capability profiles disagree")
     (out / "firesim_target.json").write_text(json.dumps(profile, indent=2) + "\n")
     (out / "placement.json").write_text(json.dumps(report, indent=2) + "\n")
+    (out / "memory-audit.json").write_text(
+        json.dumps(audit_graph(manifest, report, caps), indent=2) + "\n"
+    )
     source = Path(tvm.__file__).resolve().parent
     source_bindings = [
         identity(_LIB._name),
@@ -278,6 +357,8 @@ def compile_package(args):
     )
     if database_path is not None:
         source_bindings.extend(identity(path) for path in sorted((out / "database").glob("*.json")))
+    if fallback_database_path is not None:
+        source_bindings.extend(identity(path) for path in sorted((out / "fallback-database").glob("*.json")))
     (out / "build.json").write_text(
         json.dumps(
             {
@@ -307,7 +388,10 @@ def compile_package(args):
         if args.cpu_only
         else "CPU copies; exact supported arithmetic; measured overrides when supplied",
         "tuning_database": "database" if database is not None else None,
+        "fallback_tuning_database": "fallback-database" if fallback_database_path is not None else None,
+        "database_selection": "database-selection.json" if database is not None else None,
         "tuning_preset": preset_name,
+        "graph_plan": "graph-plan.json",
         "tuned_functions": [row["function"] for row in report
                             if row.get("origin") == "TVM MetaSchedule database"],
         "unmeasured_placement_is_provisional": any(
@@ -352,11 +436,21 @@ def main():
     parser.add_argument("--riscv-gcc", type=Path)
     parser.add_argument("--adapter-receipt", type=Path)
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--graph-fusion-level", type=int, choices=(-1, 0, 1, 2, 3), default=-1,
+                        help="Relax fusion alternative before inner schedule search; default follows PassContext")
+    parser.add_argument("--no-prepack-weights", action="store_false", dest="prepack_weights",
+                        help="Compare unpacked constant operands without changing model arithmetic")
+    parser.add_argument("--graph-cse", action="store_true",
+                        help="Use stock Relax common-subexpression elimination before legalization")
+    parser.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=True,
+                        help="Retain the mathematical bias epilogue instead of canonicalizing preload")
     parser.add_argument("--tensor-memory-bytes", type=int, default=64 << 20)
     tuning = parser.add_mutually_exclusive_group()
     tuning.add_argument("--tuning-database", type=Path, help="Standard MetaSchedule JSONDatabase directory")
     tuning.add_argument("--tuning-preset", choices=["rtl-v1"],
                         help="Apply shipped RTL winners where structurally matching; report fallbacks")
+    parser.add_argument("--fallback-tuning-database", type=Path,
+                        help="Optional frozen JSONDatabase used only where the explicit primary has no match")
     args = parser.parse_args()
     if args.verify:
         verify_package(args.verify)

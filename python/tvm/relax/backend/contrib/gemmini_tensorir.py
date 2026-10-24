@@ -606,20 +606,31 @@ class ScheduleGemminiTensorIR:
 
 
 def prepare_gemmini_tensorir_workloads(
-    mod, *, optimize=True, bias_preload=True, prepack_weights=True
+    mod, *, optimize=True, bias_preload=True, prepack_weights=True, fusion_level=-1,
+    eliminate_common_subexpr=False
 ):
     """Expose the same mathematical workloads used by compile and DSE paths."""
     from tvm import relax  # pylint: disable=import-outside-toplevel
 
     if type(optimize) is not bool:
         raise ValueError("optimize must be a boolean")
+    if type(fusion_level) is not int or fusion_level not in (-1, 0, 1, 2, 3):
+        raise ValueError("fusion_level must be -1 (PassContext) or an integer from 0 to 3")
+    if not optimize and fusion_level != -1:
+        raise ValueError("Explicit fusion_level requires optimize=True")
+    if type(eliminate_common_subexpr) is not bool:
+        raise ValueError("eliminate_common_subexpr must be a boolean")
+    if eliminate_common_subexpr:
+        if not optimize:
+            raise ValueError("Graph CSE requires optimize=True")
+        mod = relax.transform.EliminateCommonSubexpr()(mod)
     passes = [relax.transform.LegalizeOps(), relax.transform.AnnotateTIROpPattern()]
     if optimize:
         passes.extend(
             [
                 relax.transform.FoldConstant(),
                 relax.transform.CanonicalizeBindings(),
-                relax.transform.FuseOps(),
+                relax.transform.FuseOps(fuse_opt_level=fusion_level),
                 relax.transform.FuseTIR(),
                 relax.transform.RewriteDataflowReshape(),
                 relax.transform.DeadCodeElimination(),
@@ -665,6 +676,8 @@ def prepare_gemmini_tensorir_graph(
     prepack_weights=True,
     movement_strategy="rectangular",
     database=None,
+    fusion_level=-1,
+    eliminate_common_subexpr=False,
 ):
     """Use normal mathematical legalization/fusion before Gemmini scheduling.
 
@@ -675,7 +688,8 @@ def prepare_gemmini_tensorir_graph(
     from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
 
     mod, references, normalizations = prepare_gemmini_tensorir_workloads(
-        mod, optimize=optimize, bias_preload=bias_preload, prepack_weights=prepack_weights
+        mod, optimize=optimize, bias_preload=bias_preload, prepack_weights=prepack_weights,
+        fusion_level=fusion_level, eliminate_common_subexpr=eliminate_common_subexpr,
     )
     database = database if database is not None else tvm.meta_schedule.Database.current()
     if database is not None:

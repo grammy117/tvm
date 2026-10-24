@@ -23,6 +23,7 @@ bundle for local execution. A final FireSim loader/DRAM/driver check is separate
 import argparse
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import struct
 
@@ -32,6 +33,31 @@ from compile_package import verify_package, FLAGS, digest
 from verify_baremetal_cpu import STARTUP, GUEST_BASE, STACK_BYTES, identity
 from verify_matmul import audit_instructions
 from verify_tensorir import GUEST, TIMING_GUEST, fixture_guest
+
+
+WS_COUNTER = r"""
+void __real_tvm_gemmini_compute_ws(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
+void __wrap_tvm_gemmini_compute_ws(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
+  ++computes;__real_tvm_gemmini_compute_ws(a,b,c,m,n,k,add);
+}
+"""
+
+
+def primitive_references(package, gcc):
+    """Read actual compiled operator references, including database-scheduled TIR.
+
+    A replayed schedule need not retain the old mathematical m/n/k metadata.
+    The adapter archive defines all primitives, so inspect operators.o instead.
+    """
+    name = subprocess.check_output([str(gcc), "-print-prog-name=nm"], text=True).strip()
+    resolved = shutil.which(name)
+    if resolved is None:
+        raise ValueError("Compiler's nm tool is unavailable: " + name)
+    nm = Path(resolved).resolve(strict=True)
+    obj = Path(package) / "graph/operators.o"
+    output = subprocess.check_output([str(nm), "-u", str(obj)], text=True)
+    symbols = sorted({line.split()[-1] for line in output.splitlines() if line.split()})
+    return {"symbols": symbols, "object": identity(obj), "nm": identity(nm)}
 
 
 def elf_memory(data, guest_bytes):
@@ -103,7 +129,11 @@ def prepare(args):
     report = json.loads((package / "placement.json").read_text())
     native = [row for row in report if row["placement"] == "gemmini"]
     scaled = any(row.get("metadata", {}).get("readout_fused") for row in native)
-    has_array = any("k" in row.get("metadata", {}) for row in native)
+    primitive_evidence = primitive_references(package, args.riscv_gcc.resolve(strict=True))
+    symbols = set(primitive_evidence["symbols"])
+    has_array = bool(symbols & {"tvm_gemmini_compute", "tvm_gemmini_compute_ws"})
+    has_ws = "tvm_gemmini_compute_ws" in symbols
+    bindings.extend([primitive_evidence["object"], primitive_evidence["nm"]])
     declarations, checks = fixture_guest(
         0,
         inputs,
@@ -130,7 +160,7 @@ def prepare(args):
         f"TENSORIR_PASS cases=1 exact={int(not (args.rtol or args.atol))} guards=1 primitives=1"
     )
     text = (
-        GUEST
+        GUEST + (WS_COUNTER if has_ws else "")
         + TIMING_GUEST
         + "\n"
         + "\n".join(declarations)
@@ -178,6 +208,8 @@ def prepare(args):
                 "tvm_gemmini_dma_scaled_out",
             )
         ]
+        if has_ws:
+            cmd.append("-Wl,--wrap=tvm_gemmini_compute_ws")
         cmd += [
             f"-DBAD_ORACLE={negative}",
             str(out / "start.S"),
@@ -216,6 +248,7 @@ def prepare(args):
         "cases": ["package"],
         "placements": {"package": "gemmini" if native else "host"},
         "scheduling": {"package": report},
+        "primitive_evidence": primitive_evidence,
         "capabilities": document["capability_fingerprint"],
         "timing_repeats": args.timing_repeats,
         "comparison": {"rtol": args.rtol, "atol": args.atol, "integer": "exact"},
