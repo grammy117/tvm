@@ -14,6 +14,16 @@ intrinsic families and probabilistic schedule decisions illustrated by the
 [RVV MetaSchedule work](https://arxiv.org/abs/2507.01457). Their published speedups
 are not evidence for Gemmini performance.
 
+The per-workload preparation and connected-chunk measurement workflow is in
+[WORKLOAD_TUNING.md](WORKLOAD_TUNING.md). The FASED follow-up remeasures current
+records and new candidates with confirmed 30/30/16/16 latency-pipe memory and a
+fixed warm interval. Stock Relax choices expose fusion, packing, bias preload and
+CSE; complete chunk measurements select those graph choices. Validated operator
+records remain reusable through exact structural matching, with separate profiles
+for each program/phase and explicit misses. No model-name compiler dispatch or
+cross-function SRAM residency is introduced. The validated FASED records ship as
+the `fased-v1` preset next to `rtl-v1`.
+
 ## What is stock TVM and what is target-specific
 
 The portable `rtl-v1` preset in `apps/gemmini/presets/` retains the nine verified

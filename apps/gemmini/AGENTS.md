@@ -12,6 +12,14 @@ those full-model runs already passed.
 Select `--tuning-preset rtl-v1` for static compilation and inspect actual structural
 coverage; the preset cannot promise measured winners for every new EL4 operation.
 
+The follow-up in `WORKLOAD_TUNING.md` and Merlin `FASED_SWEEPS.md` uses explicit
+latency-pipe Verilator receipts and fixed-warm timing. Keep its fresh databases
+separate from historical magic-memory labels. `tune_chunk.py` enumerates stock
+Relax graph traces; `tuning_library.py` validates actual record/trace/ELF evidence
+before reuse. Preserve per-phase graph choices and partial coverage. Cross-function
+SRAM residency remains unsupported; chunk passes do not resolve the historical
+complete TinyLlama numerical failure or qualify a FireSim deployment.
+
 ## Source and evidence
 
 - Apache upstream is v0.19.0 `c4dc0c29ff81ddae688da24625a603da3b4a2c0e`.
@@ -64,8 +72,9 @@ coverage; the preset cannot promise measured winners for every new EL4 operation
 6. Adapt TVM's session manifest/UART to the current EL4 chain transport with real
    package/source/route/reference bindings. The native retained-object chain
    builder already exists, but its memref ABI is different from TVM's pointer
-   array ABI. Do not rename schemas or invent native build receipts. Add per-stage
-   counters alongside the aggregate warm/measured interval.
+   array ABI. Do not rename schemas or invent native build receipts. Use the companion
+   session builder's `--profile-stages` alongside aggregate warm/measured timing;
+   record counter overhead and keep final uninstrumented comparisons.
 7. Bind matching FireSim driver/image/loader identities and the full memory range.
    Follow FIRESIM.md: strict staging/manager installation, lightweight boot-file
    evidence or legacy full-array transport are distinct modes. The supplied

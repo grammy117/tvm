@@ -16,10 +16,22 @@ stock TVM MetaSchedule and its JSONDatabase. Hardware matmul/conv loop engines
 are forbidden. Primitive OS and WS schedules, checked software pipelining,
 rectangular tails, SRAM reuse, bias preload and proved readout fusion are present.
 
+The workload-tuning branch adds explicit FASED latency-pipe measurements,
+fixed one-warmup/one-measured timing, and stock Relax graph-choice traces for
+fusion level, constant packing, bias preload and common-subexpression elimination
+(32 generic alternatives; the measured subset follows the experiment budget).
+Per-operator MetaSchedule records remain
+reusable through structural matching; connected-chunk timing selects graph
+choices separately for each workload/phase. This does not add cross-function
+SRAM residency. See [WORKLOAD_TUNING.md](WORKLOAD_TUNING.md) and the companion
+Merlin `FASED_SWEEPS.md` for the parallel three-workload campaign and its limits.
+
 Start with:
 
 - [OWNERSHIP.md](OWNERSHIP.md): complete lowering responsibilities, custom passes,
   optimization ownership chart and audit of changes from Apache TVM v0.19.0.
+- [WORKLOAD_TUNING.md](WORKLOAD_TUNING.md): per-workload operator/connected chunks,
+  current knob coverage, memory audits and later isolated Verilator campaigns.
 - [TUNING.md](TUNING.md): search space, stock versus supplied components,
   measurement contracts, real-program intake and next tuning work.
 - [FIRESIM.md](FIRESIM.md): package ABI, functional gates, hardware binding and
@@ -36,7 +48,9 @@ Start with:
 | `tune_models.py --program … --extract-only` | Inventory all tasks of a real `.pt2` or semantic Relax JSON program | Compilation, model quality or device execution |
 | `tune_models.py --program …` | Measure eligible operators and tune CPU/Gemmini placement | Complete session latency or correctness |
 | `tune_models.py --model …` | Synthetic model-shaped operator study | Actual checkpoint execution |
-| `compile_package.py` | Static archive, constants, ABI, placement and memory manifests; optional standard tuning database | Final platform boot or timing |
+| `tune_chunk.py` | Measure compiler graph alternatives on a complete connected chunk with confirmed FASED memory | Cross-call SRAM residency or complete-model qualification |
+| `tuning_library.py` | Validate fresh record evidence, merge compatible operator databases, report structural coverage | A matching operator record does not establish a connected-graph speedup |
+| `compile_package.py` | Static archive, constants, ABI, placement and memory manifests; optional standard tuning database or shipped preset (`rtl-v1`, `fased-v1`) with an ordered fallback | Final platform boot or timing |
 | `qualify_package.py` | Link archive with independent fixture and positive/wrong-oracle guests | FireSim deployment readiness |
 | `qualify_tuning_package.py` | Check a representative operator linked from the delivered archive | All operators or full-model quality |
 | `verify_tensorir.py run` | Functional Spike or selected Verilator execution | FireSim performance |
@@ -77,8 +91,8 @@ Current EL4 already implements native complete-chain images, compact comparison
 of every output element, strict version-pinned upload/manager tools and a
 lightweight actual-boot-file verification mode. TVM's package-session bridge has
 different ABI/manifest/UART contracts and needs an explicit adapter to use these
-paths. It provides aggregate warm/measured timing; per-stage timing remains to be
-added. The current audit passes 218 TVM backend/CLI tests. Companion model tests
+paths. It provides aggregate warm/measured timing; the companion Merlin
+session builder adds optional buffered stage timing via `--profile-stages`. The current audit passes 218 TVM backend/CLI tests. Companion model tests
 also expose AVX512 environment requirements and a LeRobot/diffusers/TorchAO
 dependency conflict; see the Merlin audit rather than assuming a fully validated
 three-model environment. No full-model FireSim result is inferred.

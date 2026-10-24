@@ -7,6 +7,17 @@ unsupported arithmetic and materialized copies use the CPU. It does not launch
 FireSim or allocate a board. The qualification boundary and current entrypoints are in
 [README.md](README.md); lowering ownership is in [OWNERSHIP.md](OWNERSHIP.md).
 
+For the next FireSim compilation, apply the shipped FASED-measured records with
+`compile_package.py --tuning-preset fased-v1 --fallback-tuning-preset rtl-v1`.
+`fased-v1` holds 16 operator records measured under the FASED latency-pipe
+memory model; `rtl-v1` supplies traces only where `fased-v1` has no structural
+match. Add `--graph-cse` for TinyLlama stages: it shared repeated quantization
+work and cut a connected K/V region's warm cycles by 25.95%. The companion Merlin
+`FASED_SWEEPS.md` records the bounded three-workload results. These are chunk
+measurements; read each package's `database-selection.json` and `placement.json`
+for actual coverage on the exported stages. A matching latency-pipe policy alone
+does not qualify a new bitstream or establish same-ELF FireSim agreement.
+
 ## Compile and link a reviewable result
 
 Use the pinned TVM Python/compiler-library environment and RV64 GCC recorded in
@@ -209,9 +220,10 @@ path is not a TVM whole-model executor.
    repeated invocation. Never add operator minima and call the sum measured E2E.
 
 The TVM package-session bridge already emits one warm and one measured full
-invocation in one boot, with state reset and aggregate cycle windows. It still
-needs per-stage counters and configurable counts for any different repetition
-policy. The native chain's stage counters exclude descriptor preparation and
+invocation in one boot, with state reset and aggregate cycle windows. The companion
+Merlin session builder adds `--profile-stages`: counters are buffered and printed after
+validation, with instrumentation overhead recorded. Configurable counts are still
+needed for any different repetition policy. The native chain's stage counters exclude descriptor preparation and
 input transfers, so their sum is not whole-chain E2E latency. Retain both scopes.
 Generic `qualify_package.py` HTIF guests/operator harnesses do not establish
 complete-session execution by printing a pass marker.
