@@ -34,6 +34,7 @@ from chunk_measure import build_chunk
 from compile_package import digest
 from graph_plans import GraphPlan, plans
 from measure import Toolchain, run_candidate
+from tuning_preset import PRESET_NAMES
 from verify_baremetal_cpu import identity
 
 APP = Path(__file__).resolve().parent
@@ -192,7 +193,7 @@ def main():
     parser.add_argument("--tuning-database", type=Path)
     parser.add_argument("--fallback-tuning-database", type=Path,
                         help="Frozen traces for primary-library misses; costs are not fresh labels")
-    parser.add_argument("--tuning-preset", choices=("rtl-v1", "none"), default="rtl-v1",
+    parser.add_argument("--tuning-preset", choices=(*PRESET_NAMES, "none"), default="rtl-v1",
                         help="Initial records, or none for an unseeded/default graph control")
     args = parser.parse_args()
     if args.tuning_preset == "none":

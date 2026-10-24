@@ -66,3 +66,16 @@ def test_union_preset_replays_smoke_but_does_not_match_new_prefill_shape(tmp_pat
     prepare_gemmini_graph(mod, report=report, database=database)
     assert report
     assert not any(row.get("origin") == "TVM MetaSchedule database" for row in report)
+
+
+def test_fased_preset_is_portable_and_binds_its_memory_model(tmp_path):
+    caps = GemminiCapabilities()
+    folder = materialize_preset("fased-v1", tmp_path / "fased", capabilities=caps)
+    manifest = json.loads((folder / "preset.json").read_text())
+    # Records must stay relocatable: provenance is hashes, never machine paths.
+    assert "/home/" not in (folder / "preset.json").read_text()
+    assert manifest["memory_model"]["knobs"] == {
+        "max_reads": 16, "max_writes": 16, "read_latency": 30, "write_latency": 30}
+    assert manifest["historical_costs_imported"] is False
+    database = open_gemmini_database(folder, tvm.IRModule(), capabilities=caps)
+    assert len(database.get_all_tuning_records()) == len(manifest["records"]) == 16

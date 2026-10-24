@@ -20,10 +20,14 @@ import json
 from pathlib import Path
 import shutil
 
+# rtl-v1: historical magic-memory RTL winners. fased-v1: fresh records measured
+# under the FASED latency-pipe memory model. Both share one capability profile.
+PRESET_NAMES = ("rtl-v1", "fased-v1")
+
 
 def materialize_preset(name, destination, *, capabilities, root=None):
     """Copy reviewed records; stock TVM remains responsible for matching/replay."""
-    if name != "rtl-v1":
+    if name not in PRESET_NAMES:
         raise ValueError("Unknown tuning preset: " + name)
     source = (Path(root) if root is not None else Path(__file__).parent / "presets") / name
     manifest = json.loads((source / "preset.json").read_text())

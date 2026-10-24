@@ -40,7 +40,7 @@ from tvm.relax.backend.contrib.gemmini_search import open_gemmini_database
 from program_io import import_program
 from package_audit import audit_graph
 from graph_plans import GraphPlan
-from tuning_preset import materialize_preset
+from tuning_preset import PRESET_NAMES, materialize_preset
 from baremetal import export_graph, RV64_TARGET
 from verify_baremetal_cpu import identity
 from verify_matmul import audit_instructions
@@ -212,12 +212,21 @@ def compile_package(args):
     database_path = getattr(args, "tuning_database", None)
     fallback_database_path = getattr(args, "fallback_tuning_database", None)
     preset_name = getattr(args, "tuning_preset", None)
-    if fallback_database_path is not None and database_path is None:
-        raise ValueError("A fallback tuning database requires an explicit primary tuning database")
+    fallback_preset = getattr(args, "fallback_tuning_preset", None)
+    if fallback_preset is not None:
+        if fallback_database_path is not None:
+            raise ValueError("Choose either a fallback tuning database or a fallback preset")
+        if fallback_preset == preset_name:
+            raise ValueError("Fallback preset must differ from the primary preset")
     if preset_name and (database_path is not None or args.cpu_only):
         raise ValueError("Tuning preset requires an accelerator build without another database")
     if preset_name:
         database_path = materialize_preset(preset_name, out / "preset", capabilities=caps)
+    if fallback_preset is not None:
+        fallback_database_path = materialize_preset(
+            fallback_preset, out / "fallback-preset", capabilities=caps)
+    if fallback_database_path is not None and database_path is None:
+        raise ValueError("A fallback tuning database requires an explicit primary tuning database")
     if database_path is not None:
         if args.cpu_only:
             raise ValueError("CPU-only build cannot accept a tuning database")
@@ -391,6 +400,7 @@ def compile_package(args):
         "fallback_tuning_database": "fallback-database" if fallback_database_path is not None else None,
         "database_selection": "database-selection.json" if database is not None else None,
         "tuning_preset": preset_name,
+        "fallback_tuning_preset": fallback_preset,
         "graph_plan": "graph-plan.json",
         "tuned_functions": [row["function"] for row in report
                             if row.get("origin") == "TVM MetaSchedule database"],
@@ -447,10 +457,13 @@ def main():
     parser.add_argument("--tensor-memory-bytes", type=int, default=64 << 20)
     tuning = parser.add_mutually_exclusive_group()
     tuning.add_argument("--tuning-database", type=Path, help="Standard MetaSchedule JSONDatabase directory")
-    tuning.add_argument("--tuning-preset", choices=["rtl-v1"],
-                        help="Apply shipped RTL winners where structurally matching; report fallbacks")
-    parser.add_argument("--fallback-tuning-database", type=Path,
-                        help="Optional frozen JSONDatabase used only where the explicit primary has no match")
+    tuning.add_argument("--tuning-preset", choices=PRESET_NAMES,
+                        help="Apply shipped winners where structurally matching; report fallbacks")
+    fallback = parser.add_mutually_exclusive_group()
+    fallback.add_argument("--fallback-tuning-database", type=Path,
+                          help="Optional frozen JSONDatabase used only where the explicit primary has no match")
+    fallback.add_argument("--fallback-tuning-preset", choices=PRESET_NAMES,
+                          help="Shipped preset consulted only where the primary has no match")
     args = parser.parse_args()
     if args.verify:
         verify_package(args.verify)
