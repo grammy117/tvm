@@ -83,6 +83,50 @@ def digest(path):
     return value.hexdigest()
 
 
+def bind_host_math(policy, graph, gcc, command):
+    """Resolve the scheduled operators' scalar libm calls to an explicit policy.
+
+    ``native`` links the toolchain's libm. A portable policy compiles Merlin's
+    recipe source (the same C its portable host reference evaluates) and
+    partially links it into ``operators.o``: references to the wrapped symbols
+    are renamed to the recipe's ``__wrap_`` definitions, so any consumer that
+    links ``operators.o`` gets the portable functions without extra link flags.
+    """
+    if policy == "native":
+        return {"policy": "native"}
+    try:
+        from merlin.runtime.host_math import host_math_recipe
+    except ImportError as error:
+        raise ValueError("A portable host math policy requires Merlin's src on PYTHONPATH") from error
+    recipe = host_math_recipe(policy)
+    symbols = [flag.removeprefix("-Wl,--wrap=") for flag in recipe.link_flags]
+    if recipe.source is None or not symbols or any(flag == symbol for flag, symbol in zip(recipe.link_flags, symbols)):
+        raise ValueError("Host math recipe must define only --wrap link flags: " + policy)
+    (graph / "host_math.c").write_text(recipe.source)
+    command([gcc, *FLAGS, *recipe.compile_flags, "-c", graph / "host_math.c", "-o", graph / "host_math.o"])
+    nm = Path(command([gcc, "-print-prog-name=nm"]).strip())
+    objcopy = Path(command([gcc, "-print-prog-name=objcopy"]).strip())
+    if command([nm, "-u", graph / "host_math.o"]).strip():
+        raise ValueError("Portable host math must not depend on other symbols")
+    (graph / "operators.o").rename(graph / "operators.native.o")
+    command([objcopy, *(f"--redefine-sym={name}=__wrap_{name}" for name in symbols),
+             graph / "operators.native.o", graph / "operators.wrapped.o"])
+    command([gcc, *FLAGS, "-nostdlib", "-nostartfiles", "-Wl,-r,--no-relax",
+             graph / "operators.wrapped.o", graph / "host_math.o", "-o", graph / "operators.o"])
+    remaining = set(command([nm, "-u", graph / "operators.o"]).split()) & set(symbols)
+    if remaining:
+        raise ValueError("Operators still reference native host math: " + ", ".join(sorted(remaining)))
+    (graph / "operators.wrapped.o").unlink()
+    return {
+        "policy": policy,
+        "wrapped_symbols": symbols,
+        "source": "graph/host_math.c",
+        "source_sha256": hashlib.sha256(recipe.source.encode()).hexdigest(),
+        "compile_flags": list(recipe.compile_flags),
+        "native_operators": "graph/operators.native.o",
+    }
+
+
 def verify_package(folder):
     """Verify relocatable payload identities; no original source paths are needed."""
     folder = Path(folder).resolve()
@@ -273,6 +317,7 @@ def compile_package(args):
         ]
     )
     command([gcc, *FLAGS, "-c", graph / "model.c", "-o", graph / "model.o"])
+    host_math = bind_host_math(args.host_math_policy, graph, gcc, command)
     (out / "runtime.c").write_text(RUNTIME)
     command([gcc, *FLAGS, "-c", out / "runtime.c", "-o", out / "runtime.o"])
     shutil.copy2(adapter_object, out / "adapter.o")
@@ -400,6 +445,7 @@ def compile_package(args):
         "fallback_tuning_database": "fallback-database" if fallback_database_path is not None else None,
         "database_selection": "database-selection.json" if database is not None else None,
         "tuning_preset": preset_name,
+        "host_math": host_math,
         "fallback_tuning_preset": fallback_preset,
         "graph_plan": "graph-plan.json",
         "tuned_functions": [row["function"] for row in report
@@ -455,6 +501,10 @@ def main():
     parser.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=True,
                         help="Retain the mathematical bias epilogue instead of canonicalizing preload")
     parser.add_argument("--tensor-memory-bytes", type=int, default=64 << 20)
+    parser.add_argument("--host-math-policy", default="native",
+                        choices=("native", "portable_trig", "portable_exp_trig", "portable_neural_f32"),
+                        help="Scalar libm for float islands; portable policies compile Merlin's recipe "
+                             "(EL4 TinyLlama selects portable_exp_trig)")
     tuning = parser.add_mutually_exclusive_group()
     tuning.add_argument("--tuning-database", type=Path, help="Standard MetaSchedule JSONDatabase directory")
     tuning.add_argument("--tuning-preset", choices=PRESET_NAMES,

@@ -1195,5 +1195,47 @@ def test_bool_return_value():
     assert not built(15)
 
 
+@tvm.testing.requires_llvm
+@pytest.mark.skipif(
+    "riscv64" not in tvm.target.codegen.llvm_get_targets(), reason="LLVM built without RISC-V"
+)
+@pytest.mark.parametrize(
+    "contract, fused", [(None, True), ("fast", True), ("off", False)], ids=["default", "fast", "off"]
+)
+def test_llvm_fp_contract(contract, fused):
+    """-fp-contract=off keeps a float multiply and add separately rounded."""
+
+    @T.prim_func
+    def func(
+        a: T.Buffer((64,), "float32"),
+        b: T.Buffer((64,), "float32"),
+        c: T.Buffer((64,), "float32"),
+        d: T.Buffer((64,), "float32"),
+    ):
+        for i in range(64):
+            d[i] = a[i] * b[i] + c[i]
+
+    target = "llvm -mtriple=riscv64-unknown-elf -mattr=+m,+a,+f,+d,+c -mabi=lp64d"
+    if contract is not None:
+        target += " -fp-contract=" + contract
+    target = tvm.target.Target(target)
+    asm = tvm.build(func, target=target).get_source("asm")
+    assert ("fmadd.s" in asm) == fused
+    assert ("fmul.s" in asm and "fadd.s" in asm) != fused
+    if contract == "off":
+        assert "-fp-contract=off" in str(target)
+
+
+@tvm.testing.requires_llvm
+def test_llvm_fp_contract_rejects_unknown_value():
+    @T.prim_func
+    def func(a: T.Buffer((4,), "float32")):
+        for i in range(4):
+            a[i] = a[i] * a[i] + a[i]
+
+    with pytest.raises(tvm.TVMError, match="fp-contract"):
+        tvm.build(func, target="llvm -fp-contract=sometimes")
+
+
 if __name__ == "__main__":
     tvm.testing.main()

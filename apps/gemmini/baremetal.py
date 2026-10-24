@@ -37,7 +37,8 @@ from verify_baremetal_cpu import checked_path
 
 ALIGNMENT = 64
 DTYPES = {"int8": "int8_t", "uint8": "uint8_t", "int32": "int32_t", "int64": "int64_t", "float32": "float", "float64": "double", "bfloat16": "uint16_t", "bool": "uint8_t"}
-RV64_TARGET = "llvm -mtriple=riscv64-unknown-elf -mcpu=generic-rv64 -mattr=+m,+a,+f,+d,+c -mabi=lp64d"
+# Float islands keep each multiply and add separately rounded, as unfused references compute them.
+RV64_TARGET = "llvm -mtriple=riscv64-unknown-elf -mcpu=generic-rv64 -mattr=+m,+a,+f,+d,+c -mabi=lp64d -fp-contract=off"
 
 
 def _aligned(size):

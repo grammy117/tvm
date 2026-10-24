@@ -285,7 +285,20 @@ LLVMTargetInfo::LLVMTargetInfo(LLVMInstance& instance, const TargetJSON& target)
 #endif
   // In clang, these are fed from LangOpts which describe language specific features
   // TODO(AndrewZhaoLuo): figure out how these relate to fast math flags
+  // -fp-contract=fast (default) lets LLVM fuse separate multiplies and adds into FMAs;
+  // "on" fuses only explicit llvm.fmuladd; "off" keeps every float operation rounded
+  // separately, as an unfused reference (e.g. PyTorch eager) computes it.
   target_options_.AllowFPOpFusion = llvm::FPOpFusion::Fast;
+  if (const auto& v = Downcast<Optional<String>>(target.Get("fp-contract"))) {
+    String value = v.value();
+    if (value == "on") {
+      target_options_.AllowFPOpFusion = llvm::FPOpFusion::Standard;
+    } else if (value == "off") {
+      target_options_.AllowFPOpFusion = llvm::FPOpFusion::Strict;
+    } else if (value != "fast") {
+      LOG(FATAL) << "invalid -fp-contract option " << value << ", expected fast, on or off";
+    }
+  }
   target_options_.UnsafeFPMath = false;
   target_options_.NoInfsFPMath = false;
   target_options_.NoNaNsFPMath = true;
@@ -451,6 +464,16 @@ std::string LLVMTargetInfo::str() const {
   }
   if (!target_options_.MCOptions.ABIName.empty()) {
     os << " -mabi=" << target_options_.MCOptions.ABIName;
+  }
+  switch (target_options_.AllowFPOpFusion) {
+    case llvm::FPOpFusion::Standard:
+      os << " -fp-contract=on";
+      break;
+    case llvm::FPOpFusion::Strict:
+      os << " -fp-contract=off";
+      break;
+    case llvm::FPOpFusion::Fast:
+      break;
   }
 
   bool do_individual = true;

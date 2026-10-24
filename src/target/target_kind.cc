@@ -278,6 +278,8 @@ TVM_REGISTER_TARGET_KIND("llvm", kDLCPU)
     .add_attr_option<runtime::Bool>("fast-math-arcp")
     .add_attr_option<runtime::Bool>("fast-math-contract")
     .add_attr_option<runtime::Bool>("fast-math-reassoc")
+    // Floating-point contraction: fast (default), on, off; see llvm_instance.cc
+    .add_attr_option<String>("fp-contract")
     .add_attr_option<runtime::Int>("opt-level")
     // LLVM command line flags, see below
     .add_attr_option<Array<String>>("cl-opt")
