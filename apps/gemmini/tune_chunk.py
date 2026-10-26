@@ -32,8 +32,9 @@ import traceback
 
 from chunk_measure import build_chunk
 from compile_package import digest
-from graph_plans import GraphPlan, plans
+from graph_plans import GraphPlan, audit_plans, plans
 from measure import Toolchain, run_candidate
+from program_io import import_program
 from tuning_preset import PRESET_NAMES
 from verify_baremetal_cpu import identity
 
@@ -89,9 +90,19 @@ def run(args):
         raise ValueError("This sweep requires explicit FASED memory and fixed-warm timing")
     program, fixture, reference = [p.resolve() for p in (args.program, args.fixture, args.fixture_provenance)]
     choices = {name: GraphPlan.from_name(name) for name in args.plans}
-    document = {"schema": "gemmini_connected_graph_sweep_v1", "program": identity(program),
+    if len(choices) != len(args.plans):
+        raise ValueError("Graph plans must be distinct")
+    program_identity = identity(program)
+    graph_audit = audit_plans(import_program(program), choices.values())
+    if identity(program) != program_identity:
+        raise ValueError("Program changed during graph-choice audit")
+    representatives = [group["representative"] for group in graph_audit["groups"]]
+    equivalent = {name: group["representative"] for group in graph_audit["groups"]
+                  for name in group["plans"] if name != group["representative"]}
+    document = {"schema": "gemmini_connected_graph_sweep_v1", "program": program_identity,
                 "fixture": identity(fixture), "reference": identity(reference),
                 "toolchain": provenance, "plans": args.plans,
+                "graph_choice_audit": graph_audit,
                 "cycle_limit": args.max_cycles, "rtl_wall_limit": args.rtl_seconds,
                 "preset": args.tuning_preset, "tuning_database": None,
                 "scope": "Connected chunk, fixed boundary fixture; no full-model or FireSim qualification",
@@ -117,7 +128,9 @@ def run(args):
         root.mkdir(parents=True)
         (root / "sweep.json").write_text(json.dumps(document, indent=2) + "\n")
     results = []
-    for name in args.plans:
+    # Measure representatives first. Equivalent choices retain an explicit
+    # unmeasured result rather than multiplying one observation into many costs.
+    for name in [*representatives, *equivalent]:
         plan = choices[name]
         folder = root / name
         result_path = folder / "result.json"
@@ -127,6 +140,16 @@ def run(args):
         if folder.exists():
             raise ValueError("Incomplete retained trial; inspect its process/evidence before starting a fresh sweep: " + str(folder))
         folder.mkdir()
+        if name in equivalent:
+            result = {"plan": name, "status": "equivalent_prepared_graph",
+                      "representative": equivalent[name], "performance_measured": False}
+            result_path.write_text(json.dumps(result, indent=2) + "\n")
+            results.append(result)
+            winner = select_winner(results)
+            (root / "results.json").write_text(json.dumps({"results": results, "winner": winner,
+                "complete": len(results) == len(args.plans)}, indent=2) + "\n")
+            print(json.dumps(result), flush=True)
+            continue
         (folder / "started.json").write_text(json.dumps({"pid": os.getpid(), "start_unix": time.time()}) + "\n")
         result = {"plan": name, "preparation_options": plan.preparation_options,
                   "package": str(folder / "package"), "measurement_folder": str(folder / "measurement")}

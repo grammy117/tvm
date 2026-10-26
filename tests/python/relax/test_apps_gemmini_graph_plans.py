@@ -25,7 +25,7 @@ from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_
 from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
 
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
-from graph_plans import GraphPlan, plans, replay
+from graph_plans import GraphPlan, audit_plans, plans, replay
 
 
 def graph():
@@ -98,6 +98,29 @@ def test_existing_default_preparation_is_preserved():
         explicit, _, _ = GraphPlan().prepare(mod)
         tvm.ir.assert_structural_equal(existing, explicit)
         assert GraphPlan(-1).preparation_options["fusion_level"] == 2
+
+
+def test_audit_collapses_inactive_choices_and_prefers_existing_default():
+    mod, _, _ = graph()
+    result = audit_plans(mod)
+    assert result["configurations"] == 32
+    assert result["distinct_prepared_graphs"] == 4
+    assert result["groups"][0]["representative"] == GraphPlan().name
+    assert sum(len(group["plans"]) for group in result["groups"]) == 32
+    for field in ("bias_preload", "eliminate_common_subexpr"):
+        assert result["option_effects"][field] == {
+            "compared_pairs": 16, "changed_prepared_graph": 0,
+            "identical_prepared_graph": 16}
+    assert result["option_effects"]["prepack_weights"]["changed_prepared_graph"] == 16
+    assert result["performance_measured"] is False
+
+
+def test_audit_does_not_merge_different_programs_on_hash_collision(monkeypatch):
+    mod, _, _ = graph()
+    monkeypatch.setattr(tvm.ir, "structural_hash", lambda _: 0)
+    assert audit_plans(mod, plans())["distinct_prepared_graphs"] == 4
+    with pytest.raises(ValueError, match="distinct"):
+        audit_plans(mod, [GraphPlan(), GraphPlan()])
 
 
 @pytest.mark.parametrize("kwargs", [dict(fusion_level=True), dict(fusion_level=4),

@@ -144,6 +144,60 @@ def plans(*, include_cse=False, fusion_levels=(2, 0), prepack_choices=(True, Fal
     return result
 
 
+def audit_plans(mod, alternatives=None):
+    """Group identical prepared programs before allocating measurement budget.
+
+    Equality is structural, including constant bytes. Hashes only shortlist
+    comparisons; they never establish equivalence. Reprepare a representative
+    when comparing rather than retaining every large model variant in memory.
+    This says nothing about which *different* program will execute fastest.
+    """
+    alternatives = tuple(alternatives) if alternatives is not None else plans(
+        include_cse=True, fusion_levels=(0, 1, 2, 3),
+        bias_preload_choices=(True, False))
+    if not alternatives or len({p.name for p in alternatives}) != len(alternatives):
+        raise ValueError("Audit requires nonempty, distinct graph plans")
+    # Prefer the existing compiler default when several choices are equivalent.
+    alternatives = tuple(sorted(alternatives, key=lambda p: (p != GraphPlan(), p.name)))
+    groups, buckets, rows = [], {}, []
+    for plan in alternatives:
+        prepared = plan.prepare(mod)[0]
+        structural_hash = int(tvm.ir.structural_hash(prepared))
+        group_index = None
+        for candidate in buckets.get(structural_hash, []):
+            representative = GraphPlan.from_name(groups[candidate]["representative"])
+            other = representative.prepare(mod)[0]
+            equal = tvm.ir.structural_equal(prepared, other)
+            del other
+            if equal:
+                group_index = candidate
+                break
+        if group_index is None:
+            group_index = len(groups)
+            groups.append({"representative": plan.name, "plans": []})
+            buckets.setdefault(structural_hash, []).append(group_index)
+        groups[group_index]["plans"].append(plan.name)
+        rows.append({"plan": plan.name, "options": plan.preparation_options,
+                     "group": group_index})
+        del prepared
+    fields = tuple(GraphPlan().preparation_options)
+    effects = {}
+    for field in fields:
+        pairs = [(a, b) for index, a in enumerate(rows) for b in rows[index + 1:]
+                 if a["options"][field] != b["options"][field]
+                 and all(a["options"][key] == b["options"][key]
+                         for key in fields if key != field)]
+        changes = sum(a["group"] != b["group"] for a, b in pairs)
+        effects[field] = {"compared_pairs": len(pairs), "changed_prepared_graph": changes,
+                          "identical_prepared_graph": len(pairs) - changes}
+    return {"schema": "gemmini_graph_plan_audit_v1", "configurations": len(rows),
+            "distinct_prepared_graphs": len(groups), "groups": groups,
+            "option_effects": effects,
+            "equivalence": "TVM structural equality, including constants; hash collisions checked",
+            "scope": "Preparation only; different graphs require connected timing and output checks",
+            "performance_measured": False}
+
+
 def replay(mod, document):
     """Replay standard serialized choices against the bound semantic program."""
     if document.get("schema") != "gemmini_graph_plan_v1" or module_digest(mod) != document["semantic_ir_sha256"]:

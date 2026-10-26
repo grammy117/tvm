@@ -10,6 +10,19 @@ case. Decode and prefill never share a campaign by default.
 
 ## Compiler-controlled choices
 
+Before allocating simulator trials, run `audit_graph_plans.py --program PROGRAM
+--output-dir NEW`. It reports distinct prepared graphs and inactive options on
+that exact input. `tune_chunk.py` now measures one representative per structurally
+equal prepared graph; aliases remain explicitly unmeasured in its results. The
+32 option configurations are not a promise of 32 different implementations.
+
+For internal attribution, `compile_package.py --profile-operators` buffers cycles
+and symbols for each operator call. The companion session builder's
+`--profile-stages` snapshots these counters for each warm/measured invocation
+and prints them after validation. Counter reads and snapshots add overhead;
+keep final performance comparisons uninstrumented. Operator intervals exclude
+wrapper checks, final output copies and caller routing, so their sum is not E2E.
+
 This driver does not assign tile sizes by model name or edit winner traces.
 `current` replays unchanged measured records through TVM structural matching;
 `tune` delegates to the existing compiler search. The eleven graph definitions
