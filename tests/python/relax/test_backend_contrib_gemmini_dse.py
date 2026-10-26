@@ -69,7 +69,8 @@ def test_cap_retry_rejects_changed_executable(tmp_path):
 
 
 def test_concurrent_duplicate_measurements_run_once(tmp_path, monkeypatch):
-    args = SimpleNamespace(work_dir=tmp_path, max_cycles=1000, cap_factor=3, cpu_max_cycles=1000)
+    args = SimpleNamespace(work_dir=tmp_path, max_cycles=1000, cap_factor=3, cpu_max_cycles=1000,
+                           rtl_seconds=None)
     campaign = Campaign(args, None)
     calls = []
     def run(artifact, *_args, **_kwargs):
@@ -114,7 +115,8 @@ def test_cache_migration_prefers_a_successful_repaired_measurement(tmp_path):
         "status": "passed", "folder": str(tmp_path / "1"), "cycles": 17, "cycle_cap": 1000}))
     (tmp_path / "measurement-cache.json").write_text(json.dumps(cache))
     campaign = Campaign(args, None)
-    assert campaign.cache["workload:same-elf"]["cycles"] == 17
+    key = Campaign.measurement_key(json.loads((tmp_path / "1/artifact.json").read_text()))
+    assert campaign.cache[key]["cycles"] == 17
 
 
 class GemminiDSETests(unittest.TestCase):

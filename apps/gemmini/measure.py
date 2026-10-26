@@ -51,6 +51,7 @@ from baremetal import RV64_TARGET, export_graph  # pylint: disable=wrong-import-
 from verify_baremetal_cpu import STARTUP, identity  # pylint: disable=wrong-import-position
 from verify_matmul import audit_instructions  # pylint: disable=wrong-import-position
 from memory_model import bind_memory_model, confirm_memory_model, runtime_environment
+from cycle_watchdog import PROFILE as WATCHDOG_PROFILE, instrument_runner
 
 ROCKET_MARCHID = 1
 GUEST_BASE, GUEST_BYTES = 0x80000000, 0x10000000
@@ -179,13 +180,17 @@ int main(void){
 """
 
 
-def render_runner(values, timing_policy="legacy"):
+def render_runner(values, timing_policy="legacy", *, watchdog=False):
     """Share the checked guest with connected-package measurements."""
     if timing_policy not in ("legacy", "fixed-warm"):
         raise ValueError("Unknown timing policy")
     values = dict(values, ROCKET_MARCHID=ROCKET_MARCHID,
                   WARM_LIMIT="UINT64_MAX" if timing_policy == "fixed-warm" else WARM_LIMIT)
     runner = RUNNER
+    if watchdog:
+        if timing_policy != "fixed-warm":
+            raise ValueError("Measured-region watchdog requires fixed-warm timing")
+        runner = instrument_runner(runner)
     for key in sorted(values, key=len, reverse=True):
         runner = runner.replace(key, str(values[key]))
     return runner
@@ -347,6 +352,7 @@ class Toolchain:
     firesim_memory_artifact: str | None = None
     memory_pin_registry: Path | None = None
     timing_policy: str = "legacy"
+    cycle_watchdog: bool = False
 
     @property
     def adapter(self):
@@ -361,8 +367,13 @@ class Toolchain:
                 for key, value in self.__dict__.items()}
 
     def memory_configuration(self):
-        return bind_memory_model(self.hardware_receipt, self.memory_variant_receipt,
-                                 self.firesim_memory_artifact, self.memory_pin_registry)
+        memory = bind_memory_model(self.hardware_receipt, self.memory_variant_receipt,
+                                   self.firesim_memory_artifact, self.memory_pin_registry)
+        if self.cycle_watchdog:
+            receipt = json.loads(self.memory_variant_receipt.read_text())
+            if receipt.get("dse_cycle_monitor", {}).get("kind") != WATCHDOG_PROFILE["kind"]:
+                raise ValueError("Moving cutoff requires the source-bound native cycle monitor")
+        return memory
 
     def provenance(self):
         """Verify the actual executable bytes against the retained qualifications."""
@@ -394,6 +405,7 @@ class Toolchain:
             identities["simulator"] = memory["simulator"]
         return {"hardware": hardware["hardware"], "binaries": identities,
                 "memory_model": memory, "timing_policy": self.timing_policy,
+                "cycle_watchdog": WATCHDOG_PROFILE if self.cycle_watchdog else None,
                 "adapter_sources": adapter["source_set"],
                 "receipts": [identity(p) for p in (self.hardware_receipt, self.spike_receipt,
                                                   self.adapter_receipt)]}
@@ -401,7 +413,7 @@ class Toolchain:
     @classmethod
     def from_json(cls, value):
         return cls(**{key: Path(item) if item is not None and key not in
-                     ("firesim_memory_artifact", "timing_policy") else item
+                     ("firesim_memory_artifact", "timing_policy", "cycle_watchdog") else item
                       for key, item in value.items()})
 
 
@@ -480,7 +492,7 @@ def build_candidate(mod, workload_folder, folder, toolchain, *, timeout=300):
         "WARM_LIMIT": WARM_LIMIT,
         "ROCKET_MARCHID": ROCKET_MARCHID,
     }
-    runner = render_runner(values, toolchain.timing_policy)
+    runner = render_runner(values, toolchain.timing_policy, watchdog=toolchain.cycle_watchdog)
     (folder / "runner.c").write_text(runner)
     (folder / "start.S").write_text(STARTUP)
     (folder / "link.ld").write_text(LINKER)
@@ -535,6 +547,8 @@ def build_candidate(mod, workload_folder, folder, toolchain, *, timeout=300):
         "adapter_sha256": receipt["object_sha256"],
         "timing_policy": toolchain.timing_policy,
         "memory_model": toolchain.memory_configuration(),
+        "cycle_watchdog": dict(WATCHDOG_PROFILE, enabled=True, limit_cycles=0)
+                          if toolchain.cycle_watchdog else {"enabled": False},
     }
     (folder / "artifact.json").write_text(json.dumps(artifact, indent=2) + "\n")
     return artifact
@@ -603,10 +617,14 @@ def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, sp
     wall = rtl_seconds if rtl_seconds is not None else 60 + max_cycles / cycles_per_second
     if wall <= 0:
         raise ValueError("RTL wall limit must be positive")
+    environment = runtime_environment(memory)
+    environment.pop("MERLIN_DSE_CYCLE_LIMIT_FILE", None)
+    if getattr(toolchain, "cycle_watchdog", False):
+        environment["MERLIN_DSE_CYCLE_LIMIT_FILE"] = artifact["cycle_watchdog"]["cutoff_file"]
     with log.open("wb") as stream:
         try:
             process = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=wall,
-                                     env=runtime_environment(memory))
+                                     env=environment)
             code = process.returncode
         except subprocess.TimeoutExpired:
             code = None
@@ -615,8 +633,15 @@ def run_candidate(artifact, toolchain, *, max_cycles, cycles_per_second=1500, sp
     confirmation = confirm_memory_model(memory, text)
     record.update(memory_confirmation=confirmation, command=command, wall_limit_seconds=wall,
                   cycle_cap=int(max_cycles), rtl_log=identity(log))
+    record["cycle_watchdog"] = artifact.get("cycle_watchdog", {"enabled": False})
     if not confirmation["model_confirmed"]:
         record.update(status="memory_model_not_confirmed", returncode=code)
+        return record
+    if getattr(toolchain, "cycle_watchdog", False) and "[dse-cycle-monitor] enabled" not in text:
+        record.update(status="cycle_monitor_not_confirmed", returncode=code)
+        return record
+    if "DSE_PRUNED limit=" in text:
+        record.update(status="pruned_by_incumbent", returncode=code)
         return record
     cycles = _parse_cycles(text)
     if code != 0 or cycles is None or "Verilog $finish" not in text or "DSE_PASS" not in text:

@@ -228,6 +228,7 @@ def tune_gemmini_tasks(
     describe=None,
     include_cpu=True,
     warmup=4,
+    compact=False,
 ):
     """Tune extracted tasks with stock ``tune_tasks`` and return the JSONDatabase."""
     capabilities = capabilities or GemminiCapabilities()
@@ -236,11 +237,11 @@ def tune_gemmini_tasks(
     for index, task in enumerate(tasks):
         if strategy == "evolutionary":
             search = ms.search_strategy.EvolutionarySearch(
-                population_size=64,
+                population_size=32 if compact else 64,
                 init_measured_ratio=0.2,
-                init_min_unmeasured=16,
+                init_min_unmeasured=4 if compact else 16,
                 max_fail_count=8,
-                genetic_num_iters=3,
+                genetic_num_iters=2 if compact else 3,
                 genetic_mutate_prob=0.85,
                 genetic_max_fail_count=10,
                 eps_greedy=0.1,
@@ -253,7 +254,7 @@ def tune_gemmini_tasks(
             ms.TuneContext(
                 mod=task.dispatched[0],
                 target=target,
-                space_generator=gemmini_space_generator(capabilities, include_cpu=include_cpu),
+                space_generator=gemmini_space_generator(capabilities, include_cpu=include_cpu, compact=compact),
                 search_strategy=search,
                 task_name=task.task_name,
                 rand_state=seed + index,

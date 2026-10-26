@@ -69,9 +69,10 @@ def _blocks(func):
 class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
     """Expand supported blocks into Gemmini sketches on the given schedule."""
 
-    def __init__(self, capabilities=None, dataflows=("os", "ws")):
+    def __init__(self, capabilities=None, dataflows=("os", "ws"), compact=False):
         self.capabilities = capabilities or GemminiCapabilities()
         self.dataflows = tuple(dataflows)
+        self.compact = compact
         self.target = None
 
     def __str__(self):
@@ -105,6 +106,8 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             info = contraction_info(func, name)
             results = []
             for sketch in sketch_space(info, dataflows=self.dataflows):
+                if self.compact and sketch.epilogue != "root":
+                    continue
                 try:
                     candidate = apply_contraction_sketch(
                         sch.copy(), block, sketch, capabilities=self.capabilities
@@ -132,7 +135,7 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         return results
 
     def clone(self):
-        return GemminiScheduleRule(self.capabilities, self.dataflows)
+        return GemminiScheduleRule(self.capabilities, self.dataflows, self.compact)
 
 
 @derived_object
@@ -197,13 +200,13 @@ def cpu_schedule_rules():
     ]
 
 
-def gemmini_schedule_rules(capabilities=None, dataflows=("os", "ws")):
+def gemmini_schedule_rules(capabilities=None, dataflows=("os", "ws"), *, compact=False):
     return [
-        GemminiScheduleRule(capabilities, dataflows),
+        GemminiScheduleRule(capabilities, dataflows, compact),
         ms.schedule_rule.ParallelizeVectorizeUnroll(
             max_jobs_per_core=-1,
             max_vectorize_extent=-1,
-            unroll_max_steps=_UNROLL_STEPS,
+            unroll_max_steps=[0, 16] if compact else _UNROLL_STEPS,
             unroll_explicit=True,
         ),
     ]
@@ -228,12 +231,12 @@ def gemmini_mutator_probs():
     }
 
 
-def gemmini_space_generator(capabilities=None, *, include_cpu=True, dataflows=("os", "ws")):
+def gemmini_space_generator(capabilities=None, *, include_cpu=True, dataflows=("os", "ws"), compact=False):
     """Gemmini and CPU placements of one function as a stock union of spaces."""
     capabilities = capabilities or GemminiCapabilities()
     generators = [
         ms.space_generator.PostOrderApply(
-            sch_rules=gemmini_schedule_rules(capabilities, dataflows),
+            sch_rules=gemmini_schedule_rules(capabilities, dataflows, compact=compact),
             postprocs=[],
             mutator_probs={},
         )

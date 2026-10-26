@@ -31,6 +31,7 @@ measurement instead of simulating again.
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from host_execution import execution_lease
 import hashlib
 import json
 from pathlib import Path
@@ -61,6 +62,7 @@ from tvm.relax.backend.contrib.gemmini_tensorir import (  # pylint: disable=wron
 )
 
 import measure  # pylint: disable=wrong-import-position
+from cycle_watchdog import bind_limit, cutoff_path, write_limit
 import model_workloads  # pylint: disable=wrong-import-position
 from program_io import import_program  # pylint: disable=wrong-import-position
 from memory_model import add_memory_arguments
@@ -79,6 +81,7 @@ class Campaign:
         self.counter = len(list((self.root / "candidates").glob("*.request.json")))
         self.program_locks = {}
         self.default_cycles = {}
+        self.incumbents = {}
         cache = self.root / "measurement-cache.json"
         self.cache = {}
         if cache.exists():
@@ -99,6 +102,18 @@ class Campaign:
                              or record.get("cycle_cap", 0) > previous.get("cycle_cap", 0))
                     ):
                         self.cache[key] = record
+        incumbent_path = self.root / "incumbents.json"
+        if getattr(args, "moving_cutoff", False) and incumbent_path.exists():
+            for key, entry in json.loads(incumbent_path.read_text()).items():
+                artifact = json.loads(Path(entry["artifact"]).read_text())
+                measurement = json.loads((Path(artifact["folder"]) / "measurement.json").read_text())
+                if (measurement["status"] != "passed" or measurement["cycles"] != entry["cycles"]
+                        or Path(artifact["workload"]).name != key):
+                    raise ValueError("Incumbent is not a validated measurement of this workload")
+                for elf in artifact["elfs"].values():
+                    if measure.identity(elf["path"])["sha256"] != elf["sha256"]:
+                        raise ValueError("Incumbent executable changed")
+                self.incumbents[key] = entry
 
     @staticmethod
     def measurement_key(artifact):
@@ -134,11 +149,12 @@ class Campaign:
                 }
             )
         )
-        process = subprocess.run(
-            [sys.executable, str(APP / "measure.py"), "build", str(request)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            timeout=self.args.build_seconds,
-        )
+        with execution_lease(getattr(self.args, "execution_pool", None), "build"):
+            process = subprocess.run(
+                [sys.executable, str(APP / "measure.py"), "build", str(request)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=self.args.build_seconds,
+            )
         (folder.with_suffix(".build.log")).write_text(process.stdout)
         outcome = json.loads(result.read_text()) if result.exists() else {"error": process.stdout[-2000:]}
         if process.returncode or "error" in outcome:
@@ -161,19 +177,52 @@ class Campaign:
         # Search strategies can submit identical generated code concurrently.
         # Serialize only those duplicates; distinct programs still run in parallel.
         with program_lock:
-            cap = self.cap(key)
-            if not artifact["native"]:
-                cap = min(cap, self.args.cpu_max_cycles)
-            with self.lock:
-                cached = self.cache.get(program)
-            if (cached is not None and cached.get("cycle_cap") is not None
-                    and cached["status"] != "passed" and cached["cycle_cap"] < cap):
-                cached = None
-            if cached is not None:
-                record = dict(cached, reused_from=cached["folder"])
-            else:
-                record = measure.run_candidate(artifact, self.toolchain, max_cycles=cap,
-                                               rtl_seconds=self.args.rtl_seconds)
+            with execution_lease(getattr(self.args, "execution_pool", None), "run"):
+                moving = getattr(self.args, "moving_cutoff", False)
+                if moving:
+                    with self.lock:
+                        limit = self.incumbents.get(key, {}).get("cycles", 0)
+                        artifact = bind_limit(artifact, self.toolchain, int(limit), measure.identity)
+                    program = self.measurement_key(artifact)
+                cap = self.cap(key)
+                if not artifact["native"]:
+                    cap = min(cap, self.args.cpu_max_cycles)
+                with self.lock:
+                    cached = self.cache.get(program)
+                if (cached is not None and cached.get("cycle_cap") is not None
+                        and cached["status"] != "passed" and cached["cycle_cap"] < cap):
+                    cached = None
+                if cached is not None:
+                    record = dict(cached, reused_from=cached["folder"])
+                else:
+                    wall = getattr(self.args, "rtl_seconds", None)
+                    deadline = getattr(self.args, "deadline_epoch", None)
+                    if deadline is not None:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            raise RuntimeError("DSE wall deadline reached")
+                        wall = min(wall, remaining) if wall is not None else remaining
+                    record = measure.run_candidate(artifact, self.toolchain, max_cycles=cap,
+                                                   rtl_seconds=wall)
+                if moving and record["status"] == "passed":
+                    with self.lock:
+                        previous = self.incumbents.get(key)
+                        if previous is not None and record["cycles"] > previous["cycles"]:
+                            record = dict(record, status="pruned_by_newer_incumbent",
+                                          observed_cycles=record["cycles"],
+                                          incumbent_cycles=previous["cycles"])
+                            record.pop("cycles")
+                        else:
+                            self.incumbents[key] = {"cycles": int(record["cycles"]),
+                                                    "artifact": str(artifact_path),
+                                                    "first_call_cycles": record.get("first_call_cycles"),
+                                                    "updated_at": time.time()}
+                            path = self.root / "incumbents.json"
+                            temporary = path.with_suffix(".tmp")
+                            temporary.write_text(json.dumps(self.incumbents, indent=2) + "\n")
+                            temporary.replace(path)
+                            if artifact.get("cycle_watchdog", {}).get("enabled"):
+                                write_limit(cutoff_path(artifact), int(record["cycles"]))
                 with self.lock:
                     self.cache[program] = record
                     (self.root / "measurement-cache.json").write_text(json.dumps(self.cache))
@@ -249,6 +298,12 @@ def retain_measured_baseline(database, workload, trace, measurement, target):
     database.commit_tuning_record(ms.database.TuningRecord(
         trace, database.commit_workload(workload), [float(measurement["cycles"])], target, []))
     return True
+
+
+def validated_baseline_database(root):
+    folder = Path(root) / "validated-baselines"
+    folder.mkdir(parents=True, exist_ok=True)
+    return ms.database.JSONDatabase(work_dir=str(folder))
 
 
 def bind_program(root, program):
@@ -339,6 +394,18 @@ def main(argv=None):
     parser.add_argument("--tasks", type=int, nargs="*", help="Restrict to these task indices")
     parser.add_argument("--operators", type=int, nargs="+", help="Select semantic operators before task extraction")
     parser.add_argument("--baseline-workers", type=int, default=2)
+    parser.add_argument("--moving-cutoff", action="store_true",
+                        help="Abort measured inference above the fastest validated exact-task cycle count")
+    parser.add_argument("--incumbent-baseline-only", action="store_true",
+                        help="Remeasure matching current trace, falling back to default; defer CPU/extra baselines")
+    parser.add_argument("--compact-search", action="store_true",
+                        help="Bounded native search profile: root epilogue, short unrolling, smaller stock population")
+    parser.add_argument("--deadline-epoch", type=float,
+                        help="Absolute shared wall deadline; admission and supervisor enforce the same deadline")
+    parser.add_argument("--baselines-after-search", action="store_true",
+                        help="Start stock DSE before baseline comparisons; candidate correctness gates still apply")
+    parser.add_argument("--execution-pool", type=Path,
+                        help="Shared Linux CPU/memory admission directory for external builds and measurements")
     parser.add_argument("--cpu-max-cycles", type=int, default=2_000_000)
     parser.add_argument("--cap-factor", type=float, default=3.0)
     parser.add_argument("--max-cycles", type=int, default=40_000_000)
@@ -354,7 +421,7 @@ def main(argv=None):
     parser.add_argument("--graph-cse", action="store_true",
                         help="Expose stock Relax common-subexpression elimination as a graph preparation choice")
     parser.add_argument("--baseline-database", type=Path,
-                        help="Remeasure structurally matching historical traces before search; costs are not imported")
+                        help="Remeasure structurally matching historical traces with the baselines; costs are not imported")
     parser.add_argument("--input-fixture", type=Path,
                         help="NPZ input_0,... in prepared main parameter order; propagate mathematical boundary inputs")
     parser.add_argument("--no-cpu", action="store_true", help="Omit the CPU placement from the space")
@@ -365,6 +432,10 @@ def main(argv=None):
     parser.add_argument("--hardware-receipt", type=Path)
     add_memory_arguments(parser)
     args = parser.parse_args(argv)
+    if args.moving_cutoff and args.timing_policy != "fixed-warm":
+        parser.error("--moving-cutoff requires --timing-policy fixed-warm")
+    if args.moving_cutoff and args.baselines_after_search:
+        parser.error("Moving cutoffs require a freshly validated incumbent before search")
     if args.rtl_seconds is not None and args.rtl_seconds < 1:
         parser.error("rtl-seconds must be positive")
     if args.validation_overhead_cycles < 0:
@@ -419,7 +490,7 @@ def main(argv=None):
         parser.error("Program has no eligible Gemmini tasks; see extraction.json for CPU fallbacks")
     toolchain = measure.Toolchain(args.gcc, args.adapter_receipt, args.spike_receipt, args.hardware_receipt,
                                   args.memory_variant_receipt, args.firesim_memory_artifact,
-                                  args.memory_pin_registry, args.timing_policy)
+                                  args.memory_pin_registry, args.timing_policy, args.moving_cutoff)
     provenance = toolchain.provenance()
     provenance_path = args.work_dir / "hardware-provenance.json"
     if provenance_path.exists():
@@ -437,6 +508,7 @@ def main(argv=None):
     input_bindings, input_binding_record = bind_operator_workloads(
         prepared, tasks, args.work_dir, input_fixture=args.input_fixture)
     current_traces = {}
+    fallback_database = validated_baseline_database(args.work_dir)
     inventory = []
     for task in tasks:
         func = task.dispatched[0]["main"]
@@ -452,6 +524,16 @@ def main(argv=None):
         inventory.append({"task": task.task_name, "workload": key, "weight": int(task.weight),
                           "buffers": [[int(x) for x in func.buffer_map[p].shape] + [func.buffer_map[p].dtype] for p in func.params]})
     (args.work_dir / "tasks.json").write_text(json.dumps({"model": args.model, "operators": operators, "tasks": inventory}, indent=2) + "\n")
+    (args.work_dir / "live-campaign.json").write_text(json.dumps({
+        "status": "running", "program_sha256": program_sha256,
+        "prepared_sha256": prepared_sha256, "scope": extraction["scope"],
+        "preparation_options": preparation, "strategy": args.strategy,
+        "proposal_budget": args.trials_per_task * len(tasks),
+        "moving_cutoff": args.moving_cutoff, "compact_search": args.compact_search,
+        "deadline_epoch": args.deadline_epoch, "toolchain": toolchain.as_json(),
+        "compiler": measure.identity(tvm._ffi.base._LIB._name),
+        "input_bindings": input_binding_record, "baseline_database": seed_binding,
+    }, indent=2) + "\n")
 
     # Remeasure current first so a known schedule sets a practical cap for the
     # default and CPU baselines. Historical magic-memory labels are never used.
@@ -474,21 +556,44 @@ def main(argv=None):
                         campaign.default_cycles[key] = item["current"]["cycles"]
                 except (ValueError, tvm.TVMError) as error:
                     item["current"] = {"status": "failed", "error": str(error)}
-        try:
-            default_mod = default_schedule(func).mod
-            record = baseline(campaign, key, "default", default_mod)
-        except (ValueError, tvm.TVMError) as error:
-            record = {"status": "failed", "error": str(error)}
+        if args.incumbent_baseline_only and item.get("current", {}).get("status") == "passed":
+            record = {"status": "deferred", "reason": "matching current trace freshly validated"}
+        else:
+            try:
+                default_mod = default_schedule(func).mod
+                record = baseline(campaign, key, "default", default_mod)
+            except (ValueError, tvm.TVMError) as error:
+                record = {"status": "failed", "error": str(error)}
         item["default"] = record
         if record.get("status") == "passed":
             campaign.default_cycles[key] = min(campaign.default_cycles.get(key, record["cycles"]), record["cycles"])
-        item["cpu_untuned"] = baseline(campaign, key, "cpu-untuned", tvm.IRModule({"main": func}))
+        item["cpu_untuned"] = ({"status": "deferred", "reason": "four-hour search policy"}
+                               if args.incumbent_baseline_only else
+                               baseline(campaign, key, "cpu-untuned", tvm.IRModule({"main": func})))
         print(json.dumps({"task": item["task"], "current": item.get("current", {}).get("cycles"),
                           "default": record.get("cycles"), "cpu": item["cpu_untuned"].get("cycles")}), flush=True)
         with campaign.lock:
+            if record.get("status") == "passed":
+                retain_measured_baseline(fallback_database, task.dispatched[0],
+                                         default_schedule(func).trace, record, capabilities.target())
+            if item.get("current", {}).get("status") == "passed":
+                retain_measured_baseline(fallback_database, task.dispatched[0], current_traces[key],
+                                         item["current"], capabilities.target())
             (args.work_dir / "tasks.json").write_text(json.dumps({"model": args.model, "operators": operators, "tasks": inventory}, indent=2) + "\n")
-    with ThreadPoolExecutor(args.baseline_workers) as pool:
-        list(pool.map(measure_baselines, zip(tasks, inventory)))
+    def run_baselines():
+        with ThreadPoolExecutor(args.baseline_workers) as pool:
+            list(pool.map(measure_baselines, zip(tasks, inventory)))
+    if not args.baselines_after_search:
+        run_baselines()
+    if args.moving_cutoff:
+        missing = [item["workload"] for item in inventory if item["workload"] not in campaign.incumbents]
+        if missing:
+            (args.work_dir / "deferred.json").write_text(json.dumps({
+                "status": "deferred_no_valid_incumbent", "workloads": missing,
+                "reason": "Bootstrap did not establish a validated cycle limit within the bounded local policy",
+                "next": "Continue with retained inputs, traces and failures during FireSim handoff",
+            }, indent=2) + "\n")
+            return
     (args.work_dir / "tasks.json").write_text(json.dumps({"model": args.model, "operators": operators, "tasks": inventory}, indent=2) + "\n")
 
     builder = GemminiBuilder(campaign.build, max_workers=args.builders)
@@ -506,7 +611,10 @@ def main(argv=None):
         log=args.work_dir / ("trials.jsonl" if args.strategy == "evolutionary" else "replay-trials.jsonl"),
         describe=describe,
         include_cpu=not args.no_cpu,
+        compact=args.compact_search,
     )
+    if args.baselines_after_search:
+        run_baselines()
     # Add freshly verified baselines only after the search has finished. This gives
     # deployment a non-regressing fallback without seeding EvolutionarySearch
     # with baseline records it would otherwise propose measuring again.
@@ -523,6 +631,10 @@ def main(argv=None):
                     "prepared_sha256": prepared_sha256, "preparation_options": preparation,
                     "scope": extraction["scope"], "strategy": args.strategy, "wall_seconds": time.monotonic() - started,
                     "trials_per_task": args.trials_per_task, "parallel": args.parallel, "cap_factor": args.cap_factor,
+                    "baselines_after_search": args.baselines_after_search,
+                    "execution_pool": str(args.execution_pool) if args.execution_pool else None,
+                    "moving_cutoff": args.moving_cutoff, "compact_search": args.compact_search,
+                    "deadline_epoch": args.deadline_epoch,
                     "trials_per_iteration": args.trials_per_iteration or args.parallel,
                     "max_cycles": args.max_cycles, "cpu_max_cycles": args.cpu_max_cycles,
                     "validation_overhead_cycles": args.validation_overhead_cycles,
