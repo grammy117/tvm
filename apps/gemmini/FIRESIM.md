@@ -1,5 +1,45 @@
 # Offline compiler and FireSim handoff
 
+## Current remote handoff (2026-10-25)
+
+Published source: `grammy117/tvm`, branch `gemmini/firesim-chunks`. A checkout
+of this branch already includes the changes; the older delivered patch applies
+only to its original base, not on top of the published branch.
+
+The companion Merlin guide `examples/gemmini/comparisons/tvm/FIRESIM_CHUNK_TUNING.md`
+supersedes the historical preset recommendations below. Its delivery
+`out/artifacts/handoff/gemmini-tvm-firesim-refresh/v1/latest/` contains full
+ResNet baseline/current-tuned/profiled guests and small trained-weight TinyLlama probes.
+They pass functional Spike positive/wrong-oracle controls; FPGA execution is
+deferred to the new machine. The ResNet explicit validated database matches
+one classifier task out of 68, not the whole model. No new FireSim gain is claimed.
+
+Use this isolated `tvm-firesim-chunks` tree at base `c50c4e2` plus the complete
+delivered patch/overlay and the matching corrected native library. It retains
+stock task extraction, gradient scheduling, EvolutionarySearch, XGB and standard
+JSONDatabase. The scalar input-binding fix preserves rank-zero mathematical
+constants during host propagation. The completed `tvm-dse-budgeted` evidence
+tree remains unchanged.
+
+Merlin's `tune_firesim_chunks.py` uses the existing builder and stock search
+with a bounded command adapter to the actual remote manager. It batches 4–6
+proposals, shares explicit slot locks across studies, and allocates no hardware.
+The supplied bitstream already configures the expected DDR3 memory model;
+deliver ELFs to the existing runner. Do not configure memory or infer F2 clock,
+capacity or runtimes. Abort DSE candidates when active measured cycles reach
+the current best, excluding boot/loading/initialization/warmup, and tighten
+in-flight limits on improvements. There are no guessed per-job caps. Keep
+FireSim and Verilator cost labels separate. Probe constants use a fresh W8A8
+recipe; actual calibrated EL4 slices and full-shape confirmation precede E2E.
+
+The remote order is full TinyLlama baseline plus ResNet baseline and current
+tuned ResNet, then ML-guided TinyLlama chunk DSE, then tuned TinyLlama E2E.
+Independent jobs may overlap on available slots; full TinyLlama ELFs are built
+from the actual remote exports. EvolutionarySearch uses XGBoost ranking and
+measurement feedback, not a static parameter sweep.
+
+## Package interface and historical deployment notes
+
 `compile_package.py` compiles a saved Torch export (`.pt2`) or semantic Relax JSON
 into a portable RV64/lp64d static library. It runs ordinary Relax optimization,
 constant packing/folding, exact integer legality checks and TensorIR scheduling;
@@ -7,7 +47,7 @@ unsupported arithmetic and materialized copies use the CPU. It does not launch
 FireSim or allocate a board. The qualification boundary and current entrypoints are in
 [README.md](README.md); lowering ownership is in [OWNERSHIP.md](OWNERSHIP.md).
 
-For the next FireSim compilation, apply the shipped FASED-measured records with
+The earlier FireSim compilation used the shipped FASED-measured records with
 `compile_package.py --tuning-preset fased-v1 --fallback-tuning-preset rtl-v1`.
 `fased-v1` holds 16 operator records measured under the FASED latency-pipe
 memory model; `rtl-v1` supplies traces only where `fased-v1` has no structural
@@ -40,7 +80,7 @@ allowed, so inspect placement and account for every remaining default/fallback.
 `--tuning-result` was removed. Verilator choices are hints for FireSim and must
 be measured on the selected FireSim image. Compilation does not tune implicitly.
 
-The three-model EL4 handoff selects `--tuning-preset rtl-v1`. This portable
+The earlier three-model EL4 handoff selected `--tuning-preset rtl-v1`. This portable
 stock database supplies the nine existing operator winners and verifies payload
 and capability identities. Unlike an explicit database, this preset permits zero
 structural matches, leaving those functions on unmeasured defaults. Inspect
