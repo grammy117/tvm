@@ -40,7 +40,9 @@ def _checked(value, shape, dtype):
         raise ValueError("Bound operator input shape/dtype mismatch")
     if value.dtype.kind == "f" and not np.isfinite(value).all():
         raise ValueError("Bound operator input is nonfinite")
-    return np.ascontiguousarray(value)
+    # ascontiguousarray promotes rank-zero constants to shape (1,), which
+    # violates the extracted PrimFunc ABI during boundary propagation.
+    return np.array(value, copy=True, order="C")
 
 
 def check_integer_divisors(func, parameter_arrays):

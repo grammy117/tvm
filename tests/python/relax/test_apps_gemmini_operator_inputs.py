@@ -24,8 +24,14 @@ from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
 from tvm.relax.backend.contrib.gemmini_search import WORKLOAD_ATTR, workload_key
 
 sys.path.insert(0, str(Path(tvm.__file__).resolve().parents[2] / "apps/gemmini"))
-from operator_inputs import array_identity, check_integer_divisors, resolve_operator_inputs
+from operator_inputs import _checked, array_identity, check_integer_divisors, resolve_operator_inputs
 from tune_models import extract_inventory
+
+
+def test_scalar_constant_keeps_primfunc_abi_rank():
+    scalar = _checked(np.array(127., dtype="float32"), (), "float32")
+    assert scalar.shape == ()
+    assert tvm.nd.array(scalar).shape == ()
 
 
 def graph():
