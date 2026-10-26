@@ -311,7 +311,8 @@ def preflight_graph(mod, *, memory_limit_bytes=1 << 30, target=RV64_TARGET):
     return _memory_preflight(plan, memory_limit_bytes)
 
 
-def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 << 30):
+def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 << 30,
+                 profile_operators=False):
     """Write operators, one constant blob, C orchestration and a storage manifest.
 
     The limit covers explicit tensor storage only; executable sections, generated
@@ -322,7 +323,8 @@ def export_graph(mod, output_dir, *, target=RV64_TARGET, memory_limit_bytes=1 <<
     """
     plan = plan_graph(mod)
     _plan_operator_workspaces(plan, target)
-    return _export_plan(mod, plan, output_dir, target, memory_limit_bytes)
+    return _export_plan(mod, plan, output_dir, target, memory_limit_bytes,
+                        profile_operators=profile_operators)
 
 
 def _plan_operator_workspaces(plan, target):
@@ -394,7 +396,8 @@ def _plan_operator_workspaces(plan, target):
     plan["workspace_bytes"] = offset + _aligned(size)
 
 
-def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix="", shared_constants=None):
+def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix="", shared_constants=None,
+                 profile_operators=False):
     preflight = _memory_preflight(plan, memory_limit_bytes)
     tensors_bytes = preflight["allocated"]["explicit_tensor_bytes"]
     output_dir = checked_path(output_dir)
@@ -425,6 +428,23 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
     else:
         lines.append("extern const char *model_last_error;")
     lines.append(f"const char *{prefix}model_get_last_error(void) {{ return model_last_error; }}")
+    if profile_operators:
+        count = len(plan["calls"])
+        names = ", ".join(json.dumps(symbol) for symbol, _, _ in plan["calls"]) or "0"
+        lines.extend([
+            "#if defined(__riscv) && __riscv_xlen == 64",
+            'static uint64_t model_profile_clock(void) { uint64_t v; __asm__ volatile("csrr %0,mcycle":"=r"(v)::"memory"); return v; }',
+            "#else",
+            "extern uint64_t model_profile_read_cycles(void);",
+            "static uint64_t model_profile_clock(void) { return model_profile_read_cycles(); }",
+            "#endif",
+            f"static uint64_t model_operator_cycles[{max(1, count)}];",
+            "static uint32_t model_profile_completed;",
+            f"static const char *const model_operator_symbols[{max(1, count)}] = {{{names}}};",
+            f"uint32_t {prefix}model_profile_count(void) {{ return model_profile_completed; }}",
+            f"uint64_t {prefix}model_profile_cycles(uint32_t i) {{ return i < model_profile_completed ? model_operator_cycles[i] : 0; }}",
+            f"const char *{prefix}model_profile_symbol(uint32_t i) {{ return i < {count} ? model_operator_symbols[i] : 0; }}",
+        ])
     for symbol, args, results in plan["calls"]:
         ctypes = [DTYPES[tensor.dtype] + "*" for tensor in [*args, *results]]
         if symbol in plan.get("operator_workspaces", {}):
@@ -437,6 +457,7 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         "static int model_overlap(const void *a, uint64_t an, const void *b, uint64_t bn) { return an && bn && (uintptr_t)a < (uintptr_t)b + bn && (uintptr_t)b < (uintptr_t)a + an; }",
         f"int32_t {prefix}model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes) {{",
         "  model_last_error = 0;",
+        *(["  model_profile_completed = 0;"] if profile_operators else []),
         "  if (!outputs" + (" || !inputs" if plan["inputs"] else "") + ") return -1;",
         f"  if (workspace_bytes < UINT64_C({plan['workspace_bytes']})) return -1;",
     ])
@@ -453,11 +474,18 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         for other, other_size in [*read_buffers, *write_buffers[:index]]:
             if other_size:
                 lines.append(f"  if (model_overlap({pointer}, {size}, {other}, {other_size})) return -2;")
-    for symbol, args, results in plan["calls"]:
+    for call_index, (symbol, args, results) in enumerate(plan["calls"]):
         arguments = ["(" + DTYPES[tensor.dtype] + "*)" + address(tensor) for tensor in [*args, *results]]
         if symbol in plan.get("operator_workspaces", {}):
             arguments.append(f"(workspace + {plan['operator_workspace_offset']})")
-        lines.append(f"  if ({symbol}({', '.join(arguments)})) return -3;")
+        if profile_operators:
+            lines.append("  { uint64_t start = model_profile_clock();")
+            lines.append(f"    int32_t rc = {symbol}({', '.join(arguments)});")
+            lines.append(f"    model_operator_cycles[{call_index}] = model_profile_clock() - start;")
+            lines.append("    if (rc) return -3;")
+            lines.append(f"    model_profile_completed = {call_index + 1}; }}")
+        else:
+            lines.append(f"  if ({symbol}({', '.join(arguments)})) return -3;")
     for index, tensor in enumerate(plan["outputs"]):
         if tensor.origin != "output" or tensor.offset != index:
             lines.append(f"  for (uint64_t i = 0; i < UINT64_C({tensor.nbytes}); ++i) ((uint8_t*)outputs[{index}])[i] = ((const uint8_t*){address(tensor)})[i];")
@@ -506,6 +534,17 @@ def _export_plan(mod, plan, output_dir, target, memory_limit_bytes, *, prefix=""
         "calls": [{"symbol": name, "inputs": [t.name for t in args], "outputs": [t.name for t in results]} for name, args, results in plan["calls"]],
         "constants_sha256": _file_sha256(constant_path), "full_model_qualified": False, "timing_qualified": False,
     }
+    if profile_operators:
+        manifest["operator_profile"] = {
+            "count": len(plan["calls"]), "count_entrypoint": prefix + "model_profile_count",
+            "cycles_entrypoint": prefix + "model_profile_cycles",
+            "symbol_entrypoint": prefix + "model_profile_symbol",
+            "counter_storage_bytes": max(1, len(plan["calls"])) * 8 + 4,
+            "scope": "Last invocation, per call_tir; includes each function's existing completion handling",
+            "resets_each_invocation": True, "prints_inside_model_run": False,
+            "aggregate_includes_counter_overhead": True,
+            "excludes": ["wrapper argument checks", "final output copies", "caller routing"],
+        }
     (output_dir / "graph.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest
 

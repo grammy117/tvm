@@ -298,7 +298,8 @@ def compile_package(args):
                     row["database_source"] = by_task.get(row["function"])
     graph = out / "graph"
     manifest = export_graph(
-        selected, graph, target=RV64_TARGET, memory_limit_bytes=args.tensor_memory_bytes
+        selected, graph, target=RV64_TARGET, memory_limit_bytes=args.tensor_memory_bytes,
+        profile_operators=getattr(args, "profile_operators", False),
     )
     # Compile incbin now. The delivered archive contains its own constant object,
     # so it remains usable after the source/output directory has moved.
@@ -323,7 +324,10 @@ def compile_package(args):
     shutil.copy2(adapter_object, out / "adapter.o")
     shutil.copy2(app / "matmul.h", out / "matmul.h")
     (out / "model.h").write_text(
-        '#pragma once\n#include <stdint.h>\n#ifdef __cplusplus\nextern "C" {\n#endif\nint32_t model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes);\nconst char *model_get_last_error(void);\n#ifdef __cplusplus\n}\n#endif\n'
+        '#pragma once\n#include <stdint.h>\n#ifdef __cplusplus\nextern "C" {\n#endif\nint32_t model_run(const void *const *inputs, void *const *outputs, uint8_t *workspace, uint64_t workspace_bytes);\nconst char *model_get_last_error(void);\n'
+        + ('uint32_t model_profile_count(void);\nuint64_t model_profile_cycles(uint32_t index);\nconst char *model_profile_symbol(uint32_t index);\n'
+           if manifest.get("operator_profile") else "")
+        + '#ifdef __cplusplus\n}\n#endif\n'
     )
     libraries = []
     for name in ("libm.a", "libgcc.a"):
@@ -448,6 +452,7 @@ def compile_package(args):
         "host_math": host_math,
         "fallback_tuning_preset": fallback_preset,
         "graph_plan": "graph-plan.json",
+        "operator_profile": manifest.get("operator_profile"),
         "tuned_functions": [row["function"] for row in report
                             if row.get("origin") == "TVM MetaSchedule database"],
         "unmeasured_placement_is_provisional": any(
@@ -492,6 +497,8 @@ def main():
     parser.add_argument("--riscv-gcc", type=Path)
     parser.add_argument("--adapter-receipt", type=Path)
     parser.add_argument("--cpu-only", action="store_true")
+    parser.add_argument("--profile-operators", action="store_true",
+                        help="Buffer per-call operator cycles; report after inference through the session profiler")
     parser.add_argument("--graph-fusion-level", type=int, choices=(-1, 0, 1, 2, 3), default=-1,
                         help="Relax fusion alternative before inner schedule search; default follows PassContext")
     parser.add_argument("--no-prepack-weights", action="store_false", dest="prepack_weights",

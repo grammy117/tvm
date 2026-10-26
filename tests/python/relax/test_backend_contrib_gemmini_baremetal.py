@@ -102,10 +102,15 @@ class StaticGraphTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def compile(self, mod):
-        report = export_graph(mod, self.root, target="llvm")
+    def compile(self, mod, *, profile_operators=False):
+        report = export_graph(mod, self.root, target="llvm", profile_operators=profile_operators)
+        extras = []
+        if profile_operators:
+            clock = self.root / "profile_clock.c"
+            clock.write_text('#include <stdint.h>\nuint64_t model_profile_read_cycles(void) { static uint64_t t; return t += 7; }\n')
+            extras.append(clock)
         library = self.root / "model.so"
-        subprocess.run(["cc", "-shared", "-fPIC", "-std=c11", "-O2", self.root / "model.c", self.root / "constants.S", self.root / "operators.o", "-o", library], check=True, capture_output=True)
+        subprocess.run(["cc", "-shared", "-fPIC", "-std=c11", "-O2", self.root / "model.c", self.root / "constants.S", self.root / "operators.o", *extras, "-o", library], check=True, capture_output=True)
         loaded = ctypes.CDLL(str(library))
         self.addCleanup(dlclose, loaded._handle)
         loaded.model_run.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint64]
@@ -119,6 +124,35 @@ class StaticGraphTests(unittest.TestCase):
         ins = (ctypes.c_void_p * len(inputs))(*(array.ctypes.data for array in inputs))
         outs = (ctypes.c_void_p * len(outputs))(*(array.ctypes.data for array in outputs))
         return loaded.model_run(ins, outs, workspace.ctypes.data, workspace.nbytes if size is None else size)
+
+    def test_operator_profile_preserves_payload_and_resets_after_rejected_call(self):
+        mod = graph()
+        plain = self.root / "plain"
+        export_graph(mod, plain, target="llvm")
+        report, loaded, inputs, outputs, workspace = self.compile(mod, profile_operators=True)
+        for filename in ("operators.o", "constants.bin"):
+            self.assertEqual((plain / filename).read_bytes(), (self.root / filename).read_bytes())
+        loaded.model_profile_count.restype = ctypes.c_uint32
+        loaded.model_profile_cycles.argtypes = [ctypes.c_uint32]
+        loaded.model_profile_cycles.restype = ctypes.c_uint64
+        loaded.model_profile_symbol.argtypes = [ctypes.c_uint32]
+        loaded.model_profile_symbol.restype = ctypes.c_char_p
+        self.assertEqual(loaded.model_profile_count(), 0)
+        for value in (1, 3):
+            inputs[0][:] = value
+            self.assertEqual(self.invoke(loaded, inputs, outputs, workspace), 0)
+            weights = np.arange(12, dtype="int32").reshape(3, 4) - 5
+            expected = ((inputs[0].astype("int32") @ weights + 3) * 2) - 1
+            np.testing.assert_array_equal(outputs[0], expected)
+            self.assertEqual(loaded.model_profile_count(), len(report["calls"]))
+            for index, call in enumerate(report["calls"]):
+                self.assertEqual(loaded.model_profile_cycles(index), 7)
+                self.assertEqual(loaded.model_profile_symbol(index).decode(), call["symbol"])
+        self.assertEqual(loaded.model_profile_cycles(len(report["calls"])), 0)
+        self.assertIsNone(loaded.model_profile_symbol(len(report["calls"])))
+        self.assertEqual(self.invoke(loaded, inputs, outputs, workspace, size=0), -1)
+        self.assertEqual(loaded.model_profile_count(), 0)
+        self.assertEqual(loaded.model_profile_cycles(0), 0)
 
     def test_absolute_constant_binding_reuses_operator_and_payload(self):
         report = export_graph(graph(), self.root, target="llvm")
