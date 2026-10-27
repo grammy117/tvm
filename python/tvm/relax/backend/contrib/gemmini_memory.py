@@ -106,12 +106,14 @@ _DMA_READS = {
     "tvm_gemmini_dma_acc_write": 0,
     "tvm_gemmini_dma_acc_add": 0,
     "tvm_gemmini_dma_widen": 0,
+    "tvm_gemmini_dma_scaled_in": 0,
 }
 _DMA_WRITES = {
     "tvm_gemmini_dma_out": 1,
     "tvm_gemmini_dma_spad_out": 1,
     "tvm_gemmini_dma_relu_out": 1,
     "tvm_gemmini_dma_scaled_out": 1,
+    "tvm_gemmini_dma_pool_out": 1,
 }
 _MAX_BLOCKS = 4  # MAX_BLOCK_LEN for INT8 scratchpad rows of the pinned profile
 
@@ -546,6 +548,13 @@ def lower_memory(mod, *, spad_rows=16384, acc_rows=1024):
                 return tir.call_extern(
                     "void", symbol, dst, row, height, width, stride, scale, relu, wait_flag(dst)
                 )
+            if symbol == "tvm_gemmini_dma_scaled_in":
+                src, row, height, width, stride, scale, accumulate, _ = args
+                return tir.call_extern("void", symbol, src, row, height, width, stride,
+                                       scale, accumulate, wait_flag(src))
+            if symbol == "tvm_gemmini_dma_pool_out":
+                row, dst, size = args
+                return tir.call_extern("void", symbol, dst, row, size, wait_flag(dst))
             if symbol in ("tvm_gemmini_dma_out", "tvm_gemmini_dma_spad_out", "tvm_gemmini_dma_relu_out"):
                 row, dst, height, width, _, stride = args
                 return tir.call_extern("void", symbol, dst, row, height, width, stride, wait_flag(dst))

@@ -548,6 +548,9 @@ def register_literal_intrinsic(rows, cols, rank, dtype, value_bits):
 
 def elementwise_blocks(func):
     """Find exact copies, widening, INT32 addition and INT8 ReLU blocks."""
+    from .gemmini_bytes import BYTE_DTYPES
+    from .gemmini_affine import affine_match
+
     matches = []
 
     def visit(node):
@@ -581,14 +584,14 @@ def elementwise_blocks(func):
         if (
             isinstance(value, tir.BufferLoad)
             and value.dtype == output.dtype
-            and output.dtype in ("int8", "int32", "float32")
+            and output.dtype in ("int8", "int32", "float32", *BYTE_DTYPES)
         ):
             kind, loads = (
-                {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}[output.dtype],
+                {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}.get(output.dtype, "bytes_" + output.dtype),
                 [value],
             )
         elif (
-            output.dtype in ("int8", "int32", "float32")
+            output.dtype in ("int8", "int32", "float32", *BYTE_DTYPES)
             and (selected := copy_selection_loads(value, output.dtype)) is not None
         ):
             kind, loads = "select_copy", selected
@@ -604,7 +607,7 @@ def elementwise_blocks(func):
             and isinstance(value.args[1], tir.BufferLoad)
             and isinstance(value.args[2], (tir.IntImm, tir.FloatImm))
             and value.args[1].dtype == output.dtype
-            and output.dtype in ("int8", "int32", "float32")
+            and output.dtype in ("int8", "int32", "float32", *BYTE_DTYPES)
         ):
             kind, loads = "padding", [value.args[1]]
         elif isinstance(value, tir.Max) and output.dtype == "int8":
@@ -648,6 +651,8 @@ def elementwise_blocks(func):
             )
         ):
             kind, loads = "add_i32_wrapping", [value.value.a.value, value.value.b.value]
+        elif affine_match(node) is not None:
+            kind, loads = "affine_i8", []
         else:
             return
         # Tensorize proves the access map below. Copies may use sliced,
@@ -658,7 +663,9 @@ def elementwise_blocks(func):
         if len(scalar_inputs) > 1:
             return
         if scalar_inputs:
-            if kind in ("copy_i8", "copy_i32", "copy_f32", "widen_i8_i32"):
+            if kind.startswith("bytes_"):
+                pass
+            elif kind in ("copy_i8", "copy_i32", "copy_f32", "widen_i8_i32"):
                 kind = {
                     "copy_i8": "fill_i8",
                     "copy_i32": "fill_i32",
@@ -730,7 +737,15 @@ def schedule_elementwise(
                     max(value for value in range(1, 17) if extent % value == 0)
                     for extent in dimensions
                 ]
+                if kind.startswith("bytes_"):
+                    size = max(1, (tvm.DataType(node.body.buffer.dtype).bits + 7) // 8)
+                    factors[-1] = max(value for value in range(1, 16 // size + 1)
+                                      if dimensions[-1] % value == 0)
+                    if any(not region.buffer.shape for region in node.reads):
+                        factors[-1] = 1
                 if kind.startswith(("fill_", "constant_")) or "_scalar_" in kind:
+                    factors[-1] = 1
+                if kind == "affine_i8":
                     factors[-1] = 1
                 if use_scalar:
                     factors = [1] * rank
@@ -763,7 +778,9 @@ def schedule_elementwise(
 
 def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensorize):
     rows, cols = factors if rank == 2 else (1, factors[0])
-    if kind.startswith("constant_"):
+    if kind.startswith("bytes_") or kind == "affine_i8":
+        intrinsics = None
+    elif kind.startswith("constant_"):
         copy_kind = {"int8": "copy_i8", "int32": "copy_i32", "float32": "copy_f32"}[
             node.body.buffer.dtype
         ]
@@ -813,14 +830,34 @@ def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensori
     loops = sch.get_loops(block)[-rank:]
     split = [sch.split(loop, [None, factor]) for loop, factor in zip(loops, factors)]
     sch.reorder(*[pair[0] for pair in split], *[pair[1] for pair in split])
-    if kind == "relu_i8":
+    if kind in ("relu_i8", "affine_i8") or kind.startswith("bytes_"):
         if mark_tensorize:
             tile = sch.blockize(sch.get_loops(block)[-rank])
-            intrinsic = register_relu_intrinsic(
-                rows, cols, rank, isinstance(node.body.value.a, tir.IntImm)
-            )
+            if kind == "relu_i8":
+                intrinsic = register_relu_intrinsic(
+                    rows, cols, rank, isinstance(node.body.value.a, tir.IntImm)
+                )
+            elif kind == "affine_i8":
+                from .gemmini_affine import register_affine_intrinsic
+                intrinsic = register_affine_intrinsic(node, rows, rank)
+            else:
+                from .gemmini_bytes import register_byte_copy
+                source_rank = len(node.body.value.buffer.shape)
+                intrinsic = register_byte_copy(rows, cols, rank, node.body.buffer.dtype,
+                                               source_rank if source_rank < rank else None)
             sch.annotate(tile, "meta_schedule.auto_tensorize", intrinsic)
-        return {"operation": kind, "tile_rows": rows, "tile_cols": cols}
+        metadata = {"operation": kind, "tile_rows": rows, "tile_cols": cols}
+        if kind == "affine_i8":
+            from .gemmini_affine import affine_match
+            match = affine_match(node)
+            if match["raw_readout"]:
+                metadata["operation"] = "scaled_readout"
+            metadata.update(coefficients=[c for _,c,_ in match["terms"]], offset=match["offset"],
+                            operand_scale_bits=[struct.unpack("I",struct.pack("f",s))[0] for _,_,s in match["terms"]],
+                            per_operand_rounding=match["per_operand_rounding"],
+                            scaled_readout=match["readout"] is not None,
+                            readout_proof=match["readout"])
+        return metadata
     outer = split[-1][0]
     write = sch.cache_write(block, 0, intrinsics["scope"])
     sch.reverse_compute_at(write, outer, preserve_unit_loops=True)

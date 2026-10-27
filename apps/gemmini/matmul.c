@@ -130,6 +130,7 @@ static struct {
   uint64_t ld_stride[3];
   uint32_t ld_block[3];
   int ld_shrunk[3];
+  uint32_t ld_scale[3];
   int valid_st;
   uint64_t st_stride;
   int st_act;
@@ -148,16 +149,22 @@ static void invalidate_shadow(void) {
   shadow.valid_ws = 0;
 }
 
-static void config_ld(int id, uint64_t stride, int shrunk, uint32_t block) {
+static void config_ld_scaled(int id, uint64_t stride, int shrunk, uint32_t block, float scale) {
+  union { uint32_t bits; float value; } s = {.value = scale};
   if (shadow.valid_ld[id] && shadow.ld_stride[id] == stride && shadow.ld_shrunk[id] == shrunk &&
-      shadow.ld_block[id] == block) {
+      shadow.ld_block[id] == block && shadow.ld_scale[id] == s.bits) {
     return;
   }
-  gemmini_extended4_config_ld(stride, MVIN_SCALE_IDENTITY, shrunk, block, id);
+  gemmini_extended4_config_ld(stride, scale, shrunk, block, id);
   shadow.valid_ld[id] = 1;
   shadow.ld_stride[id] = stride;
   shadow.ld_shrunk[id] = shrunk;
   shadow.ld_block[id] = block;
+  shadow.ld_scale[id] = s.bits;
+}
+
+static void config_ld(int id, uint64_t stride, int shrunk, uint32_t block) {
+  config_ld_scaled(id, stride, shrunk, block, MVIN_SCALE_IDENTITY);
 }
 
 static void config_st(uint64_t stride, int act, float scale) {
@@ -347,6 +354,18 @@ void tvm_gemmini_dma_widen(const int8_t* src, uint32_t row, uint32_t rows, uint3
   if (wait) tvm_gemmini_end();
 }
 
+void tvm_gemmini_dma_scaled_in(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols,
+                              int64_t stride, uint32_t scale_bits, int32_t accumulate, int32_t wait) {
+  /* The compiler proves per-operand RNE/saturation for the complete signed-byte
+   * domain, with scale in (0,1]. Full-width INT32 loads remain unscaled. */
+  union { uint32_t bits; float value; } scale = {.bits = scale_bits};
+  config_ld_scaled(2, (uint64_t)stride, true, DIM, scale.value);
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvin3(src, accumulator_address(row, accumulate), cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
 void tvm_gemmini_dma_spad_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait) {
   config_st((uint64_t)stride, NO_ACTIVATION, ACC_SCALE_IDENTITY);
   asm volatile("" ::: "memory");
@@ -376,6 +395,19 @@ void tvm_gemmini_dma_scaled_out(int8_t* dst, uint32_t row, uint32_t rows, uint32
   config_st((uint64_t)stride, relu ? RELU : NO_ACTIVATION, scale.value);
   asm volatile("" ::: "memory");
   gemmini_extended_mvout(dst, address, cols, rows);
+  asm volatile("" ::: "memory");
+  if (wait) tvm_gemmini_end();
+}
+
+void tvm_gemmini_dma_pool_out(int8_t* dst, uint32_t row, uint32_t size, int32_t wait) {
+  /* One values-only square window, one channel, no physical padding. Input
+   * rows are complete widened INT8 values, hence identity readout is exact. */
+  uint32_t address = accumulator_address(row, 0) & ~(1U << (ADDR_LEN - 3));
+  gemmini_extended2_config_st(1, NO_ACTIVATION, ACC_SCALE_IDENTITY,
+                            1, size, 1, 1, 1, size, size, 0, 0);
+  shadow.valid_st = 0;  /* Ordinary stores must clear all pooling fields. */
+  asm volatile("" ::: "memory");
+  gemmini_extended_mvout(dst, address, 1, 0);
   asm volatile("" ::: "memory");
   if (wait) tvm_gemmini_end();
 }

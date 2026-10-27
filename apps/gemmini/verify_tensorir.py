@@ -73,11 +73,36 @@ void* memset(void* p,int c,size_t n) { volatile unsigned char* d=p;for(size_t i=
 void* memcpy(void* d,const void* s,size_t n) { volatile unsigned char* o=d;const volatile unsigned char* p=s;for(size_t i=0;i<n;++i)o[i]=p[i];return d; }
 int printf(const char* format,...) { (void)format;puts_htif("VENDOR_DIAGNOSTIC\n");return 0; }
 __attribute__((noreturn)) void exit(int code) { tohost=((uint64_t)(code?code:99)<<1)|1;for(;;){} }
-static unsigned computes,zeros,dmas,accumulates,acc_writes,relus,scaled_outs;
+static unsigned computes,zeros,dmas,accumulates,acc_writes,relus,scaled_outs,pool_outs;
+void __real_tvm_gemmini_dma_a(const int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __real_tvm_gemmini_dma_b(const int8_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __real_tvm_gemmini_dma_out(int32_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
+void __wrap_tvm_gemmini_dma_a(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;__real_tvm_gemmini_dma_a(p,c,m,n,s,w);
+}
+void __wrap_tvm_gemmini_dma_b(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;__real_tvm_gemmini_dma_b(p,c,m,n,s,w);
+}
+void __wrap_tvm_gemmini_dma_out(int32_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,int32_t w) {
+  ++dmas;__real_tvm_gemmini_dma_out(p,c,m,n,s,w);
+}
+void __real_tvm_gemmini_dma_scaled_in(const int8_t*,uint32_t,uint32_t,uint32_t,int64_t,uint32_t,int32_t,int32_t);
+void __wrap_tvm_gemmini_dma_scaled_in(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,uint32_t scale,int32_t add,int32_t w) {
+  ++dmas;if(add)++accumulates;
+  __real_tvm_gemmini_dma_scaled_in(p,c,m,n,s,scale,add,w);
+}
+void __real_tvm_gemmini_dma_pool_out(int8_t*,uint32_t,uint32_t,int32_t);
+void __wrap_tvm_gemmini_dma_pool_out(int8_t* p,uint32_t c,uint32_t size,int32_t w) {
+  ++dmas;++pool_outs;__real_tvm_gemmini_dma_pool_out(p,c,size,w);
+}
 void __real_tvm_gemmini_compute(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
 void __real_tvm_gemmini_zero_acc(uint32_t,uint32_t,uint32_t);
 void __wrap_tvm_gemmini_compute(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
   ++computes;__real_tvm_gemmini_compute(a,b,c,m,n,k,add);
+}
+void __real_tvm_gemmini_compute_ws(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,int32_t);
+void __wrap_tvm_gemmini_compute_ws(uint32_t a,uint32_t b,uint32_t c,uint32_t m,uint32_t n,uint32_t k,int32_t add) {
+  ++computes;__real_tvm_gemmini_compute_ws(a,b,c,m,n,k,add);
 }
 void __wrap_tvm_gemmini_zero_acc(uint32_t c,uint32_t m,uint32_t n) { ++zeros;__real_tvm_gemmini_zero_acc(c,m,n); }
 void __real_tvm_gemmini_dma_acc_write(const int32_t*,uint32_t,uint32_t,uint32_t,int64_t,int32_t);
@@ -946,10 +971,13 @@ def fixture_guest(
             "int64": "int64_t",
             "float32": "uint32_t",
             "bool": "uint8_t",
+            "uint8": "uint8_t", "int16": "int16_t", "uint16": "uint16_t",
+            "float16": "uint16_t", "uint32": "uint32_t", "uint64": "uint64_t",
+            "float64": "uint64_t",
         }.get(str(array.dtype))
         if ctype is None or not array.size:
             raise ValueError("Unsupported or empty verification tensor")
-        data = array.view("uint32") if array.dtype == np.float32 else array
+        data = array.view("uint" + str(array.itemsize * 8)) if array.dtype.kind == "f" else array
         return ctype, ",".join(str(int(x)) for x in data.flat)
 
     guest, checks = [], []
@@ -1002,6 +1030,9 @@ def fixture_guest(
         primitive_check += f"if(accumulates==add_before_{index})return 21;"
     if operation == "relu_i8":
         primitive_check += f"if(relus==relu_before_{index})return 21;"
+    if operation == "max_pool_i8":
+        checks.append(f"unsigned pool_before_{index}=pool_outs;")
+        primitive_check += f"if(pool_outs==pool_before_{index})return 21;"
     if placement == "mixed":
         primitive_check += f"if(computes!=before_{index})return 21;"
     if required_scaled:
@@ -1161,6 +1192,7 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
         "-Wl,--no-relax",
         "-Wl,-T," + str(out / "link.ld"),
         "-Wl,--wrap=tvm_gemmini_compute",
+        "-Wl,--wrap=tvm_gemmini_compute_ws",
         "-Wl,--wrap=tvm_gemmini_zero_acc",
         "-Wl,--wrap=tvm_gemmini_dma_acc_write",
         "-Wl,--wrap=tvm_gemmini_dma_acc_add",
@@ -1168,6 +1200,11 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
         "-Wl,--wrap=tvm_gemmini_dma_spad_out",
         "-Wl,--wrap=tvm_gemmini_dma_relu_out",
         "-Wl,--wrap=tvm_gemmini_dma_scaled_out",
+        "-Wl,--wrap=tvm_gemmini_dma_scaled_in",
+        "-Wl,--wrap=tvm_gemmini_dma_pool_out",
+        "-Wl,--wrap=tvm_gemmini_dma_a",
+        "-Wl,--wrap=tvm_gemmini_dma_b",
+        "-Wl,--wrap=tvm_gemmini_dma_out",
         "-I" + str(out),
     ]
     sources = [out / "start.S", out / "runner.c", package / "runtime.c", package / "constants.S"]

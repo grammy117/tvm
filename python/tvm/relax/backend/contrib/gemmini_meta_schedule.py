@@ -38,6 +38,7 @@ from .gemmini_sketch import apply_contraction_sketch, contraction_info, sketch_s
 from .gemmini_target import GemminiCapabilities
 from .gemmini_elementwise import elementwise_blocks, schedule_elementwise
 from .gemmini_reduction import reduction_blocks, schedule_reduction
+from .gemmini_pool import pool_blocks, schedule_pool
 
 
 def _supported(func):
@@ -51,6 +52,8 @@ def _supported(func):
         return "contraction", contractions
     if len(reduction_blocks(func)) == 1:
         return "reduction", [reduction_blocks(func)[0][0].name_hint]
+    if len(pool_blocks(func)) == 1:
+        return "pool", [pool_blocks(func)[0][0].name_hint]
     pointwise = elementwise_blocks(func)
     if pointwise:
         return "elementwise", [pointwise[0][0].name_hint]
@@ -89,7 +92,8 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
         func = sch.mod["main"]
         kind, names = _supported(func)
         if (kind != "contraction"
-                and "gemmini.sketch" in func.body.block.annotations):
+                and any(key in func.body.block.annotations for key in
+                        ("gemmini.sketch", "gemmini.pool_scheduled"))):
             # Decomposing a contraction removes its reduction init. Do not
             # then reinterpret its padding/reindexing producers as independent
             # copy kernels: their predicates belong to the contraction sketch.
@@ -119,11 +123,15 @@ class GemminiScheduleRule(ms.schedule_rule.PyScheduleRule):
             return results
         # Secondary operators keep their structural rules: each candidate is
         # a recorded trace of ordinary primitives replayed onto this schedule.
-        schedule = schedule_reduction if kind == "reduction" else schedule_elementwise
+        schedule = schedule_reduction if kind == "reduction" else schedule_pool if kind == "pool" else schedule_elementwise
         results, traces = [], set()
         for scalar in (False, True):
             try:
-                transformed, _, _ = schedule(func, tensorize=False, mark_tensorize=True, scalar=scalar)
+                # A pooled window's intrinsic includes its reduction init.
+                # Record Tensorize now, before RewriteReductionBlock separates
+                # that init. This remains an ordinary replayable TVM trace.
+                transformed, _, _ = schedule(func, tensorize=kind == "pool",
+                                              mark_tensorize=kind != "pool", scalar=scalar)
             except (ValueError, tvm.TVMError):
                 continue
             if str(transformed.trace) in traces:
@@ -202,6 +210,9 @@ def cpu_schedule_rules():
 
 def gemmini_schedule_rules(capabilities=None, dataflows=("os", "ws"), *, compact=False):
     return [
+        # Resolve TOPI's schedule_rule annotations through the stock dispatcher
+        # before ordinary target rules are considered.
+        ms.schedule_rule.ApplyCustomRule(),
         GemminiScheduleRule(capabilities, dataflows, compact),
         ms.schedule_rule.ParallelizeVectorizeUnroll(
             max_jobs_per_core=-1,

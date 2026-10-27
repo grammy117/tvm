@@ -103,6 +103,25 @@ static void flush(void) {
         bits += x.op==5?(uint32_t)acc[x.c+i][j]:0;
         memcpy(&acc[x.c+i][j],&bits,sizeof(bits));initialized[x.c+i][j]=1;
       }
+    } else if(x.op==12) {
+      check(x.c+x.m<=1024 && (x.stride==0 || x.stride>=x.n));
+      union {uint32_t bits;float value;} scale={.bits=x.a};
+      const int8_t* p=x.src;
+      for(unsigned i=0;i<x.m;++i) for(unsigned j=0;j<x.n;++j) {
+        if(x.add)check(initialized[x.c+i][j]);
+        float rounded=nearbyintf((float)p[i*x.stride+j]*scale.value);
+        int32_t v=rounded>127?127:rounded < -128?-128:(int32_t)rounded;
+        acc[x.c+i][j]=(x.add?acc[x.c+i][j]:0)+v;
+        initialized[x.c+i][j]=1;
+      }
+    } else if(x.op==13) {
+      check(x.c+x.k*x.k<=1024 && (x.k==2 || x.k==3));
+      int8_t maximum=-128;
+      for(unsigned i=0;i<x.k*x.k;++i) {
+        check(initialized[x.c+i][0] && acc[x.c+i][0]>=-128 && acc[x.c+i][0]<=127);
+        if(acc[x.c+i][0]>maximum)maximum=acc[x.c+i][0];
+      }
+      store(x.dst,&maximum,1);
     } else if(x.op==6) {
       check(x.c+x.m<=1024 && (x.stride==0 || x.stride>=x.n));
       const int8_t* p=x.src;
@@ -142,6 +161,12 @@ void emulator_wrong(int x) { wrong=x; }
 void emulator_reverse_stores(int x) { reverse_stores=x; }
 unsigned emulator_faults(void) { return faults; }
 unsigned emulator_commands(void) { return commands; }
+void tvm_gemmini_dma_scaled_in(const int8_t* p,uint32_t c,uint32_t m,uint32_t n,int64_t s,uint32_t scale,int32_t add,int32_t wait) {
+  push((struct command){.op=12,.src=p,.c=c,.m=m,.n=n,.stride=s,.a=scale,.add=add});if(wait)flush();
+}
+void tvm_gemmini_dma_pool_out(int8_t* p,uint32_t c,uint32_t size,int32_t wait) {
+  push((struct command){.op=13,.dst=p,.c=c,.k=size,.m=1,.n=1});if(wait)flush();
+}
 unsigned emulator_fences(void) { return fences; }
 unsigned emulator_pending(void) { return count; }
 int32_t tvm_gemmini_validate_tensor_output(void* c,int64_t cz) {

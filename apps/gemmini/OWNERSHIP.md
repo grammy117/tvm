@@ -164,6 +164,97 @@ Independent formulas, tails, refusal cases and runtime checks bound applicabilit
 | ELF measurement cache/dedup | Campaign identity policy | External runner/cache | Workload + actual guest bytes and bound toolchain; not a search heuristic |
 | Non-regressing default record fallback | Integration policy after search | Standard database commit | Preserve pure-search minima separately |
 
+## Complete current device-operation inventory
+
+`Prev` means available before the device-operation extension, at
+`3423bd6818ab752ddd9cdb5d5773743e48c65f1d`; `New` means added in
+`gemmini/device-ops`. These are mathematical pattern/dtype capabilities, not
+unconditional ATen-overload coverage or measured performance claims. The
+[reviewed baseline](https://github.com/ucb-bar/merlin/blob/608f3939b9ccadf552c0be6737859fdc64b7d1d6/examples/gemmini/target/software-spec.yaml)
+defines the source/numerical admission boundary. No model-name dispatch, CPU
+loop/packing search knobs, new runtime, or TVM C++ change is introduced here.
+
+| Device operation | Status | Handling and limits |
+| --- | --- | --- |
+| INT8 x INT8 -> INT32 contraction: `mm`, `bmm`, eligible convolutions/linear/attention matmuls | Prev | Existing TensorIR contraction sketches and primitive OS/WS; static layouts/tails and PE/accumulator bounds remain mandatory. Conv indexing/packing may be host work. |
+| Contraction with INT32 bias: eligible `addmm`/linear/conv bias | Prev | Proved bias normalization, full-width seed load once, existing reduction tensorization. Arbitrary FP32 bias is not this operation. |
+| Accumulator zero/init; INT8 A/B operand loads; multi-block loads | Prev | Existing primitive zero/mvin commands and SRAM lifetime allocation. |
+| Full-width INT32 accumulator overwrite/add | Prev | Unscaled full-width DMA; addition uses the existing modulo-32 accumulator semantics. |
+| Signed INT8 -> INT32 widening | Prev | Shrunk/unit-scaled accumulator load. |
+| INT32 tensor/scalar broadcast addition | Prev | Full-width overwrite followed by accumulator-add DMA. |
+| INT8 ReLU | Prev | Widen plus native identity-scale ReLU readout; fused producer readout also supported. |
+| INT8/INT32/FP32 copy, repeat/broadcast, indexed copy, constant/scalar fill | Prev | Existing DMA intrinsics and region partitioning. FP32 copies preserve bits and do no floating arithmetic. |
+| Static padding, concatenation, slice/select/scatter and materialized permutation | Prev machinery; New dtype reach | Existing static copy-region rules, with native byte-copy implementations for the additional storage types below. Region predicates/aliasing must be proved. Residual producer work can remain CPU. |
+| Opaque bool/INT16/FP16/BF16/INT64/FP64 copies, broadcasts and materialized permutations | New | Unscaled scratchpad byte DMA, explicit byte widths/strides/pointers. No conversion or arithmetic. Physical tiles stay within 16 rows and 16 bytes per row. |
+| Bounded affine `a*x + b*y + c`, including subtract, negation and scalar coefficients | New | One/two signed-INT8 sources widened to INT32; signed byte coefficients; constant INT32 seed; full-domain prefix bounds. Unit terms use accumulator loads; other coefficients execute on the WS mesh. Raw INT32 or proved RNE/saturated INT8 output. Wrapping INT8 arithmetic, general INT32 coefficient arithmetic and FP32 affine operations are not silently reinterpreted. |
+| Single-rounding byte residual sum | New | Unit input loads, exact INT32 addition, one proved readout rounding/saturation, optional ReLU. |
+| Per-operand-rounding byte residual sum | New | Each positive input scale in `(0,1]` scales/RNE/saturates its byte before INT32 addition, then a proved narrow readout. Two terms, no bias, no raw accumulator exit for this family. Independent exhaustive 65,536-pair fixtures exercise two scale pairs. |
+| Scalar scaled/RNE/saturated/ReLU INT8 readout fused with contraction | Prev | Existing full-INT32-domain output-threshold proof; no tolerance widening or scale averaging. |
+| Standalone INT32 -> scaled/RNE/saturated/ReLU INT8 readout | New integration | Same proof and existing readout command, now recognized by normal placement, including INT32 extremes. |
+| Signed-INT8 sums, including static window sums | Prev | Existing reduction-against-ones kernel; bounded INT32 accumulation, selected exact INT64 exits. Arbitrary FP32/wide-integer sums remain CPU. |
+| Quantized window average / mean epilogue | New | Existing integer sum kernel plus proved scaled narrow readout, including non-power-of-two reciprocal factors already present in the prepared program. Layout reconstruction remains visible. This does not convert arbitrary FP32 average pooling to a different quantized program. |
+| Values-only INT8 max, complete 2x2/3x3 windows | New | Integer maximum executes in pooled accumulator readout. Index gathering and literal padding remain explicit host TensorIR producers. Every physical window is complete, so the hardware's implicit zero padding is unused; negative-valued source padding is preserved correctly. No indices or FP32 maximum. |
+| Legal reshape/view/alias/squeeze/unsqueeze/split | Prev | Metadata/view when possible; materialized results use the copy paths above. A metadata-only operation is not advertised as native arithmetic. |
+
+Copy offload keeps its existing explicit opt-in or measured-record policy;
+it is not globally enabled by this extension. New arithmetic/window rules use
+the same default placement and stock MetaSchedule union as existing operators.
+Pool Tensorize is recorded before stock reduction decomposition because its
+intrinsic includes initialization; all schedule operations remain replayable.
+This adds coverage, not a measured winner or an automatic expansion of the
+contraction-only remote campaign's task selection.
+
+Frozen scales shared by groups of 16 output channels retain their exact values
+and short-tail handling. **General fusion of a nonuniform grouped-scale vector
+is still partial**: raw INT32 output followed by the original CPU FP32 rescaling
+remains supported and is checked by `group16_preserved`. This extension never
+replaces a vector by one tensor scale. General fused conv-plus-pool residency,
+arbitrary/adaptive floating averages, wider-integer limb constructions,
+comparisons, arg reductions, sort, nonlinear floating arithmetic and complex
+storage are outside this minimal extension. RMSNorm/RoPE/softmax/SiLU remain CPU
+work under the selected policy.
+
+All primitive adapter entrypoints are accounted for below; the new C entrypoints
+only issue configuration/transfer commands and contain no CPU output arithmetic.
+
+| Primitive ABI entrypoint(s) | Status | Role |
+| --- | --- | --- |
+| `tvm_gemmini_begin`, `tvm_gemmini_end` | Prev | Exclusive command session, configuration reset, completion/coherence fences. |
+| `tvm_gemmini_load_a`, `tvm_gemmini_load_b` | Prev | Primitive scratchpad loads using current load configuration. |
+| `tvm_gemmini_dma_a`, `tvm_gemmini_dma_b`, `tvm_gemmini_dma_a_blocks`, `tvm_gemmini_dma_b_blocks` | Prev | Configured scratchpad DMA, including byte-copy payloads and legal coalesced blocks. |
+| `tvm_gemmini_compute`, `tvm_gemmini_compute_ws` | Prev | Primitive OS/WS mesh contractions; weighted affine uses the same compute ABI. |
+| `tvm_gemmini_zero_acc` | Prev | Hardware zero load. |
+| `tvm_gemmini_store`, `tvm_gemmini_dma_out` | Prev | Full-width INT32 result readout. |
+| `tvm_gemmini_dma_acc_write`, `tvm_gemmini_dma_acc_add` | Prev | Full-width accumulator overwrite/add without a scaler. |
+| `tvm_gemmini_dma_widen` | Prev | Unit-scale signed-byte accumulator load. |
+| `tvm_gemmini_dma_spad_out` | Prev | Uninterpreted scratchpad bytes to host. |
+| `tvm_gemmini_dma_relu_out`, `tvm_gemmini_dma_scaled_out` | Prev | Native narrow readout with the proved activation/scale/rounding contract. |
+| `tvm_gemmini_dma_scaled_in` | New | Byte load scale plus overwrite/add. Load-configuration caching now includes scale bits, so subsequent unit loads reset correctly. |
+| `tvm_gemmini_dma_pool_out` | New | One complete values-only 2x2/3x3 signed-byte max window. Invalidates cached store configuration so subsequent ordinary stores clear pooling. |
+| `tvm_gemmini_matmul_i8_i32` | Prev, legacy API | Retained whole-operation interface; current TensorIR schedules issue primitive calls instead. |
+| `tvm_gemmini_validate_matmul_i8_i32`, `tvm_gemmini_validate_tensor_buffers`, `tvm_gemmini_validate_tensor_output` | Prev, CPU admission | Range/alias/ABI checks, not accelerator operations. |
+
+`verify_device_ops.py` builds guarded original-TVM-operator guests with independent
+NumPy references, primitive-use checks and a wrong-oracle ELF. Execute through
+`verify_tensorir.py run --backend spike`; Spike establishes functional semantics,
+not FireSim cycles or a full-model quality result. Existing local/remote model
+artifacts remain bound to their original source and numerical identities.
+The new affine tiles use one column and max pooling uses one output window per
+command group. These conservative implementations establish coverage; their
+throughput and full-model benefit have not been measured.
+
+With this TVM source/Python/native library selected and the normal adapter and
+functional simulator receipts built, reproduce the qualification with:
+
+```sh
+"$PY" apps/gemmini/verify_device_ops.py --output-dir "$OUT/device-ops" \
+  --adapter-receipt "$ADAPTER_RECEIPT" --riscv-gcc "$GCC"
+"$PY" apps/gemmini/verify_tensorir.py run --bundle "$OUT/device-ops" \
+  --backend spike --simulator-receipt "$SPIKE_RECEIPT" --name positive
+"$PY" apps/gemmini/verify_tensorir.py run --bundle "$OUT/device-ops" \
+  --backend spike --simulator-receipt "$SPIKE_RECEIPT" --name negative --negative
+```
+
 ## Upstream modifications by subsystem
 
 | Area | Full purpose of fork delta | Review/ownership disposition |

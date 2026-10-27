@@ -503,6 +503,7 @@ class ScheduleGemminiTensorIR:
     def transform_module(self, mod, _ctx):
         from .gemmini_elementwise import elementwise_blocks, make_elementwise_schedule
         from .gemmini_reduction import reduction_blocks, reduction_metadata, make_reduction_schedule
+        from .gemmini_pool import pool_blocks, make_pool_schedule
 
         for gv, func in list(mod.functions_items()):
             if not isinstance(func, tir.PrimFunc) or (
@@ -535,13 +536,14 @@ class ScheduleGemminiTensorIR:
                 continue
             matches = contraction_block(func) or _normalizable_contractions(func)
             reductions = reduction_blocks(func) if not matches else []
-            pointwise = elementwise_blocks(func) if not matches and not reductions else []
-            if not matches and not pointwise and not reductions:
+            pools = pool_blocks(func) if not matches and not reductions else []
+            pointwise = elementwise_blocks(func) if not matches and not reductions and not pools else []
+            if not matches and not pointwise and not reductions and not pools:
                 self.report.append(
                     {
                         "function": gv.name_hint,
                         "placement": "cpu",
-                        "reason": "No supported exact integer contraction, bounded sum, copy, widening or addition",
+                        "reason": "No supported exact integer contraction, bounded sum/window, affine/readout, copy, widening or addition",
                     }
                 )
                 continue
@@ -550,7 +552,7 @@ class ScheduleGemminiTensorIR:
                     pointwise
                     and not self.offload_copies
                     and any(
-                        not kind.startswith("add_i32") and kind != "relu_i8"
+                        not kind.startswith("add_i32") and kind not in ("relu_i8", "affine_i8")
                         for _, kind in pointwise
                     )
                 ):
@@ -562,7 +564,10 @@ class ScheduleGemminiTensorIR:
                         }
                     )
                     continue
-                if reductions:
+                if pools:
+                    result = make_pool_schedule(func, capabilities=self.capabilities)
+                    origin = "TensorIR values-only pooled readout rule"
+                elif reductions:
                     result = make_reduction_schedule(func, capabilities=self.capabilities)
                     origin = "deterministic TensorIR reduction rule"
                 elif pointwise:

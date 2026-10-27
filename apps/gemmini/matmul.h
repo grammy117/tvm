@@ -85,12 +85,19 @@ void tvm_gemmini_dma_out(int32_t* dst, uint32_t row, uint32_t rows, uint32_t col
 void tvm_gemmini_dma_acc_write(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 void tvm_gemmini_dma_acc_add(const int32_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 void tvm_gemmini_dma_widen(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
+/* Signed-byte load scaling, RNE/saturate each operand before INT32 addition.
+ * Proven scales are in (0,1]; accumulate is 0 (overwrite) or 1 (add). */
+void tvm_gemmini_dma_scaled_in(const int8_t* src, uint32_t row, uint32_t rows, uint32_t cols,
+                              int64_t stride, uint32_t scale_bits, int32_t accumulate, int32_t wait);
 void tvm_gemmini_dma_spad_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 /* Identity-scale narrow ReLU. Every read element must have been widened from
  * INT8, so no saturation or rounding changes a positive value. */
 void tvm_gemmini_dma_relu_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols, int64_t stride, int32_t wait);
 void tvm_gemmini_dma_scaled_out(int8_t* dst, uint32_t row, uint32_t rows, uint32_t cols,
                                int64_t stride, uint32_t scale_bits, int32_t relu, int32_t wait);
+/* Values-only 2x2/3x3 signed-byte max; size*size complete widened input rows,
+ * one channel, no physical padding, one output byte. */
+void tvm_gemmini_dma_pool_out(int8_t* dst, uint32_t row, uint32_t size, int32_t wait);
 /* Admission for a literal fill with no external source buffers. */
 int32_t tvm_gemmini_validate_tensor_output(void* c, int64_t c_bytes);
 int32_t tvm_gemmini_validate_tensor_buffers(const void* a, int64_t a_bytes, const void* b, int64_t b_bytes,

@@ -351,8 +351,19 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
         for downstream in sch.get_consumers(consumer):
             sch.reverse_compute_at(downstream, io, preserve_unit_loops=True)
     init = sch.decompose_reduction(block, ko)
+    from .gemmini_epilogue import fuse_readout
+    sch, write, readout_intrinsic = fuse_readout(sch, write, m, 1)
+    if readout_intrinsic is not None:
+        # The sum flattens arbitrary output axes. Keep the physical readout
+        # rectangular and retain the original output view as a visible copy.
+        sch.reindex_cache_write(write, 0, "global", tir.IndexMap.from_func(
+            lambda i,j:(i if rows > 1 else tir.const(0,dtype),tir.const(0,dtype)), index_dtype=dtype))
+        for consumer in sch.get_consumers(write):
+            sch.reverse_compute_at(consumer, io, preserve_unit_loops=True)
     mathematical = sch.mod
     intrinsics = register_reduction_intrinsics(m, k, wide, tuple(source_casts))
+    if readout_intrinsic is not None:
+        intrinsics = dict(intrinsics, store=readout_intrinsic)
     for target, axes, kind in (
         (init, 1, "init"),
         (load, 2, "load_a"),

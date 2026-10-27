@@ -252,8 +252,9 @@ def prove_readout(expression, accumulator):
 def normalize_readout_layout(func):
     """Expose a proved INT8 matrix epilogue before scheduling destroys perfect nests."""
     from .gemmini_tensorir import contraction_block
+    from .gemmini_reduction import reduction_blocks
 
-    matches = contraction_block(func)
+    matches = contraction_block(func) or reduction_blocks(func)
     if len(matches) != 1:
         return func
     outputs = {buffer.data for buffer in func.buffer_map.values()}
