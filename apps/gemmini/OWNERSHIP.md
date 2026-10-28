@@ -121,3 +121,12 @@ standalone movement/affine/sum ranks stop at five. Rank-five 3D convolution
 retains host mathematics. Byte sums require `128*K <= INT32_MAX`; accepting
 `-2**31` solely because it fits the dtype would violate the spec's absolute
 partial bound. These checks apply before ordinary schedule construction.
+
+## Historical implementation boundary
+
+The old Relax substitution/template implementation lives in `gemmini_legacy.py`.
+The current `gemmini.py` entry point imports it only for explicit legacy requests;
+compatibility symbol exports preserve old tests and diagnostics. Default TensorIR
+preparation and shared host producer inlining remain separate. See
+[LEGACY.md](LEGACY.md) for consumers; current mathematical lowering and numerical
+semantics are unchanged by this source reorganization.

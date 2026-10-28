@@ -15,7 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Bounded Gemmini search using TVM MetaSchedule features and XGBModel.
+"""Historical nine-template experiment; not the active ReplayTrace tuner.
+
+See apps/gemmini/LEGACY.md for remaining reproduction consumers.
+
+Bounded Gemmini search using TVM MetaSchedule features and XGBModel.
 
 Only nine primitive macro-tile schedules are proposed. Features are extracted
 from executable semantic TIR before tensorization, not opaque external calls.

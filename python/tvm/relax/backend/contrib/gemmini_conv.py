@@ -14,7 +14,11 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Static integer convolution decomposition before Gemmini matmul scheduling.
+"""Historical graph decomposition; not the active TensorIR lowering path.
+
+See apps/gemmini/LEGACY.md for remaining reproduction consumers.
+
+Static integer convolution decomposition before Gemmini matmul scheduling.
 
 This opt-in pass emits ordinary CPU mathematical packing/restoration and a
 semantic Relax matmul. Run it before FoldConstant and prepare_gemmini_graph;
