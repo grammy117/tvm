@@ -13,7 +13,7 @@ upstream binary. See [README.md](README.md) for status and the selected protocol
 | Graph preparation | LegalizeOps, pattern annotation, FoldConstant, CanonicalizeBindings, FuseOps/FuseTIR, reshape rewrite, DCE; optional CSE | Pipeline selection and structural workload annotation. |
 | Extraction | extract_tasks and call-count weights | Exact-family recognition and explicit placement/exclusion report. Recognition alone is not spec admission. |
 | Search space | Schedule API, trace, sampling, mutations, union of generators | Gemmini contraction/secondary-family rules, capability limits and single-hart CPU settings. |
-| Search/model | EvolutionarySearch, gradient task scheduler, XGBModel, PerStoreFeature | Bounded search settings and pre-postprocessing feature replay. |
+| Search/model | ReplayTrace, round-robin task scheduler; no learned model | Bounded traced schedule space and capacity-checked shape/reuse baseline. Evolutionary/XGB is explicit legacy opt-in. |
 | Tensorization | TensorIntrin registration/matching, RewriteTensorize | Mathematical descriptions, implementations and exact legality proofs. |
 | Physical memory | Storage scopes and software-pipeline transformation | SRAM lifetime/address allocation, bounds/alias checks, host-DMA hazard waits and completion. |
 | Machine code | LLVM RV64 | Primitive C command adapter; no hardware matmul/conv loop FSM. |

@@ -17,8 +17,8 @@ old ELFs or graph plans with new source identities.
 - Final E2E wall timeouts only: ResNet 1800s, TinyLlama/SmolVLA 25200s per run.
 - Next campaign: ResNet plus the 16 kernel cases in the companion Merlin
   KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA
-  are backlogged. Requested plan: 50 warmup + 5 guided trials per workload,
-  with explicit grouping/budget decisions in the handoff. Report unequal effort.
+  are backlogged. Use 25 total ReplayTrace proposals per kernel/chunk with no ML. The 16-case
+  TVM kernel sweep ceiling is 24 occupied-slot-hours. Report unequal effort.
 - Candidate median-based wall watchdog replaces incumbent-cycle cancellation.
   Use three real baseline timings, a 3x latest-nine median with a 3x baseline floor,
   and an explicit hard ceiling. Bootstrap/ceiling values come from the remote pilot.

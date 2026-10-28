@@ -118,6 +118,21 @@ def test_merge_reuses_structures_and_retains_each_exact_measurement(tmp_path):
         library.merge_campaigns([first], output)
 
 
+def test_replay_campaign_keeps_trace_evidence_and_publishes_beside_database(tmp_path):
+    root = tmp_path / "replay"
+    campaign(root)
+    (root / "campaign.json").rename(root / "replay-campaign.json")
+    (root / "database").rename(root / "replay-database")
+    path = library.publish_campaign_context(root)
+    assert path == root / "replay-database/measurement-context.json"
+    context = json.loads(path.read_text())
+    assert context["records"] == 1
+    assert Path(context["campaign"]["path"]).name == "replay-campaign.json"
+    (root / "campaign.json").write_text((root / "replay-campaign.json").read_text())
+    with pytest.raises(ValueError, match="one completed campaign"):
+        library.validate_campaign(root)
+
+
 def test_a_cycle_from_another_trace_is_not_a_valid_witness(tmp_path):
     root, _ = campaign(tmp_path / "campaign", ((1, 120), (2, 90)))
     records = root / "database/database_tuning_record.json"

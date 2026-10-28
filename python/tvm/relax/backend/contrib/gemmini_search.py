@@ -17,15 +17,16 @@
 """Stock MetaSchedule tuning of Gemmini tasks with an external cycle runner.
 
 Tasks come from ``ms.relax_integration.extract_tasks`` (call-count weights),
-search is ``tune_tasks`` with ``EvolutionarySearch`` and ``XGBModel``, and the
+default search is ``tune_tasks`` with non-learning ``ReplayTrace``, and the
 records go to a ``JSONDatabase`` that ``relax.transform.MetaScheduleApplyDatabase``
 replays at compile time. This module only supplies what MetaSchedule leaves to
 the target: a builder and runner for the bare-metal simulators, a workload key
 that lets them find each task's fixed inputs, and a feature view of candidates
 before tensorization.
 
-The runner reports target cycles in ``RunnerResult.run_secs``. MetaSchedule
-uses that value only for ranking; it is never interpreted as seconds.
+The legacy generic runner reports cycles in ``run_secs``. The FireSim caller
+wraps it to convert measured target cycles to seconds; keep these record
+conventions separate. EvolutionarySearch/XGB remains explicit opt-in.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -225,7 +226,7 @@ def tune_gemmini_tasks(
     max_trials_global,
     num_trials_per_iter=16,
     capabilities=None,
-    strategy="evolutionary",
+    strategy="replay",
     seed=0,
     log=None,
     describe=None,
@@ -236,7 +237,8 @@ def tune_gemmini_tasks(
     max_trials_per_task=None,
 ):
     """Tune extracted tasks with stock ``tune_tasks`` and return the JSONDatabase."""
-    import xgboost  # Fail before measurements if the optional tuner is unavailable.
+    if strategy == "evolutionary":
+        import xgboost  # ReplayTrace never imports or trains XGBoost.
 
     if type(warmup) is not int or warmup < 1 or not 0 <= eps_greedy <= 1:
         raise ValueError("Use a positive XGB warmup and epsilon in [0,1]")
@@ -276,22 +278,33 @@ def tune_gemmini_tasks(
         for context in contexts:
             context.generate_design_space()
     database = ms.database.JSONDatabase(work_dir=str(work_dir))
-    cost_model = ms.cost_model.XGBModel(
-        extractor=MathematicalFeatures(), adaptive_training=False, num_tuning_cores=1,
-        num_warmup_samples=warmup,
-    )
+    learned = strategy == "evolutionary"
     model_path = Path(work_dir) / "cost_model.xgb"
-    if model_path.exists():
-        cost_model.load(str(model_path))
+    if learned:
+        cost_model = ms.cost_model.XGBModel(
+            extractor=MathematicalFeatures(), adaptive_training=False, num_tuning_cores=1,
+            num_warmup_samples=warmup,
+        )
+        if model_path.exists():
+            cost_model.load(str(model_path))
+    else:
+        # Stock tune_tasks requires a CostModel object; ReplayTrace does not
+        # consult it. No feature extraction, update callback or model loading.
+        cost_model = ms.cost_model.RandomModel(seed=seed)
+        if model_path.exists():
+            raise ValueError("ReplayTrace requires a fresh directory without a learned model")
+
     def model_state():
-        return dict(training_samples_before_update=cost_model.data_size,
-                    learned_ranking_available=cost_model.data_size >= warmup and cost_model.booster is not None)
+        return dict(training_samples_before_update=cost_model.data_size if learned else 0,
+                    learned_ranking_available=bool(learned and cost_model.data_size >= warmup
+                                                  and cost_model.booster is not None))
 
     callbacks = [ms.measure_callback.AddToDatabase()]
     if log is not None:
         # Log the state used to select this batch, before its labels train XGB.
         callbacks.append(RecordMeasurements(log, describe, model_state))
-    callbacks.append(ms.measure_callback.UpdateCostModel())
+    if learned:
+        callbacks.append(ms.measure_callback.UpdateCostModel())
     ms.tune_tasks(
         tasks=contexts,
         task_weights=weights,
@@ -304,17 +317,20 @@ def tune_gemmini_tasks(
         database=database,
         cost_model=cost_model,
         measure_callbacks=callbacks,
-        task_scheduler="gradient",
+        task_scheduler="gradient" if learned else "round-robin",
     )
-    if cost_model.booster is not None:
+    if learned and cost_model.booster is not None:
         cost_model.save(str(model_path))
     (Path(work_dir) / "cost-model.json").write_text(json.dumps({
-        "implementation": "TVM XGBModel", "warmup_samples": warmup,
-        "xgboost_version": xgboost.__version__,
-        "eps_greedy": eps_greedy, "max_trials_per_task": max_trials_per_task,
-        "warmup_scope": "this cost-model instance; feature-bearing samples, including runner errors",
-        "training_samples": cost_model.data_size, "booster_trained": cost_model.booster is not None,
-        "learned_predictions_enabled": cost_model.data_size >= warmup and cost_model.booster is not None,
+        "implementation": "TVM XGBModel" if learned else "unused stock RandomModel placeholder",
+        "strategy": strategy, "ml_enabled": learned,
+        "warmup_samples": warmup if learned else 0,
+        "xgboost_version": xgboost.__version__ if learned else None,
+        "eps_greedy": eps_greedy if learned else None,
+        "max_trials_per_task": max_trials_per_task,
+        "training_samples": cost_model.data_size if learned else 0,
+        "booster_trained": bool(learned and cost_model.booster is not None),
+        "learned_predictions_enabled": model_state()["learned_ranking_available"],
     }, indent=2) + "\n")
     return database
 

@@ -82,6 +82,28 @@ def test_surrogates_keep_dimensions_but_execute_one_site(name, shape, count):
     assert metadata["full_model_qualified"] is False
 
 
+def test_wrapper_uses_total_replay_budget_and_compiles_its_database(tmp_path, monkeypatch):
+    import workload_tuning as wrapper
+
+    monkeypatch.setattr(wrapper, "verify_case", lambda root: None)
+    commands = []
+    monkeypatch.setattr(wrapper.subprocess, "run", lambda command, **kwargs: commands.append(command))
+    common = ["--case-dir", str(tmp_path), "--gcc", "gcc", "--adapter-receipt", "adapter.json"]
+    wrapper.main(["tune", *common, "--spike-receipt", "spike.json", "--hardware-receipt", "rtl.json"])
+    command = commands[-1]
+    assert command[command.index("--strategy") + 1] == "replay"
+    assert command[command.index("--trials-total") + 1] == "25"
+    assert "--trials-per-task" not in command
+    database = tmp_path / "campaign/replay-database"
+    database.mkdir(parents=True)
+    with pytest.raises(ValueError, match="completed campaign"):
+        wrapper.main(["compile", *common, "--variant", "tuned"])
+    (tmp_path / "campaign/replay-campaign.json").write_text("{}")
+    wrapper.main(["compile", *common, "--variant", "tuned"])
+    command = commands[-1]
+    assert command[command.index("--tuning-database") + 1] == str(database)
+
+
 def test_current_knobs_are_bound_to_case_payload(tmp_path):
     caps = GemminiCapabilities()
     program = tmp_path / "program.json"

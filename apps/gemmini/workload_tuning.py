@@ -166,8 +166,9 @@ def main(argv=None):
         else:
             run.add_argument("--spike-receipt", type=Path, required=True)
             run.add_argument("--hardware-receipt", type=Path, required=True)
-            run.add_argument("--trials-per-task", type=int, default=16)
-            run.add_argument("--trials-per-iteration", type=int, default=4)
+            run.add_argument("--trials-per-task", type=int, default=None)
+            run.add_argument("--trials-total", type=int, default=25)
+            run.add_argument("--trials-per-iteration", type=int, default=1)
             run.add_argument("--builders", type=int, default=1)
             run.add_argument("--baseline-workers", type=int, default=1)
             run.add_argument("--input-fixture", type=Path)
@@ -216,12 +217,19 @@ def main(argv=None):
                 # Use the frozen per-case seed, not a moving preset. Explicit DB
                 # rejects zero hits; zero-hit current cases use reported defaults.
                 if args.variant == "tuned":
-                    command += ["--tuning-database", str(root / "campaign/database")]
+                    databases = [root / "campaign" / name for name in ("database", "replay-database")
+                                 if (root / "campaign" / name).is_dir()
+                                 and (root / "campaign" / name.replace("database", "campaign.json")).is_file()]
+                    if len(databases) != 1:
+                        raise ValueError("Expected exactly one completed campaign database")
+                    command += ["--tuning-database", str(databases[0])]
                 elif any(r["matched"] for r in json.loads((root / "current-knobs.json").read_text())["matches"]):
                     command += ["--tuning-database", str(root / "seed")]
         else:
-            if min(args.trials_per_task, args.trials_per_iteration, args.parallel,
+            if min(args.trials_total, args.trials_per_iteration, args.parallel,
                    args.builders, args.baseline_workers, args.max_cycles) < 1:
+                parser.error("Tuning budgets must be positive")
+            if args.trials_per_task is not None and args.trials_per_task < 1:
                 parser.error("Tuning budgets must be positive")
             if args.validation_overhead_cycles < 0:
                 parser.error("Validation overhead must be nonnegative")
@@ -231,12 +239,15 @@ def main(argv=None):
             command += ["--gcc", str(args.gcc.resolve()), "--work-dir", str(campaign),
                         "--spike-receipt", str(args.spike_receipt.resolve()),
                         "--hardware-receipt", str(args.hardware_receipt.resolve()),
-                        "--trials-per-task", str(args.trials_per_task), "--parallel", str(args.parallel),
+                        "--strategy", "replay", "--trials-total", str(args.trials_total),
+                        "--parallel", str(args.parallel),
                         "--builders", str(args.builders), "--baseline-workers", str(args.baseline_workers),
                         "--trials-per-iteration", str(args.trials_per_iteration),
                         "--max-cycles", str(args.max_cycles), "--rtl-seconds", str(args.rtl_seconds),
                         "--validation-overhead-cycles", str(args.validation_overhead_cycles),
                         "--timing-policy", args.timing_policy, "--baseline-database", str(root / "seed")]
+            if args.trials_per_task is not None:
+                command += ["--trials-per-task", str(args.trials_per_task)]
             if args.input_fixture is not None:
                 command += ["--input-fixture", str(args.input_fixture.resolve())]
             for name in ("memory_variant_receipt", "firesim_memory_artifact", "memory_pin_registry"):
