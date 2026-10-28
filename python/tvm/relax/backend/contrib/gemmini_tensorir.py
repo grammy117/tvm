@@ -240,8 +240,8 @@ def make_tensorir_schedule(
     *,
     order="ij",
     reduction_chunk=None,
-    row_tiles=1,
-    col_tiles=1,
+    row_tiles=None,
+    col_tiles=None,
     capabilities=None,
 ):
     """Apply the default contraction sketch and lower target scopes with admission checks."""

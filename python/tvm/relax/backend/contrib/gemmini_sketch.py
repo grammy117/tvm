@@ -28,6 +28,7 @@ immediate deterministic form used by untuned compilation.
 from dataclasses import dataclass, replace
 import math
 
+import tvm
 from tvm import tir
 
 from .gemmini_intrin import ACC, SPAD, register_intrinsics
@@ -534,8 +535,8 @@ def with_rectangle(sketch, rows, cols, depth):
     return replace(sketch, rows=rows, cols=cols, depth=depth)
 
 
-def default_schedule(func, *, capabilities=None, order="ij", chunk=None, row_tiles=1, col_tiles=1):
-    """The untuned Gemmini schedule: default sketch, one tile per reuse group.
+def default_schedule(func, *, capabilities=None, order="ij", chunk=None, row_tiles=None, col_tiles=None):
+    """Shape-derived baseline: large exact tiles and capacity-bounded operand reuse.
 
     ``order``, ``chunk`` and the group sizes select other points of the same
     sketch family for explicit experiments; tuning explores them by sampling.
@@ -561,15 +562,52 @@ def default_schedule(func, *, capabilities=None, order="ij", chunk=None, row_til
         "j": info.n // sketch.cols,
         "k": math.ceil(info.k / sketch.depth),
     }
-    groups = {"i": row_tiles, "j": col_tiles, "k": 1}
-    if any(tiles[key] % groups[key] for key in tiles):
-        raise ValueError("Reuse groups must divide the tile counts")
-    sch = tir.Schedule(func)
-    return apply_contraction_sketch(
-        sch,
-        sch.get_block(names[0]),
-        sketch,
-        decisions={key: [tiles[key] // groups[key], groups[key]] for key in tiles},
-        tensorize=True,
-        capabilities=capabilities,
-    )
+    caps = capabilities or GemminiCapabilities()
+    explicit = row_tiles is not None or col_tiles is not None
+    if explicit:
+        groups = {"i": 1 if row_tiles is None else row_tiles,
+                  "j": 1 if col_tiles is None else col_tiles, "k": 1}
+        if any(type(groups[key]) is not int or groups[key] < 1
+               or groups[key] > MAX_GROUP_TILES or tiles[key] % groups[key] for key in tiles):
+            raise ValueError("Reuse groups must divide the tile counts and fit the group limit")
+        choices = [groups]
+    else:
+        # Tile-major buffers pad each physical row to DIM. No overlap/pipeline
+        # is assumed. Larger M/N groups reduce repeated A/B DMA; K grouping
+        # batches loads but does not claim additional arithmetic reuse.
+        divisors = {axis: [g for g in range(1, min(count, MAX_GROUP_TILES) + 1)
+                           if count % g == 0] for axis, count in tiles.items()}
+        candidates = []
+        for gi in divisors["i"]:
+            for gj in divisors["j"]:
+                if gi * gj * sketch.rows > caps.acc_rows:
+                    continue
+                for gk in divisors["k"]:
+                    spad = gk * (gi * sketch.rows + gj * sketch.depth)
+                    if spad > caps.spad_rows:
+                        continue
+                    # Total logical operand traffic per output tile, then
+                    # prefer larger batches. This is a heuristic, not cycles.
+                    traffic = sketch.rows * sketch.depth / gj + sketch.depth * sketch.cols / gi
+                    candidates.append((traffic, -gi*gj, -gk, gi, gj))
+        candidates.sort()
+        choices = [dict(i=gi, j=gj, k=-negk) for _, _, negk, gi, gj in candidates[:8]]
+        if dict(i=1, j=1, k=1) not in choices:
+            choices.append(dict(i=1, j=1, k=1))
+    from .gemmini_memory import lower_memory
+
+    last_error = None
+    for groups in choices:
+        try:
+            sch = tir.Schedule(func)
+            result = apply_contraction_sketch(
+                sch, sch.get_block(names[0]), sketch,
+                decisions={key: [tiles[key] // groups[key], groups[key]] for key in tiles},
+                tensorize=True, capabilities=caps,
+            )
+            # Actual buffer compaction/alignment/lifetimes are authoritative.
+            lower_memory(result.mod, spad_rows=caps.spad_rows, acc_rows=caps.acc_rows)
+            return result
+        except (ValueError, tvm.TVMError) as error:
+            last_error = error
+    raise ValueError(f"No legal default Gemmini schedule: {last_error}") from last_error
