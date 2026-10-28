@@ -23,9 +23,12 @@ This is verification input, never production compiler dispatch or cost data.
 import numpy as np
 
 ARRAY_OPERATORS = {"mm", "bmm", "addmm", "convolution", "sum.dim_IntList"}
-ACCUMULATOR_OPERATORS = {"add.Tensor", "add.Scalar", "sub.Scalar"}
 MIXED_OPERATORS = {"convolution_backward", "avg_pool1d", "avg_pool2d", "avg_pool3d"}
 CPU_OPERATORS = {
+    # Full-domain i32 arithmetic is not the spec's bounded-exact byte affine map.
+    "add.Tensor",
+    "add.Scalar",
+    "sub.Scalar",
     "sub.Tensor",
     "mul.Scalar",
     "div.Scalar",
@@ -305,8 +308,6 @@ def execution_kind(name):
     """Required execution for these exact runtime-input contracts and profile."""
     if name in ARRAY_OPERATORS:
         return "array"
-    if name in ACCUMULATOR_OPERATORS:
-        return "accumulator"
     if name == "relu":
         return "readout_relu"
     if name in MIXED_OPERATORS:

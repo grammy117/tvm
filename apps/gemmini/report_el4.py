@@ -68,12 +68,12 @@ LIMITS = {
     "aten.add.Tensor": (
         "FP32 in recipe graphs",
         "CPU bias, residual or plane accumulation",
-        "Native coefficient-one INT32 accumulator addition exists; that does not implement FP32 residual addition or arbitrary alpha.",
+        "Only proved bounded byte-source affine/sum intrinsics remain candidates. Full-domain INT32 addition and FP32 residual addition use host arithmetic.",
     ),
     "aten.sub.Tensor": (
         "FP32 residual-plane arithmetic",
         "CPU",
-        "No floating subtract unit. Restricted constant modular integer offsets can normalize to native INT32 add.",
+        "No floating subtract unit. Full-domain INT32 constant offsets are also outside the bounded-exact device contract.",
     ),
     "aten.mul.Tensor": (
         "FP32 scaling, RoPE and gate arithmetic",

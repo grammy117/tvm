@@ -212,7 +212,7 @@ def fixtures():
         expected = tuple(value.numpy() for value in expected) if backward else expected.numpy()
         mod = from_exported_program(torch.export.export(model, args), unwrap_unit_return_tuple=True)
         result.append(
-            (f"convolution_{kind}", mod, arrays, expected, "gemmini" if native else "host")
+            (f"convolution_{kind}", mod, arrays, expected, "gemmini" if native and dim < 3 else "host")
         )
     for kind in ("average", "override", "adaptive", "integer", "holes", "col2im", "boolean"):
         import torch
@@ -379,7 +379,7 @@ def fixtures():
                 graph,
                 values,
                 model(*examples).numpy(),
-                "gemmini" if kind in ("mm", "bmm", "addmm", "add", "scalar_add") else "host",
+                "gemmini" if kind in ("mm", "bmm", "addmm") else "host",
             )
         )
     for kind in ("full", "full_like"):
@@ -811,7 +811,7 @@ def fixtures():
             if kind == "widen"
             else a
         )
-        result.append((kind, builder.get(), arrays, expected, "gemmini",
+        result.append((kind, builder.get(), arrays, expected, "host" if kind == "add_i32" else "gemmini",
                        {"offload_copies": kind != "add_i32"}))
     for kind in ("permute", "repeat"):
         a = (np.arange(6).reshape(2, 3) * 17 - 128).astype("int8")
@@ -863,7 +863,7 @@ def fixtures():
             if kind == "add_scalar"
             else np.full((3, 4), int(scalar), "int8" if kind == "fill_i8" else "int32")
         )
-        result.append((kind, builder.get(), arrays, expected))
+        result.append((kind, builder.get(), arrays, expected, "host" if kind == "add_scalar" else "gemmini"))
     for name, shape, axes, keepdims in (
         ("sum", (3, 17), (1,), False),
         ("sum_full", (2, 32), (1,), False),

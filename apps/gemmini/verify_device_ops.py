@@ -205,7 +205,7 @@ def fixtures():
     expected = np.clip(
         np.rint(np.maximum(values.astype("float32") * np.float32(0.0031129), 0)), -128, 127
     ).astype("int8")
-    result.append(("standalone_readout", graph(te.create_prim_func([a, c]), 1), [values], expected))
+    result.append(("standalone_readout", graph(te.create_prim_func([a, c]), 1), [values], expected, "host"))
     # A nonuniform frozen group-of-16 vector must retain every original value.
     # Raw INT32 Gemmini output plus host FP32 rescaling is an allowed exit.
     a, b = te.placeholder((3, 5), "int8", "a"), te.placeholder((5, 33), "int8", "b")

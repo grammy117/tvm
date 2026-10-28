@@ -415,6 +415,20 @@ class GemminiTensorIRTests(unittest.TestCase):
                         expected[(n, oc, *position)] += int(av[(n, ic, *source)]) * int(
                             bv[(oc, ic, *tap)]
                         )
+            if expected.ndim > 4:
+                # Rank-five convolution is outside the declared contraction
+                # domain. Keep the independent numerical test on the CPU path.
+                with self.assertRaises(ValueError):
+                    make_tensorir_schedule(func)
+                runtime, control = self.build(tvm.IRModule({"main": func}))
+                output = tvm.nd.empty(expected.shape, "int32")
+                runtime(tvm.nd.array(av), tvm.nd.array(bv), output)
+                np.testing.assert_array_equal(output.numpy(), expected)
+                self.assertEqual(control.emulator_commands(), 0)
+                report = []
+                prepare_gemmini_graph(builder.get(), report=report)
+                self.assertFalse(any(row["placement"] == "gemmini" for row in report), report)
+                continue
             for order in ("ij", "ji"):
                 scheduled = make_tensorir_schedule(func, order=order)
                 replay = tir.Schedule(func, debug_mask="all")

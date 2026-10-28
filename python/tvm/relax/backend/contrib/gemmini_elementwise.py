@@ -50,12 +50,6 @@ def _region(buffer):
     )
 
 
-def _add_reference(left, right, wrapping):
-    if wrapping:
-        return tir.Cast("int32", tir.Cast("int64", left) + tir.Cast("int64", right))
-    return left + right
-
-
 def _read(buffer, indices):
     return tir.BufferLoad(buffer, list(indices) if len(buffer.shape) else [])
 
@@ -208,16 +202,10 @@ def _register_elementwise_intrinsics(kind, rows, cols, rank, source_rank):
         "copy_i32",
         "copy_f32",
         "widen_i8_i32",
-        "add_i32",
-        "add_i32_wrapping",
         "fill_i8",
         "fill_i32",
         "fill_f32",
         "fill_widen_i8_i32",
-        "add_i32_scalar_a",
-        "add_i32_scalar_b",
-        "add_i32_wrapping_scalar_a",
-        "add_i32_wrapping_scalar_b",
     ) or rank not in (1, 2):
         raise ValueError("Unsupported Gemmini elementwise intrinsic")
     if any(type(value) is not int or not 1 <= value <= 16 for value in (rows, cols)) or (
@@ -230,9 +218,8 @@ def _register_elementwise_intrinsics(kind, rows, cols, rank, source_rank):
         or kind not in ("copy_i8", "copy_i32", "copy_f32", "widen_i8_i32")
     ):
         raise ValueError("Rank-changing DMA supports a vector source and matrix tile")
-    scalar_a, scalar_b = kind.endswith("_scalar_a"), kind.endswith("_scalar_b")
     fill = kind.startswith("fill_")
-    if (fill or scalar_a or scalar_b) and cols != 1:
+    if fill and cols != 1:
         raise ValueError("Scalar broadcasts require one-column DMA")
     scope = SPAD if kind in ("copy_i8", "fill_i8") else ACC
     dtype = (
@@ -255,103 +242,10 @@ def _register_elementwise_intrinsics(kind, rows, cols, rank, source_rank):
         "fill_f32": "tvm_gemmini_dma_acc_write",
         "fill_widen_i8_i32": "tvm_gemmini_dma_widen",
     }.get(kind)
-    shape = (cols,) if rank == 1 else (rows, cols)
-    factor = cols if rank == 1 else 1
-    a_shape, b_shape = () if scalar_a else shape, () if scalar_b else shape
-    wrapping = kind.startswith("add_i32_wrapping")
-    if kind.startswith("add_i32"):
-        if rank == 1:
-
-            @T.prim_func
-            def desc(a: T.handle, b: T.handle, c: T.handle):
-                A = T.match_buffer(
-                    a, a_shape, "int32", strides=_strides(len(a_shape)), offset_factor=1
-                )
-                B = T.match_buffer(
-                    b, b_shape, "int32", strides=_strides(len(b_shape)), offset_factor=1
-                )
-                C = T.match_buffer(
-                    c, shape, "int32", scope=ACC, strides=_strides(rank), offset_factor=1
-                )
-                with T.block("root"):
-                    T.reads(_region(A), _region(B))
-                    T.writes(C[0:cols])
-                    for j in T.serial(cols):
-                        with T.block("add"):
-                            vj = T.axis.spatial(cols, j)
-                            C[vj] = _add_reference(_read(A, (vj,)), _read(B, (vj,)), wrapping)
-        else:
-
-            @T.prim_func
-            def desc(a: T.handle, b: T.handle, c: T.handle):
-                A = T.match_buffer(
-                    a, a_shape, "int32", strides=_strides(len(a_shape)), offset_factor=1
-                )
-                B = T.match_buffer(
-                    b, b_shape, "int32", strides=_strides(len(b_shape)), offset_factor=1
-                )
-                C = T.match_buffer(
-                    c, shape, "int32", scope=ACC, strides=_strides(rank), offset_factor=1
-                )
-                with T.block("root"):
-                    T.reads(_region(A), _region(B))
-                    T.writes(C[0:rows, 0:cols])
-                    for i, j in T.grid(rows, cols):
-                        with T.block("add"):
-                            vi, vj = T.axis.remap("SS", [i, j])
-                            C[vi, vj] = _add_reference(
-                                _read(A, (vi, vj)), _read(B, (vi, vj)), wrapping
-                            )
-
-        @T.prim_func
-        def impl(a: T.handle, b: T.handle, c: T.handle):
-            A = T.match_buffer(a, a_shape, "int32", strides=_strides(len(a_shape)), offset_factor=1)
-            B = T.match_buffer(b, b_shape, "int32", strides=_strides(len(b_shape)), offset_factor=1)
-            C = T.match_buffer(
-                c, shape, "int32", scope=ACC, strides=_strides(rank), offset_factor=1
-            )
-            with T.block("root"):
-                T.reads(_region(A), _region(B))
-                T.writes(_region(C))
-                T.evaluate(
-                    T.call_extern(
-                        "void",
-                        "tvm_gemmini_dma_acc_write",
-                        A.access_ptr("r"),
-                        C.access_ptr("w"),
-                        T.uint32(rows),
-                        T.uint32(cols),
-                        _dma_stride(A, factor),
-                        T.int32(0),
-                    )
-                )
-                T.evaluate(
-                    T.call_extern(
-                        "void",
-                        "tvm_gemmini_dma_acc_add",
-                        B.access_ptr("r"),
-                        C.access_ptr("rw"),
-                        T.uint32(rows),
-                        T.uint32(cols),
-                        _dma_stride(B, factor),
-                        T.int32(0),
-                    )
-                )
-
-        op = desc, impl
-    else:
-        op = _copy_pair(
-            rows,
-            cols,
-            rank,
-            source_dtype,
-            dtype,
-            "global",
-            scope,
-            source_symbol,
-            source_scalar=fill,
-            source_rank=source_rank,
-        )
+    op = _copy_pair(
+        rows, cols, rank, source_dtype, dtype, "global", scope, source_symbol,
+        source_scalar=fill, source_rank=source_rank,
+    )
     store = _copy_pair(
         rows,
         cols,
@@ -547,7 +441,7 @@ def register_literal_intrinsic(rows, cols, rank, dtype, value_bits):
 
 
 def elementwise_blocks(func):
-    """Find exact copies, widening, INT32 addition and INT8 ReLU blocks."""
+    """Find exact copies, widening, bounded byte affine and INT8 ReLU blocks."""
     from .gemmini_bytes import BYTE_DTYPES
     from .gemmini_affine import affine_match
 
@@ -571,6 +465,8 @@ def elementwise_blocks(func):
             return
         axes = [axis.var for axis in node.iter_vars]
         output, value = node.body.buffer, node.body.value
+        if len(output.shape) > 5:
+            return
         analyzer = tvm.arith.Analyzer()
         if len(node.body.indices) != len(axes) or any(
             not isinstance(offset := analyzer.simplify(index - axis), tir.IntImm)
@@ -630,34 +526,13 @@ def elementwise_blocks(func):
             and value.value.dtype == "int8"
         ):
             kind, loads = "widen_i8_i32", [value.value]
-        elif (
-            isinstance(value, tir.Add)
-            and value.dtype == "int32"
-            and isinstance(value.a, tir.BufferLoad)
-            and isinstance(value.b, tir.BufferLoad)
-        ):
-            kind, loads = "add_i32", [value.a, value.b]
-        elif (
-            isinstance(value, tir.Cast)
-            and value.dtype == "int32"
-            and isinstance(value.value, tir.Add)
-            and value.value.dtype == "int64"
-            and all(
-                isinstance(expr, tir.Cast)
-                and expr.dtype == "int64"
-                and isinstance(expr.value, tir.BufferLoad)
-                and expr.value.dtype == "int32"
-                for expr in (value.value.a, value.value.b)
-            )
-        ):
-            kind, loads = "add_i32_wrapping", [value.value.a.value, value.value.b.value]
         elif affine_match(node) is not None:
             kind, loads = "affine_i8", []
         else:
             return
         # Tensorize proves the access map below. Copies may use sliced,
         # repeated or permuted indices. Scalar DMA is an explicit experiment.
-        if any(load.buffer.data.same_as(output.data) for load in loads):
+        if any(len(load.buffer.shape) > 5 or load.buffer.data.same_as(output.data) for load in loads):
             return
         scalar_inputs = [index for index, load in enumerate(loads) if not load.buffer.shape]
         if len(scalar_inputs) > 1:
@@ -672,8 +547,6 @@ def elementwise_blocks(func):
                     "copy_f32": "fill_f32",
                     "widen_i8_i32": "fill_widen_i8_i32",
                 }[kind]
-            elif kind.startswith("add_i32"):
-                kind += "_scalar_a" if scalar_inputs[0] == 0 else "_scalar_b"
             else:
                 return
         matches.append((node, kind))
@@ -850,9 +723,9 @@ def _schedule_elementwise_candidate(sch, node, kind, rank, factors, mark_tensori
         if kind == "affine_i8":
             from .gemmini_affine import affine_match
             match = affine_match(node)
-            if match["raw_readout"]:
-                metadata["operation"] = "scaled_readout"
-            metadata.update(coefficients=[c for _,c,_ in match["terms"]], offset=match["offset"],
+            metadata.update(accumulator_partial_abs_bound=match["accumulator_partial_abs_bound"],
+                            pe_partial_abs_bound=match["pe_partial_abs_bound"],
+                            coefficients=[c for _,c,_ in match["terms"]], offset=match["offset"],
                             operand_scale_bits=[struct.unpack("I",struct.pack("f",s))[0] for _,_,s in match["terms"]],
                             per_operand_rounding=match["per_operand_rounding"],
                             scaled_readout=match["readout"] is not None,

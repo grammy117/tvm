@@ -105,11 +105,11 @@ class GemminiConvolutionFrontendTests(unittest.TestCase):
                 report = []
                 graph = prepare_gemmini_graph(graph, report=report)
                 selected = [row for row in report if row["placement"] == "gemmini"]
-                self.assertTrue(any("k" in row["metadata"] for row in selected), report)
+                self.assertEqual(any("k" in row["metadata"] for row in selected), dim < 3, report)
                 _, outputs, emulator = self.static_run(graph, [values, weights, bias])
                 np.testing.assert_array_equal(outputs[0], model(*args).numpy())
                 self.assertEqual(outputs[0].dtype, np.dtype("int8"))
-                self.assertGreater(emulator.emulator_commands(), 0)
+                self.assertEqual(emulator.emulator_commands() > 0, dim < 3)
                 self.assertEqual(emulator.emulator_pending(), 0)
 
     def test_full_width_and_floating_gradient_contracts_keep_cpu_arithmetic(self):
