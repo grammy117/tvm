@@ -52,8 +52,7 @@ proves exact readout and schedules it; it contains no custom graph pass.
 A TensorIntrin may issue several primitive commands. Keeping an affine or
 sum-via-ones family requires its mathematical matcher, command implementation,
 extra-memory accounting and exact software-spec proof. It does not require
-restoring the removed graph transformations. Composite coverage is pending scope
-review; do not advertise arbitrary FP32/wide-integer arithmetic or standalone
+restoring the removed graph transformations. Retain only declared/proved composite coverage; do not advertise arbitrary FP32/wide-integer arithmetic or standalone
 pooling based on similarity. The companion Merlin strict operation audit owns
 that admission review.
 
@@ -74,3 +73,21 @@ are retained in [the source-pinned ownership record](https://github.com/grammy11
 The companion Merlin OPTIMIZATION_KNOBS.md records this cleanup's tests and
 remaining cost-model/runner decisions. Neither a recognized pattern, a passing
 emulator fixture nor a compiled archive proves full-model FireSim readiness.
+
+Full-domain INT32 add (including explicit modulo-32 and scalar forms) has no
+active TensorIntrin in this revision. Its original fixtures keep their bytes
+and host semantics. Bounded i8-source affine arithmetic remains a separate
+contract. Affine source ranks stop at five; per-operand scaled sums require
+rank two. These matcher restrictions do not replace selected-scale screens,
+emitted-command audits or hardware qualification.
+
+Unbounded standalone i32 readout is excluded from byte-affine admission;
+contraction readout retains its separate producer/epilogue proof. Affine
+metadata reports the conservative bound for every accumulator prefix and
+weighted K=1 mesh partial. These bounds do not constitute hardware qualification.
+
+The strict matcher admits contraction and pooled-readout result ranks 2–4;
+standalone movement/affine/sum ranks stop at five. Rank-five 3D convolution
+retains host mathematics. Byte sums require `128*K <= INT32_MAX`; accepting
+`-2**31` solely because it fits the dtype would violate the spec's absolute
+partial bound. These checks apply before ordinary schedule construction.
