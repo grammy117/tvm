@@ -46,6 +46,7 @@ def pool_blocks(func):
         store, init = node.body, node.init
         if (
             store.buffer.dtype != "int8"
+            or len(store.buffer.shape) not in (2, 3, 4)
             or not isinstance(store.value, tir.Max)
             or not isinstance(init.value, tir.IntImm)
             or int(init.value) != -128

@@ -50,7 +50,8 @@ class DeviceOpsTests(unittest.TestCase):
                 prepared = prepare_gemmini_graph(
                     mod, report=report, **(case[5] if len(case) > 5 else {})
                 )
-                self.assertEqual(sum(r["placement"] == "gemmini" for r in report), 1, report)
+                device = len(case) < 5 or case[4] != "host"
+                self.assertEqual(sum(r["placement"] == "gemmini" for r in report), int(device), report)
                 func = next(f for f in prepared.functions.values() if isinstance(f, tir.PrimFunc))
                 runtime, control = self.build(
                     tvm.IRModule({"main": func.with_attr("global_symbol", "main")})
@@ -59,7 +60,7 @@ class DeviceOpsTests(unittest.TestCase):
                 output = tvm.nd.empty(expected.shape, str(expected.dtype))
                 runtime(*values, output)
                 np.testing.assert_array_equal(output.numpy().view("uint8"), expected.view("uint8"))
-                self.assertGreater(control.emulator_commands(), 0)
+                self.assertEqual(control.emulator_commands() > 0, device)
                 self.assertEqual(control.emulator_faults(), 0)
                 self.assertEqual(control.emulator_pending(), 0)
                 for actual, expected_input in zip(values, arrays):
@@ -83,7 +84,7 @@ class DeviceOpsTests(unittest.TestCase):
         from tvm.relax.backend.contrib.gemmini_meta_schedule import default_device_schedule
 
         for name in ("subtract", "max_pool_2", "max_pool_3", "dma_int64_rectangular",
-                     "standalone_readout", "window_average_4", "window_average_9"):
+                     "window_average_4", "window_average_9"):
             with self.subTest(case=name):
                 case = next(case for case in fixtures() if case[0] == name)
                 func = next(f for f in case[1].functions.values() if isinstance(f, tir.PrimFunc))
@@ -99,7 +100,7 @@ class DeviceOpsTests(unittest.TestCase):
         from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator
         from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
 
-        for name in ("subtract", "max_pool_2", "max_pool_3", "dma_int64", "standalone_readout"):
+        for name in ("subtract", "max_pool_2", "max_pool_3", "dma_int64"):
             case = next(case for case in fixtures() if case[0] == name)
             func = next(f for f in case[1].functions.values() if isinstance(f, tir.PrimFunc))
             context = ms.TuneContext(
@@ -114,6 +115,79 @@ class DeviceOpsTests(unittest.TestCase):
                 if all(postproc.apply(design) for postproc in context.space_generator.postprocs):
                     found |= "local.gemmini" in design.mod.script()
             self.assertTrue(found, name)
+
+    def test_declared_source_rank_boundaries(self):
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import _supported
+
+        for rank in (4, 5):
+            batch = (1,) * (rank - 2)
+            a = te.placeholder(batch + (2, 4), "int8", "a")
+            b = te.placeholder(batch + (4, 3), "int8", "b")
+            k = te.reduce_axis((0, 4), "k")
+            c = te.compute(batch + (2, 3), lambda *i: te.sum(
+                a[i[:-1] + (k,)].astype("int32")
+                * b[i[:-2] + (k, i[-1])].astype("int32"), axis=k))
+            self.assertEqual(_supported(te.create_prim_func([a, b, c]))[0],
+                             "contraction" if rank == 4 else None)
+        for shape in ((3,), (2, 3)):
+            a = te.placeholder(shape + (4,), "int8", "pool_input")
+            k = te.reduce_axis((0, 4), "k")
+            c = te.compute(shape, lambda *i: te.max(a[i + (k,)], axis=k))
+            self.assertEqual(_supported(te.create_prim_func([a, c]))[0],
+                             "pool" if len(shape) == 2 else None)
+        shape = (1, 1, 1, 1, 1, 3)
+        a = te.placeholder(shape, "int8", "copy_input")
+        c = te.compute(shape, lambda *i: a[i])
+        self.assertEqual(_supported(te.create_prim_func([a, c])), (None, []))
+
+    def test_unbounded_standalone_readout_has_no_affine_admission(self):
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import _supported, default_device_schedule
+        case = next(case for case in fixtures() if case[0] == "standalone_readout")
+        func = next(f for f in case[1].functions.values() if isinstance(f, tir.PrimFunc))
+        self.assertEqual(_supported(func), (None, []))
+        with self.assertRaises(ValueError):
+            default_device_schedule(func)
+
+    def test_affine_metadata_bounds_cover_every_prefix(self):
+        for name in ("subtract", "scalar_affine", "affine_relu"):
+            case = next(case for case in fixtures() if case[0] == name)
+            func = next(f for f in case[1].functions.values() if isinstance(f, tir.PrimFunc))
+            info = make_elementwise_schedule(func).metadata
+            expected = {"subtract": (256, 128), "scalar_affine": (919, 896),
+                        "affine_relu": (659, 384)}[name]
+            self.assertEqual((info["accumulator_partial_abs_bound"], info["pe_partial_abs_bound"]), expected)
+
+    def test_per_operand_rounding_refuses_undeclared_ranks(self):
+        from tvm.relax.backend.contrib.gemmini_elementwise import elementwise_blocks
+
+        for shape in ((5,), (2, 3, 5)):
+            with self.subTest(shape=shape):
+                a = te.placeholder(shape, "int8", "a")
+                b = te.placeholder(shape, "int8", "b")
+                c = te.compute(shape, lambda *i: quantize(
+                    quantize(a[i], .5).astype("int32")
+                    + quantize(b[i], .25).astype("int32"), .5))
+                func = te.create_prim_func([a, b, c])
+                self.assertEqual(elementwise_blocks(func), [])
+                with self.assertRaises(ValueError):
+                    make_elementwise_schedule(func)
+
+    def test_full_domain_i32_add_has_no_device_schedule_or_intrinsic(self):
+        from tvm.relax.backend.contrib.gemmini_elementwise import register_elementwise_intrinsics
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import _supported, default_device_schedule
+
+        a = te.placeholder((3, 5), "int32", "a")
+        b = te.placeholder((3, 5), "int32", "b")
+        for wrapped in (False, True):
+            c = te.compute((3, 5), lambda *i:
+                (a[i].astype("int64") + b[i].astype("int64")).astype("int32")
+                if wrapped else a[i] + b[i])
+            func = te.create_prim_func([a, b, c])
+            self.assertEqual(_supported(func), (None, []))
+            with self.assertRaises(ValueError):
+                default_device_schedule(func)
+            with self.assertRaises(ValueError):
+                register_elementwise_intrinsics("add_i32_wrapping" if wrapped else "add_i32", 3, 5)
 
     def test_unsupported_numerics_remain_cpu(self):
         for kind in ("float_add", "wide_coefficient", "wrong_rounding", "scaled_operand_over_one"):

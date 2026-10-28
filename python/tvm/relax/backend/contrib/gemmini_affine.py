@@ -108,7 +108,7 @@ def affine_match(node):
     if node.init is not None or not isinstance(node.body, tir.BufferStore):
         return None
     output, expression = node.body.buffer, node.body.value
-    if output.dtype not in ("int8", "int32") or not node.iter_vars:
+    if output.dtype not in ("int8", "int32") or not 1 <= len(node.iter_vars) <= 5:
         return None
     if any(
         axis.iter_type != tir.IterVar.DataPar
@@ -136,12 +136,9 @@ def affine_match(node):
         )
         candidates.reverse()
     for candidate in candidates:
-        raw_readout = (
-            output.dtype == "int8"
-            and isinstance(candidate, tir.BufferLoad)
-            and candidate.dtype == "int32"
-        )
-        linear = ([(candidate, 1, 1.0)], 0) if raw_readout else _linear(candidate)
+        # A free i32 input has no byte-source bound. Producer readout belongs
+        # to its contraction/epilogue proof, not this standalone affine family.
+        linear = _linear(candidate)
         if linear is None or not 1 <= len(linear[0]) <= 2:
             continue
         terms, offset = linear
@@ -155,11 +152,13 @@ def affine_match(node):
         ):
             continue
         # This bound covers every prefix in either load/mesh order.
-        if abs(offset) + sum(128 * abs(c) for _, c, _ in terms) > (1 << 31) - 1:
+        accumulator_bound = abs(offset) + sum(128 * abs(c) for _, c, _ in terms)
+        if accumulator_bound > (1 << 31) - 1:
             continue
         scaled_operands = any(scale != 1.0 for _, _, scale in terms)
         if scaled_operands and (
             output.dtype != "int8"
+            or len(node.iter_vars) != 2
             or len(terms) != 2
             or offset != 0
             or any(c != 1 for _, c, _ in terms)
@@ -180,7 +179,8 @@ def affine_match(node):
             "offset": offset,
             "readout": proof,
             "per_operand_rounding": scaled_operands,
-            "raw_readout": raw_readout,
+            "accumulator_partial_abs_bound": accumulator_bound,
+            "pe_partial_abs_bound": max((128 * abs(c) for _, c, _ in terms if c != 1), default=0),
         }
     return None
 
@@ -292,19 +292,7 @@ def register_affine_intrinsic(node, rows, rank):
             next(i for i, buffer in enumerate(original) if load.buffer.same_as(buffer))
         ]
         stride = source.strides[0] if rank == 2 else tir.IntImm("int64", 1)
-        if load.dtype == "int32":
-            statements.append(
-                call(
-                    "tvm_gemmini_dma_acc_write",
-                    _ptr(source, "r"),
-                    _ptr(acc, "w"),
-                    rows,
-                    1,
-                    stride,
-                    0,
-                )
-            )
-        elif coefficient == 1:
+        if coefficient == 1:
             bits = struct.unpack("I", struct.pack("f", scale))[0]
             statements.append(
                 call(

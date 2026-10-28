@@ -83,6 +83,8 @@ def _normalizable_contractions(func):
         if not isinstance(node.body, tir.BufferStore) or not isinstance(node.init, tir.BufferStore):
             return
         output = node.body.buffer
+        if len(output.shape) not in (2, 3, 4):
+            return
         update = _contraction_update(node)
         if output.dtype != "int32" or not _supported_contraction_init(node) or update is None:
             return
@@ -156,7 +158,8 @@ def contraction_block(func):
         if not isinstance(node.body, tir.BufferStore) or not isinstance(node.init, tir.BufferStore):
             return
         output = node.body.buffer
-        if output.dtype != "int32" or len(output.shape) != len(node.iter_vars) - 1:
+        if (output.dtype != "int32" or len(output.shape) not in (2, 3, 4)
+                or len(output.shape) != len(node.iter_vars) - 1):
             return
         if not _supported_contraction_init(node):
             return
@@ -539,7 +542,7 @@ class ScheduleGemminiTensorIR:
                     {
                         "function": gv.name_hint,
                         "placement": "cpu",
-                        "reason": "No supported exact integer contraction, bounded sum/window, affine/readout, copy, widening or addition",
+                        "reason": "No supported exact integer contraction, bounded sum/window, affine/readout, copy or widening",
                     }
                 )
                 continue
@@ -548,7 +551,7 @@ class ScheduleGemminiTensorIR:
                     pointwise
                     and not self.offload_copies
                     and any(
-                        not kind.startswith("add_i32") and kind not in ("relu_i8", "affine_i8")
+                        kind not in ("relu_i8", "affine_i8")
                         for _, kind in pointwise
                     )
                 ):

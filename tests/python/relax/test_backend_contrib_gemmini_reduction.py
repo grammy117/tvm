@@ -248,7 +248,10 @@ class GemminiReductionTests(unittest.TestCase):
             self.assertEqual(control.emulator_faults(), 0)
 
     def test_numeric_and_dtype_boundaries(self):
-        self.assertEqual(len(reduction_blocks(workload((1, 1 << 24), (1,)))), 1)
+        self.assertEqual(len(reduction_blocks(workload((1, (1 << 24) - 1), (1,)))), 1)
+        self.assertFalse(reduction_blocks(workload((1, 1 << 24), (1,))))
+        self.assertFalse(reduction_blocks(workload((1, 1 << 24), (1,), output_dtype="int64")))
+        self.assertFalse(reduction_blocks(workload((1, 1, 1, 1, 1, 2), (5,))))
         self.assertFalse(reduction_blocks(workload((1, (1 << 24) + 1), (1,))))
         self.assertFalse(reduction_blocks(workload((65536, 65536, 1), (2,))))
         for dtype in ("int32", "float32"):

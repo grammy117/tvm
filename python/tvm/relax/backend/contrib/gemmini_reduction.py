@@ -93,6 +93,8 @@ def reduction_blocks(func):
         source, inline = _signed_byte_source(value.b, producers)
         if source is None:
             continue
+        if len(source.buffer.shape) > 5 or len(store.buffer.shape) > 5:
+            continue
         if source.buffer.data.same_as(store.buffer.data):
             continue
         axes = list(block.iter_vars)
@@ -108,8 +110,9 @@ def reduction_blocks(func):
         spatial = [i for i, axis in enumerate(axes) if axis.iter_type == tir.IterVar.DataPar]
         reduction = [i for i, axis in enumerate(axes) if axis.iter_type == tir.IterVar.CommReduce]
         depth = math.prod(int(axes[i].dom.extent) for i in reduction)
-        # Every prefix is in [-128*K,127*K], hence exactly representable in INT32.
-        if not reduction or depth > (1 << 24):
+        # The spec bounds absolute partials by INT32_MAX, not merely signed
+        # representability. Exclude -2**31 even though i32 can store that code.
+        if not reduction or 128 * depth > (1 << 31) - 1:
             continue
         if any(
             not isinstance(index, tir.Var)
@@ -148,13 +151,13 @@ def _sum_update(previous, value, wide, source_casts):
 
 def reduction_metadata(match):
     node, (rows, depth), _, _ = match
-    metadata = {"operation": "sum_i8_i32", "rows": rows, "depth": depth}
+    metadata = {"operation": "sum_i8_i32", "rows": rows, "depth": depth,
+                "prefix_min": -128 * depth, "prefix_max": 127 * depth,
+                "accumulator_partial_abs_bound": 128 * depth}
     if node.body.buffer.dtype == "int64":
         metadata.update(
             output_dtype="int64",
             accumulator_dtype="int32",
-            prefix_min=-128 * depth,
-            prefix_max=127 * depth,
             exact_accumulator_narrowing=True,
         )
     return metadata
@@ -302,7 +305,7 @@ def schedule_reduction(func, *, tensorize=True, mark_tensorize=False, scalar=Fal
     )
     if wide:
         # The admission proof bounds every prefix by [-128*K, 127*K], with
-        # K <= 2**24. Narrow only the internal reduction allocation; ordinary
+        # 128*K <= INT32_MAX. Narrow only the internal reduction allocation; ordinary
         # cache writeback retains the required INT64 output conversion.
         sch.unsafe_set_dtype(block, 0, "int32")
     update = sch.get(block).body.value

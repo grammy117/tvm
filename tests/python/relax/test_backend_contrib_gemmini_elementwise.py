@@ -384,7 +384,7 @@ class GemminiElementwiseTests(unittest.TestCase):
             "int32"
         )
         for shape in ((1,), (31,), (1, 7), (3, 4), (16, 16), (17, 19), (2, 3, 4)):
-            for kind in ("copy_i8", "copy_i32", "widen_i8_i32", "add_i32_wrapping"):
+            for kind in ("copy_i8", "copy_i32", "widen_i8_i32"):
                 with self.subTest(shape=shape, kind=kind):
                     original = workload(shape, kind)
                     result = make_elementwise_schedule(original)
@@ -395,24 +395,10 @@ class GemminiElementwiseTests(unittest.TestCase):
                         a = np.resize(bits, shape)
                     inputs = [tvm.nd.array(a)]
                     expected = a.astype("int32") if kind == "widen_i8_i32" else a
-                    if kind.startswith("add_i32"):
-                        b = np.resize(
-                            np.array([-1, 2147483647, 1, -1, -2147483648, 2147483647], "int32"),
-                            shape,
-                        )
-                        inputs.append(tvm.nd.array(b))
-                        expected = (a.astype("int64") + b.astype("int64")).astype("int32")
                     output = tvm.nd.empty(shape, str(expected.dtype))
                     runtime(*inputs, output)
                     np.testing.assert_array_equal(output.numpy(), expected)
-                    if kind == "add_i32_wrapping" and shape == (16, 16):
-                        semantic = tvm.build(original, "llvm")
-                        cpu_output = tvm.nd.empty(shape, "int32")
-                        semantic(*inputs, cpu_output)
-                        np.testing.assert_array_equal(cpu_output.numpy(), expected)
                     np.testing.assert_array_equal(inputs[0].numpy(), a)
-                    if kind.startswith("add_i32"):
-                        np.testing.assert_array_equal(inputs[1].numpy(), b)
                     self.assertEqual(control.emulator_faults(), 0)
                     self.assertEqual(control.emulator_pending(), 0)
                     self.assertGreater(control.emulator_commands(), 0)
@@ -426,7 +412,7 @@ class GemminiElementwiseTests(unittest.TestCase):
         from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator
         from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
 
-        func = workload((3, 4), "add_i32_wrapping")
+        func = workload((3, 4), "copy_i32")
         context = ms.TuneContext(
             mod=func,
             target=GemminiCapabilities().target(),
@@ -445,13 +431,13 @@ class GemminiElementwiseTests(unittest.TestCase):
             design.enter_postproc()
             self.assertTrue(all(p.apply(design) for p in context.space_generator.postprocs))
             result = lower_tensorir_schedule(
-                func, design, workload_metadata={"operation": "add_i32_wrapping"}
+                func, design, workload_metadata={"operation": "copy_i32"}
             )
             runtime, control = self.build(result.scheduled_mod)
             a = np.full((3, 4), 2147483647, "int32")
             output = tvm.nd.empty((3, 4), "int32")
-            runtime(tvm.nd.array(a), tvm.nd.array(np.ones((3, 4), "int32")), output)
-            np.testing.assert_array_equal(output.numpy(), np.full((3, 4), -2147483648, "int32"))
+            runtime(tvm.nd.array(a), output)
+            np.testing.assert_array_equal(output.numpy(), a)
             self.assertEqual(control.emulator_faults(), 0)
 
     def test_normal_relax_lowering_and_float_refusal(self):
@@ -466,17 +452,17 @@ class GemminiElementwiseTests(unittest.TestCase):
             report = []
             prepare_gemmini_graph(builder.get(), report=report)
             self.assertEqual(
-                sum(row["placement"] == "gemmini" for row in report), int(dtype == "int32"), report
+                sum(row["placement"] == "gemmini" for row in report), 0, report
             )
 
     def test_returned_device_buffer_is_ready_before_cpu_consumer(self):
-        a = te.placeholder((3, 4), "int32", "a")
-        b = te.placeholder((3, 4), "int32", "b")
-        c = te.compute((3, 4), lambda i, j: a[i, j] + b[i, j], name="device_result")
+        a = te.placeholder((3, 4), "int8", "a")
+        b = te.placeholder((3, 4), "int8", "b")
+        c = te.compute((3, 4), lambda i, j: a[i, j].astype("int32") + b[i, j].astype("int32"), name="device_result")
         d = te.compute((3, 4), lambda i, j: c[i, j] * 2, name="cpu_result")
         original = te.create_prim_func([a, b, c, d])
         scheduled = make_elementwise_schedule(original)
-        av, bv = np.arange(12, dtype="int32").reshape(3, 4), np.full((3, 4), 7, "int32")
+        av, bv = np.arange(12, dtype="int8").reshape(3, 4), np.full((3, 4), 7, "int8")
         runtime, control = self.build(scheduled.scheduled_mod)
         cv = tvm.nd.array(np.full((3, 4), -123, "int32"))
         dv = tvm.nd.empty((3, 4), "int32")
@@ -596,21 +582,10 @@ class GemminiElementwiseTests(unittest.TestCase):
                         )
 
                     c = te.compute(shape, value, name="add_scalar")
-                    result = make_elementwise_schedule(te.create_prim_func([x, a, c]))
-                    runtime, control = self.build(result.scheduled_mod)
-                    av = np.array(1 if wrapping else 7, "int32")
-                    xv = (
-                        np.full(shape, 2147483647, "int32")
-                        if wrapping
-                        else np.arange(np.prod(shape), dtype="int32").reshape(shape) - 10
-                    )
-                    output = tvm.nd.empty(shape, "int32")
-                    runtime(tvm.nd.array(xv), tvm.nd.array(av), output)
-                    np.testing.assert_array_equal(
-                        output.numpy(), (xv.astype("int64") + int(av)).astype("int32")
-                    )
-                    self.assertEqual(control.emulator_faults(), 0)
-                    self.assertEqual(control.emulator_pending(), 0)
+                    # No byte-source bound: wrapping/full-domain i32 addition is
+                    # outside the software spec's bounded-exact affine contract.
+                    with self.assertRaises(ValueError):
+                        make_elementwise_schedule(te.create_prim_func([x, a, c]))
 
     def test_registered_pipeline_preserves_graph_and_executes_dynamic_full(self):
         from tvm import meta_schedule as ms
