@@ -242,7 +242,7 @@ class SketchTests(EmulatedCase):
         self.assertIn(12, {sketch.depth for sketch in sketch_space(odd)})
         self.assertIn("m", {sketch.tail for sketch in sketch_space(odd)})
 
-    def test_default_schedule_is_one_tile_groups(self):
+    def test_default_schedule_uses_reuse_and_preserves_explicit_groups(self):
         sch = default_schedule(matmul(64, 64, 48))
         names = [inst.kind.name for inst in sch.trace.insts]
         self.assertIn("SamplePerfectTile", names)
@@ -251,7 +251,25 @@ class SketchTests(EmulatedCase):
             for inst in sch.trace.insts
             if inst.kind.name == "SamplePerfectTile"
         ]
-        self.assertTrue(all(decision[1] == 1 for decision in decisions))
+        self.assertTrue(any(decision[1] > 1 for decision in decisions))
+        func = matmul(64, 64, 48)
+        old = default_schedule(func, row_tiles=1, col_tiles=1)
+        commands, _ = self.run_lowered(func, lower_tensorir_schedule(func, sch).scheduled_mod)
+        old_commands, _ = self.run_lowered(func, lower_tensorir_schedule(func, old).scheduled_mod)
+        self.assertLess(commands, old_commands)
+
+    def test_default_reuse_respects_small_sram_and_decoding_shape(self):
+        for shape in ((64, 64, 48), (1, 64, 256), (7, 19, 11)):
+            with self.subTest(shape=shape):
+                caps = GemminiCapabilities(spad_rows=64, acc_rows=32)
+                func = matmul(*shape)
+                sch = default_schedule(func, capabilities=caps)
+                lowered = lower_tensorir_schedule(func, sch, capabilities=caps)
+                self.assertLessEqual(lowered.metadata["acc_rows"], caps.acc_rows)
+                self.run_lowered(func, lowered.scheduled_mod)
+                replay = tir.Schedule(func)
+                sch.trace.apply_to_schedule(replay, remove_postproc=False)
+                tvm.ir.assert_structural_equal(replay.mod, sch.mod)
 
 
 class DesignSpaceTests(EmulatedCase):
