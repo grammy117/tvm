@@ -108,3 +108,20 @@ def test_features_remain_finite_after_tensorization():
     assert candidates
     features = MathematicalFeatures().extract_from(context, candidates)
     assert all(np.isfinite(feature.numpy()).all() and feature.shape[0] > 0 for feature in features)
+
+
+def test_single_trial_batches_record_warmup_boundary_and_per_task_cap(tmp_path):
+    work = task()
+    database = tune_gemmini_tasks(
+        [work], work_dir=tmp_path, builder=GemminiBuilder(lambda mod, key: key, max_workers=1),
+        runner=GemminiRunner(lambda path: 123, max_workers=1), max_trials_global=9,
+        max_trials_per_task=5, num_trials_per_iter=1, warmup=3, eps_greedy=0.0,
+        compact=True, include_cpu=False, log=tmp_path / "trials.jsonl",
+    )
+    rows = [json.loads(line) for line in (tmp_path / "trials.jsonl").read_text().splitlines()]
+    assert len(rows) == 5
+    assert [row["training_samples_before_update"] for row in rows] == list(range(5))
+    assert [row["learned_ranking_available"] for row in rows] == [False]*3 + [True]*2
+    assert len(database.get_all_tuning_records()) == 5
+    state = json.loads((tmp_path / "cost-model.json").read_text())
+    assert state["training_samples"] == 5 and state["eps_greedy"] == 0
