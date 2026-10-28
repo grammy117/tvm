@@ -42,7 +42,11 @@ existing matchers do not establish software-spec admission. No model name or exp
 | `tuning_library.py` | Validate measurement identities and merge structurally compatible records. |
 | `tune_chunk.py` | Compare connected graph plans; its existing local runner is not the FireSim runner. |
 
-[OWNERSHIP.md](OWNERSHIP.md) defines stock versus supplied code.
+[OWNERSHIP.md](OWNERSHIP.md) defines stock versus supplied code, including the
+remaining placement, memory and host-inlining orchestration. The companion Merlin
+[architecture and paper scope](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-workload-tuning/examples/gemmini/comparisons/tvm/ARCHITECTURE.md)
+is the top-down overview; its operation inventory separates implemented candidates
+from software-spec and deployed-hardware qualification.
 [TUNING.md](TUNING.md) defines schedule choices and cost-model behavior.
 [FIRESIM.md](FIRESIM.md) defines build/handoff boundaries.
 
