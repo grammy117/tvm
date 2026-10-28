@@ -188,9 +188,10 @@ class GemminiRunner(ms.runner.PyRunner):
 class RecordMeasurements(ms.measure_callback.PyMeasureCallback):
     """Append every measured candidate to a JSON-lines campaign log."""
 
-    def __init__(self, path, describe=None):
+    def __init__(self, path, describe=None, model_state=None):
         self.path = str(path)
         self.describe = describe
+        self.model_state = model_state
 
     def apply(self, task_scheduler, task_id, measure_candidates, builder_results, runner_results):
         task = task_scheduler.tasks_[task_id].ctx
@@ -208,6 +209,8 @@ class RecordMeasurements(ms.measure_callback.PyMeasureCallback):
                     "run_error": ran.error_msg,
                     "cycles": float(ran.run_secs[0]) if ran.run_secs else None,
                 }
+                if self.model_state is not None:
+                    row.update(self.model_state())
                 if self.describe is not None:
                     row.update(self.describe(built.artifact_path))
                 stream.write(json.dumps(row) + "\n")
@@ -229,8 +232,14 @@ def tune_gemmini_tasks(
     include_cpu=True,
     warmup=4,
     compact=False,
+    eps_greedy=0.1,
+    max_trials_per_task=None,
 ):
     """Tune extracted tasks with stock ``tune_tasks`` and return the JSONDatabase."""
+    import xgboost  # Fail before measurements if the optional tuner is unavailable.
+
+    if type(warmup) is not int or warmup < 1 or not 0 <= eps_greedy <= 1:
+        raise ValueError("Use a positive XGB warmup and epsilon in [0,1]")
     capabilities = capabilities or GemminiCapabilities()
     target = capabilities.target()
     contexts, weights = [], []
@@ -244,7 +253,7 @@ def tune_gemmini_tasks(
                 genetic_num_iters=2 if compact else 3,
                 genetic_mutate_prob=0.85,
                 genetic_max_fail_count=10,
-                eps_greedy=0.1,
+                eps_greedy=eps_greedy,
             )
         elif strategy == "replay":
             search = ms.search_strategy.ReplayTrace(max_fail_count=8)
@@ -267,9 +276,6 @@ def tune_gemmini_tasks(
         for context in contexts:
             context.generate_design_space()
     database = ms.database.JSONDatabase(work_dir=str(work_dir))
-    callbacks = [ms.measure_callback.AddToDatabase(), ms.measure_callback.UpdateCostModel()]
-    if log is not None:
-        callbacks.append(RecordMeasurements(log, describe))
     cost_model = ms.cost_model.XGBModel(
         extractor=MathematicalFeatures(), adaptive_training=False, num_tuning_cores=1,
         num_warmup_samples=warmup,
@@ -277,11 +283,21 @@ def tune_gemmini_tasks(
     model_path = Path(work_dir) / "cost_model.xgb"
     if model_path.exists():
         cost_model.load(str(model_path))
+    def model_state():
+        return dict(training_samples_before_update=cost_model.data_size,
+                    learned_ranking_available=cost_model.data_size >= warmup and cost_model.booster is not None)
+
+    callbacks = [ms.measure_callback.AddToDatabase()]
+    if log is not None:
+        # Log the state used to select this batch, before its labels train XGB.
+        callbacks.append(RecordMeasurements(log, describe, model_state))
+    callbacks.append(ms.measure_callback.UpdateCostModel())
     ms.tune_tasks(
         tasks=contexts,
         task_weights=weights,
         work_dir=str(work_dir),
         max_trials_global=max_trials_global,
+        max_trials_per_task=max_trials_per_task,
         num_trials_per_iter=num_trials_per_iter,
         builder=builder,
         runner=runner,
@@ -294,6 +310,9 @@ def tune_gemmini_tasks(
         cost_model.save(str(model_path))
     (Path(work_dir) / "cost-model.json").write_text(json.dumps({
         "implementation": "TVM XGBModel", "warmup_samples": warmup,
+        "xgboost_version": xgboost.__version__,
+        "eps_greedy": eps_greedy, "max_trials_per_task": max_trials_per_task,
+        "warmup_scope": "this cost-model instance; feature-bearing samples, including runner errors",
         "training_samples": cost_model.data_size, "booster_trained": cost_model.booster is not None,
         "learned_predictions_enabled": cost_model.data_size >= warmup and cost_model.booster is not None,
     }, indent=2) + "\n")
