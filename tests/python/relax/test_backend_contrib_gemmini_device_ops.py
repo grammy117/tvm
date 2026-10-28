@@ -116,6 +116,18 @@ class DeviceOpsTests(unittest.TestCase):
                     found |= "local.gemmini" in design.mod.script()
             self.assertTrue(found, name)
 
+    def test_frozen_group_scales_keep_one_contraction_and_original_outputs(self):
+        from test_backend_contrib_gemmini_views import GemminiViewTests
+
+        case = next(case for case in fixtures() if case[0] == "group16_preserved")
+        report = []
+        prepared = prepare_gemmini_graph(case[1], report=report, **case[5])
+        self.assertEqual(sum(row["placement"] == "gemmini" for row in report), case[6])
+        _, outputs, control = GemminiViewTests.static_run(self, prepared, case[2])
+        np.testing.assert_array_equal(outputs[0], case[3])
+        self.assertGreater(control.emulator_commands(), 0)
+        self.assertEqual(control.emulator_faults(), 0)
+
     def test_declared_source_rank_boundaries(self):
         from tvm.relax.backend.contrib.gemmini_meta_schedule import _supported
 
