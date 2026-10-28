@@ -1,6 +1,7 @@
 # Gemmini TensorIR integration
 
-This worktree simplifies TVM `42b3c1ef2` on branch `gemmini/direct-intrinsics`.
+The active compiler is branch `gemmini/direct-intrinsics`, derived from TVM
+v0.19.0 with inherited correctness fixes and the Gemmini integration.
 It is a development snapshot, not a hardware-qualified release. The companion
 Merlin `examples/gemmini/comparisons/tvm/FIRESIM_HANDOFF.md` owns the campaign,
 artifact retrieval and readiness status.
@@ -8,8 +9,8 @@ artifact retrieval and readiness status.
 The selected model protocol is
 [Merlin 8ec99308](https://github.com/ucb-bar/merlin/tree/8ec99308cb1182b9b896a6075300312266fadf6f/examples/gemmini/protocol).
 Keep its numerical recipes, independent references and complete-chain checks.
-TinyLlama uses the approved 32-token prefill + 32 decode chain; its tuning probes
-remain 16/1 rows. Compiler smoke tests do not establish full-model correctness.
+The active campaign is ResNet50 plus 16 isolated kernel cases. Full TinyLlama
+and SmolVLA are backlogged. Compiler smoke tests do not establish model quality.
 
 ## One active compiler path
 
@@ -56,6 +57,8 @@ Run relevant backend/application tests. Host emulation, Spike functional checks
 and FireSim cycle observations are separate evidence tiers.
 
 The legacy graph/template/bounded-search implementations are outside this path.
+[LEGACY.md](LEGACY.md) lists their remaining consumers and the lazy compatibility
+boundary; normal preparation does not import `gemmini_legacy.py`.
 Their historical inventory and results remain at
 [the predecessor source](https://github.com/grammy117/tvm/tree/42b3c1ef27abe878f930e48b335b24956beb0e56/apps/gemmini).
 

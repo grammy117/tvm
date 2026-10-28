@@ -5,15 +5,11 @@ KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA
 are backlogged; their full-model recipes below are retained future work.
 
 Read README.md, OWNERSHIP.md, TUNING.md and FIRESIM.md before making changes.
-The sole campaign protocol is Merlin 8ec99308 (superseding older protocol links
-below). The current selection is full ResNet50, TinyLlama **32-token prefill plus 32
-teacher-forced decode calls**, and SmolVLA's prefix/ten-denoise/action-decode
-chain. Use the specified EL4 recipes, one selected `visible/v00` per model and
-explicit warm/reset/measured repetitions. Prepare calibration once, then publish
-shared numerical bytes and independent references. A previous capture is needed
-only for exact historical identity. Direct FireSim transport is the current
-workhorse path. This source is a compiler/tooling handoff, not evidence that
-those full-model runs already passed.
+The sole campaign protocol is Merlin 8ec99308. Follow the companion Merlin
+FIRESIM_HANDOFF.md for the active ResNet/kernel scope, exact inputs, budgets and
+remote responsibilities. Full TinyLlama/SmolVLA recipes below are historical or
+future work, not instructions to launch those models. Local diagnostic Spike
+results are separate from selected-model and hardware qualification.
 The simplified compiler removes automatic bias/prepacking/scale/readout preparation.
 Re-extract tasks and rebuild packages. Historical presets may seed structurally
 matching traces, but do not promise coverage or measured winners for this source.
@@ -59,7 +55,7 @@ complete TinyLlama numerical failure or qualify a FireSim deployment.
 - Source-specific ONNX arithmetic is explicitly versioned opt-in behavior in
   `_source_fidelity.py`; it is not default ONNX semantics or an accuracy waiver.
 
-## Next-agent execution order
+## Retained full-model workflow (backlogged stages are not active)
 
 1. Reopen the handoff artifact's refs, file audit, tests and remaining gates.
 2. Read the [selected EL4 contract](https://github.com/ucb-bar/merlin/blob/8ec99308cb1182b9b896a6075300312266fadf6f/examples/gemmini/protocol/experiment.yaml)

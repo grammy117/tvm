@@ -8,17 +8,11 @@ old ELFs or graph plans with new source identities.
 
 ## Current campaign decisions
 
-- Sole model protocol: Merlin 8ec99308, with approved TinyLlama prefill correction
-  to 32; E2E is 32 prefill + 32 decode. Tune published 16/1 probes.
-- Aggregate occupied tuning time: active ResNet 4h; backlogged TinyLlama/SmolVLA
-  retain 1h each for a future reactivation, across chunks
-  and graph choices. Stop new admissions at budget; finish active runs under their
-  safeguards and report overrun. CPU preparation and final E2E are separate.
-- Final E2E wall timeouts only: ResNet 1800s, TinyLlama/SmolVLA 25200s per run.
-- Next campaign: ResNet plus the 16 kernel cases in the companion Merlin
-  KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA
-  are backlogged. Use 25 total ReplayTrace proposals per kernel/chunk with no ML. The 16-case
-  TVM kernel sweep ceiling is 24 occupied-slot-hours. Report unequal effort.
+- Sole model protocol: Merlin 8ec99308. Active scope is ResNet50 plus the 16
+  complete kernel cases in the companion Merlin handoff. Full TinyLlama/SmolVLA
+  are backlogged; their old model launch settings are not active instructions.
+- Use stock ReplayTrace without ML. Workload/trial/time budgets and ELF commands
+  are defined only by the companion FIRESIM_HANDOFF.md, avoiding duplicate policy.
 - Candidate median-based wall watchdog replaces incumbent-cycle cancellation.
   Use three real baseline timings, a 3x latest-nine median with a 3x baseline floor,
   and an explicit hard ceiling. Bootstrap/ceiling values come from the remote pilot.

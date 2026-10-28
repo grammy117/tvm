@@ -256,7 +256,7 @@ def main():
         report["compiler_library"] = bind(_LIB._name)
         report["build_info"] = dict(tvm.support.libinfo())
         report["source_head"] = command(["git", "-C", source, "rev-parse", "HEAD"], "source-head").strip()
-        for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_conv.py"):
+        for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_legacy.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_conv.py"):
             bind(source / relative)
         convolution = args.workload == "conv-residual"
         kernel = args.conv_kernel or 3
@@ -267,7 +267,7 @@ def main():
         if args.search_seed is not None:
             from tvm.relax.backend.contrib.gemmini_tuning import BoundedGemminiSearch
             bind(source / "python/tvm/relax/backend/contrib/gemmini_tuning.py")
-            compiler_parts = [args.graph_mode, report["compiler_library"]["sha256"], report["exporter_source"]["sha256"], report["verifier_source"]["sha256"], report["compiler"]["sha256"], *[immutable[str(source / relative)] for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_tuning.py")]]
+            compiler_parts = [args.graph_mode, report["compiler_library"]["sha256"], report["exporter_source"]["sha256"], report["verifier_source"]["sha256"], report["compiler"]["sha256"], *[immutable[str(source / relative)] for relative in ("python/tvm/relax/backend/contrib/gemmini.py", "python/tvm/relax/backend/contrib/gemmini_legacy.py", "python/tvm/relax/backend/contrib/gemmini_schedule.py", "python/tvm/relax/backend/contrib/gemmini_tuning.py")]]
             compiler_parts.append(immutable[str(source / "python/tvm/relax/backend/contrib/gemmini_conv.py")])
             if convolution:
                 compiler_parts.extend([args.workload, kernel])

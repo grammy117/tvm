@@ -1,5 +1,9 @@
 # Per-workload Verilator chunks
 
+> Historical/local Verilator workflow, not the active FireSim launch plan.
+> Current fusion/CSE choices exclude automatic prepacking and bias folding.
+> Use [TUNING.md](TUNING.md) and the companion Merlin FIRESIM_HANDOFF.md.
+
 Use `workload_tuning.py` to prepare small, independently tunable pieces and inspect
 current knobs **before** spending search time. This is an experiment driver;
 compiler decisions still derive from IR and capability facts, not model names.
@@ -13,8 +17,9 @@ case. Decode and prefill never share a campaign by default.
 Before allocating simulator trials, run `audit_graph_plans.py --program PROGRAM
 --output-dir NEW`. It reports distinct prepared graphs and inactive options on
 that exact input. `tune_chunk.py` now measures one representative per structurally
-equal prepared graph; aliases remain explicitly unmeasured in its results. The
-32 option configurations are not a promise of 32 different implementations.
+equal prepared graph; aliases remain explicitly unmeasured in its results.
+Current graph controls are four fusion levels × CSE on/off, with structural
+deduplication; the old 32-plan study also varied now-removed preparation passes.
 
 For internal attribution, `compile_package.py --profile-operators` buffers cycles
 and symbols for each operator call. The companion session builder's
