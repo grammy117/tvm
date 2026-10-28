@@ -227,7 +227,7 @@ def fixtures():
             expected,
             "gemmini",
             {},
-            2,
+            1,
         )
     )
     return result
