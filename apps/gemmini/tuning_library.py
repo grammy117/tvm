@@ -233,7 +233,13 @@ def validate_campaign(root, *, capabilities=None):
     """
     root = Path(root).resolve(strict=True)
     capabilities = capabilities or GemminiCapabilities()
-    campaign = _read(root / "campaign.json")  # Written only when search is complete.
+    manifests = [root / name for name in ("campaign.json", "replay-campaign.json")
+                 if (root / name).is_file()]
+    _require(len(manifests) == 1, "Expected one completed campaign; separate comparison runs first")
+    manifest = manifests[0]
+    prefix = "replay-" if manifest.name.startswith("replay-") else ""
+    database_dir = root / (prefix + "database")
+    campaign = _read(manifest)  # Written only when search is complete.
     _require(campaign["capabilities"] == capabilities.fingerprint, "Campaign capability mismatch")
     _require(campaign["timing_policy"] == "fixed-warm", "Only fixed-warm campaigns can be combined")
     memory = campaign["memory_model"]
@@ -256,7 +262,7 @@ def validate_campaign(root, *, capabilities=None):
         binder_identity = _unchanged(bindings["binder_source"])
         if bindings.get("fixture") is not None:
             fixture_identity = _unchanged(bindings["fixture"])
-    _require(all((root / "database" / name).is_file() for name in DATABASE_FILES),
+    _require(all((database_dir / name).is_file() for name in DATABASE_FILES),
              "Completed campaign database is missing")
     successful, failed = [], []
     for path in sorted((root / "candidates").glob("*/measurement.json")):
@@ -266,7 +272,7 @@ def validate_campaign(root, *, capabilities=None):
         else:
             failed.append(_failed_candidate(path, campaign, bindings))
     baselines = _baseline_evidence(root, successful)
-    database = open_gemmini_database(root / "database", prepared, capabilities=capabilities)
+    database = open_gemmini_database(database_dir, prepared, capabilities=capabilities)
     records, omitted = [], []
     for index, record in enumerate(database.get_all_tuning_records()):
         costs = [float(cost) for cost in record.run_secs] if record.run_secs is not None else []
@@ -291,21 +297,21 @@ def validate_campaign(root, *, capabilities=None):
                         "witnesses": [item["provenance"] for item in witnesses]})
     _require(records, "No verified fresh records in campaign")
     source_files = [root / name for name in
-                    ("campaign.json", "program.json", "prepared.json", "graph-plan.json",
-                     "hardware-provenance.json", "tasks.json", "trials.jsonl") if (root / name).exists()]
+                    (manifest.name, "program.json", "prepared.json", "graph-plan.json",
+                     "hardware-provenance.json", "tasks.json", prefix + "trials.jsonl") if (root / name).exists()]
     app = Path(__file__).resolve().parent
     backend = Path(tvm.__file__).resolve().parent / "relax/backend/contrib"
     publication_sources = sorted(app.glob("*.py")) + sorted(backend.glob("gemmini*.py"))
     context = {"schema": "gemmini_measurement_context_v1", "memory_fingerprint": memory["fingerprint"],
                "memory_model": memory, "timing_policy": "fixed-warm", "capabilities": capabilities.fingerprint,
                "target": str(capabilities.target()), "compiler": campaign["compiler"],
-               "campaign": identity(root / "campaign.json"),
+               "campaign": identity(manifest),
                "input_bindings": binding_identity, "boundary_fixture": fixture_identity,
                "input_binder_source": binder_identity,
                "source_files": [identity(path) for path in source_files],
                "publication_sources": {"phase": "captured during publication, not at candidate build time",
                                        "files": [identity(path) for path in publication_sources]},
-               "database_files": [identity(root / "database" / name) for name in DATABASE_FILES],
+               "database_files": [identity(database_dir / name) for name in DATABASE_FILES],
                "records": len(records), "record_provenance": records,
                "source_record_order": "stock Database.get_all_tuning_records (ascending mean cost)",
                "trace_identity_encoding": "TVM JSON of standard trace.as_json()",
@@ -317,7 +323,8 @@ def validate_campaign(root, *, capabilities=None):
 
 def publish_campaign_context(root, *, capabilities=None):
     _, context = validate_campaign(root, capabilities=capabilities)
-    return _write_immutable(Path(root).resolve() / "database/measurement-context.json", context)
+    database_dir = Path(context["database_files"][0]["path"]).parent
+    return _write_immutable(database_dir / "measurement-context.json", context)
 
 
 def merge_campaigns(roots, output, *, capabilities=None):

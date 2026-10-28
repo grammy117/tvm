@@ -384,13 +384,15 @@ def main(argv=None):
     parser.add_argument("--extract-only", action="store_true",
                         help="Write complete task inventory without a toolchain or simulation")
     parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("--trials-per-task", type=int, default=16,
+    parser.add_argument("--trials-per-task", type=int, default=None,
                         help="Global budget multiplier; the stock scheduler distributes this times the task count")
+    parser.add_argument("--trials-total", type=int, default=25,
+                        help="Total proposals across extracted tasks unless --trials-per-task is explicit")
     parser.add_argument("--parallel", type=int, default=14)
     parser.add_argument("--trials-per-iteration", type=int,
                         help="Stock search batch size; defaults to the runner concurrency")
     parser.add_argument("--builders", type=int, default=6)
-    parser.add_argument("--strategy", choices=("evolutionary", "replay"), default="evolutionary")
+    parser.add_argument("--strategy", choices=("evolutionary", "replay"), default="replay")
     parser.add_argument("--tasks", type=int, nargs="*", help="Restrict to these task indices")
     parser.add_argument("--operators", type=int, nargs="+", help="Select semantic operators before task extraction")
     parser.add_argument("--baseline-workers", type=int, default=2)
@@ -445,6 +447,8 @@ def main(argv=None):
     if not args.extract_only and any(getattr(args, name) is None for name in
                                    ("gcc", "adapter_receipt", "spike_receipt", "hardware_receipt")):
         parser.error("Tuning requires gcc, adapter-receipt, spike-receipt and hardware-receipt")
+    if args.trials_total < 1 or (args.trials_per_task is not None and args.trials_per_task < 1):
+        parser.error("Trial counts must be positive")
     args.work_dir = args.work_dir.resolve()
     args.work_dir.mkdir(parents=True, exist_ok=True)
     capabilities = GemminiCapabilities()
@@ -528,7 +532,7 @@ def main(argv=None):
         "status": "running", "program_sha256": program_sha256,
         "prepared_sha256": prepared_sha256, "scope": extraction["scope"],
         "preparation_options": preparation, "strategy": args.strategy,
-        "proposal_budget": args.trials_per_task * len(tasks),
+        "proposal_budget": (args.trials_per_task * len(tasks) if args.trials_per_task is not None else args.trials_total),
         "moving_cutoff": args.moving_cutoff, "compact_search": args.compact_search,
         "deadline_epoch": args.deadline_epoch, "toolchain": toolchain.as_json(),
         "compiler": measure.identity(tvm._ffi.base._LIB._name),
@@ -603,7 +607,7 @@ def main(argv=None):
         work_dir=args.work_dir / ("database" if args.strategy == "evolutionary" else "replay-database"),
         builder=builder,
         runner=runner,
-        max_trials_global=args.trials_per_task * len(tasks),
+        max_trials_global=(args.trials_per_task * len(tasks) if args.trials_per_task is not None else args.trials_total),
         num_trials_per_iter=args.trials_per_iteration or args.parallel,
         capabilities=capabilities,
         strategy=args.strategy,
@@ -630,7 +634,9 @@ def main(argv=None):
         json.dumps({"model": args.model, "program_sha256": program_sha256,
                     "prepared_sha256": prepared_sha256, "preparation_options": preparation,
                     "scope": extraction["scope"], "strategy": args.strategy, "wall_seconds": time.monotonic() - started,
-                    "trials_per_task": args.trials_per_task, "parallel": args.parallel, "cap_factor": args.cap_factor,
+                    "trials_per_task": args.trials_per_task, "trials_total": args.trials_total,
+                    "proposal_budget": (args.trials_per_task * len(tasks) if args.trials_per_task is not None else args.trials_total),
+                    "parallel": args.parallel, "cap_factor": args.cap_factor,
                     "baselines_after_search": args.baselines_after_search,
                     "execution_pool": str(args.execution_pool) if args.execution_pool else None,
                     "moving_cutoff": args.moving_cutoff, "compact_search": args.compact_search,

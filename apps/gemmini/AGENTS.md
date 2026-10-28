@@ -49,8 +49,8 @@ complete TinyLlama numerical failure or qualify a FireSim deployment.
   command software loops, primitive OS/WS, legal buffering and reuse are allowed.
 - Keep capacity, signed-width, overflow, NaN/rounding, alias and DMA-completion
   proofs. Unsupported cases must retain CPU semantics or refuse explicitly.
-- Use stock `extract_tasks`, `tune_tasks`, EvolutionarySearch/ReplayTrace,
-  XGBModel, JSONDatabase and MetaScheduleApplyDatabase. Do not revive the old
+- Use stock `extract_tasks`, `tune_tasks`, ReplayTrace (no learned model),
+  JSONDatabase and MetaScheduleApplyDatabase. Do not revive the old
   custom result format/controller. New search decisions must live in traces.
 - Tune and compile the same prepared IR and capability target. Inspect every
   function's placement; a partial database does not mean full coverage.

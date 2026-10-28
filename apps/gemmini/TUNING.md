@@ -1,105 +1,56 @@
-<!-- Current FireSim policy is in the companion Merlin handoff. -->
-# TensorIR scheduling and MetaSchedule
+# TensorIR tuning defaults
 
-The active path is `tune_models.py` with stock extraction, EvolutionarySearch,
-XGBModel, JSONDatabase and MetaScheduleApplyDatabase. The companion Merlin
-OPTIMIZATION_KNOBS.md records the current audit, trial-budget research and approved
-median-timeout policy. No custom bounded-search controller is used here.
+Use stock MetaSchedule **ReplayTrace** and ordinary TensorIR traces. The common
+tuner and tune_models.py default to replay; the FireSim runner selects replay
+explicitly. There is no XGBoost import, feature extraction, model training/load/
+save, UpdateCostModel callback or learned ranking in this path. A stock RandomModel
+is an unused API placeholder; ReplayTrace samples trace decisions directly.
+Round-robin assigns proposals across extracted tasks. Evolutionary/XGB remains
+an explicit legacy option, not part of this campaign.
 
-## Preparation and schedule choices
+## Deterministic starting schedule
 
-Start the simplified graph at fusion=2/CSE off; stock fusion levels 0–3 and CSE
-are the remaining graph alternatives. Automatic packing/bias folding are removed.
-Every changed prepared graph needs fresh extraction and structural matching;
-old 47-workload/26-owner counts belong to the predecessor configuration.
+The common contraction baseline uses the largest exact tile divisor up to 16 for
+M/N/K, respecting the PE bound and the existing exact-tail path. M=1 remains 1.
+It ranks legal reuse groups (bounded 64 tiles per axis) by logical operand traffic,
+then output-group size and K batch size. M grouping reuses B, N grouping reuses A;
+K batching combines loads without claiming additional arithmetic reuse.
+Accumulator and scratchpad estimates prune choices; actual memory lowering checks
+aligned allocations/lifetimes. Try at most eight ranked choices, then the safe
+one-group baseline. Explicit group/order/chunk settings are preserved.
+No model names, expected answers, measured historical costs or custom graph
+rewrites select the default. OS/no-hoist/no-pipeline is the conservative structural
+baseline; ReplayTrace can explore the existing legal WS/hoist/pipeline/staging/
+tail alternatives. This heuristic is not a latency predictor or a measured optimum.
 
-A contraction schedule exposes these ordinary TensorIR decisions:
+The same helper feeds direct compilation, baseline measurement and fallback records.
+Keep a correct measured baseline in JSONDatabase. Promote only actual faster correct
+measurements, then validate connected chunks/complete calls; operator minima are
+not an E2E result. Capacity, hazards and completion remain correctness lowering.
 
-| Choice | Implementation |
-| --- | --- |
-| Tile rectangle and tails | Legal 1..16 tile dimensions; split, blockize, pad/partition and tensorize. |
-| M/N/K reuse | Three sample_perfect_tile decisions, with exact SRAM capacity checks. |
-| Traversal and OS/WS | Structural sketches using primitive commands; hardware loop FSMs forbidden. |
-| Operand hoisting/staging | cache_read, compute_at and explicit root/tile packing work. |
-| Pipeline and buffering | Stage annotations, stock InjectSoftwarePipeline and checked physical buffers. |
-| Epilogue placement and unroll | Traced placement and stock categorical/mutation rules. |
+## Campaign
 
-Secondary families currently offer rectangular/scalar structural alternatives.
-The implementation inside an intrinsic is fixed; XGB does not independently tune
-its command sequence. CPU/device alternatives share prepared mathematics, but
-CPU-only unsupported tasks are reported and excluded by the current campaign
-selector. Remote eligible contractions must retain required device placement.
+Active: ResNet50 plus 16 kernel cases in the companion Merlin
+KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA are
+backlogged. Default 25 total ReplayTrace proposals per chunk/case across internal
+tasks and graph choices, not 25 per internal contraction/head. No ML warmup or
+five-guided phase. Baseline/watchdog calibrations and timing repeats are separate
+execution counts charged to the same wall budget. Failed/duplicate proposals count;
+report successful unique schedules and stop reason. Stochastic failure to find
+another candidate is not proof of complete space exhaustion.
 
-`VerifyGemminiMemory` is a legality postprocessor, not a performance optimizer.
-Allocation, host-DMA dependencies and completion waits remain required.
-Command coalescing and zero-init elimination have been removed.
+ResNet 4h DSE/30min per E2E; the 16-case TVM kernel sweep has a conservative 24
+occupied-slot-hour aggregate ceiling. Stop admissions at time or candidate cap;
+finish active jobs under frozen median watchdogs. The selected graph starts at
+fusion=2/CSE off without automatic prepacking or bias folding.
 
-## Cost model and feedback
+Raw measured completed target cycles are evidence. The FireSim adapter converts
+them to seconds at the Runner boundary using the target counter frequency.
+Never mix old cycle-valued databases with seconds-valued records. Wall duration
+is for watchdogs/occupancy, not the optimization label. No timeout becomes cycles.
 
-`MathematicalFeatures` replays a trace without postprocessing and calls stock
-PerStoreFeature. This preserves loop/store features hidden by late tensorization.
-Eager tensorization can still hide part of a secondary kernel. There is no explicit
-Gemmini command/bank/latency model; finite features do not prove predictive power.
-
-Stock XGB trains on workload-normalized costs. The helper currently sets warmup=4
-instead of upstream's 100 and disables adaptive training, with one training core.
-The threshold is total feature-bearing samples in that model object, not per task;
-failed runner results can count. Learned predictions being enabled is not proof
-that subsequent proposals were better ranked. Model save/load includes cached
-training data; bind reuse to compiler, features, hardware and measurement policy.
-
-Compact EvolutionarySearch uses population 32, two genetic iterations and four
-initial unmeasured candidates; the full profile uses 64, three and sixteen.
-Both use mutation probability .85 and random exploration .1. Mutator weights are
-tile .9 / location .05 / unroll .05. These are integration settings, not a new
-algorithm. Keep the chosen profile explicit; do not silently alter it mid-campaign.
-
-The generic local runner historically stores cycles in run_secs. The current
-Merlin FireSim adapter converts raw cycles to seconds using the documented target
-counter frequency. Keep raw cycles in receipts, and never mix those database
-conventions or substitute emulator wall throughput for counter frequency.
-
-Stock runner errors have no timing; XGB uses a large failure sentinel rather than
-censoring-aware estimation. Preserve error categories and never report that value
-as measured cycles. The approved median wall-watchdog policy retains completed correct slow runs
-as training data. Timeout samples do not update successful-duration history.
-Remote wall-cancellation/correctness qualification replaces the live-observer gate.
-
-## Record reuse and verification
-
-- Register workload-dependent intrinsics before opening a portable database;
-  TVM validates every stored trace, including unmatched records.
-- Apply records with stock structural matching. No model-name or node-ID lookup.
-- Keep actual hardware measurements separate from historical trace seeds.
-- Check default, measured winner and connected chunk with the same arithmetic,
-  inputs and timing interval. Never sum operator minima into claimed E2E cycles.
-- Report unique successes, errors, training samples per workload, post-training
-  proposals and measured ranking quality. A saved booster alone proves none of these.
-- One legal schedule with no remaining sampled choices needs a measurement,
-  not a cost-model search. Recheck this for each shape rather than assuming it.
-
-Historical presets can have zero or partial structural coverage after this
-cleanup. Re-extract and report misses; new measurements require fresh source-bound
-records. The predecessor experiments and commands remain in
-[the pinned tuning history](https://github.com/grammy117/tvm/blob/42b3c1ef27abe878f930e48b335b24956beb0e56/apps/gemmini/TUNING.md).
-
-## Next FireSim campaign
-
-ResNet plus the 16 separately specified kernel cases are active. Full TinyLlama
-and SmolVLA are backlogged. The requested plan is 50 warmup plus 5 guided
-candidate trials per workload. The companion handoff resolves workload grouping,
-wall caps and complete-call kernel measurement; counts alone do not establish
-five successful guided runs. ResNet's last confirmed caps are 4h DSE and 30min
-per E2E run. No optimizer/hardware result is implied by these settings.
-
-The FireSim caller passes warmup=50, batch=1, eps_greedy=0 and a per-task cap55.
-Each recorded trial includes the XGB sample count and learned-ranking availability
-before its labels update the model. XGB may train during warmup; its predictions
-remain random until the sample threshold and a booster exist. Runner-error labels
-can count. Baseline calibration is separate from search training. Check actual
-unique correct trials and stage counts before writing paper results.
-
-The tuner imports XGBoost before measurement and records its version. A bounded
-local smoke test used xgboost-cpu==2.1.4; install it in the selected TVM environment
-and run the search smoke test before any paid measurements. Preserve cycle units
-and CPU/thread bounds. This does not qualify cost-model prediction quality.
+Current FireSim implementation still measures extracted contractions; grouped
+complete-call builders/checks remain required for the new kernel campaign.
+Bind actual source, toolchain, hardware, placement, complete outputs and timing
+scope. ReplayTrace does not remove these requirements. See Merlin's current
+FIRESIM_HANDOFF.md for restore/build commands, receipts and readiness limitations.
