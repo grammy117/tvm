@@ -28,9 +28,8 @@ Old graph plans requesting removed transforms refuse; re-extract tasks instead
 of changing a saved plan's meaning.
 
 Keep ordinary tiling/layout/cache schedules, exact intrinsic descriptions,
-capacity/overflow/rounding checks and required memory synchronization. Composite
-intrinsic scope is under review; existing matchers do not establish software-spec
-admission. No model name or expected output chooses an optimization.
+capacity/overflow/rounding checks and required memory synchronization. The user approved retaining only declared, proved composite TensorIntrins;
+existing matchers do not establish software-spec admission. No model name or expected output chooses an optimization.
 
 ## Entry points
 
@@ -55,3 +54,21 @@ and FireSim cycle observations are separate evidence tiers.
 The legacy graph/template/bounded-search implementations are outside this path.
 Their historical inventory and results remain at
 [the predecessor source](https://github.com/grammy117/tvm/tree/42b3c1ef27abe878f930e48b335b24956beb0e56/apps/gemmini).
+
+Full-domain INT32 add (including explicit modulo-32 and scalar forms) has no
+active TensorIntrin in this revision. Its original fixtures keep their bytes
+and host semantics. Bounded i8-source affine arithmetic remains a separate
+contract. Affine source ranks stop at five; per-operand scaled sums require
+rank two. These matcher restrictions do not replace selected-scale screens,
+emitted-command audits or hardware qualification.
+
+Unbounded standalone i32 readout is excluded from byte-affine admission;
+contraction readout retains its separate producer/epilogue proof. Affine
+metadata reports the conservative bound for every accumulator prefix and
+weighted K=1 mesh partial. These bounds do not constitute hardware qualification.
+
+The strict matcher admits contraction and pooled-readout result ranks 2–4;
+standalone movement/affine/sum ranks stop at five. Rank-five 3D convolution
+retains host mathematics. Byte sums require `128*K <= INT32_MAX`; accepting
+`-2**31` solely because it fits the dtype would violate the spec's absolute
+partial bound. These checks apply before ordinary schedule construction.

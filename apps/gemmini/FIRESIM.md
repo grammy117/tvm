@@ -14,8 +14,9 @@ old ELFs or graph plans with new source identities.
   and graph choices. Stop new admissions at budget; finish active runs under their
   safeguards and report overrun. CPU preparation and final E2E are separate.
 - Final E2E wall timeouts only: ResNet 3600s, TinyLlama/SmolVLA 21600s per run.
-- Candidate median-based watchdog is a proposal, not selected policy yet. Preserve
-  the earlier early-stop qualification gate until the user explicitly replaces it.
+- Candidate median-based wall watchdog replaces incumbent-cycle cancellation.
+  Use three real baseline timings, a 3x latest-nine median with a 3x baseline floor,
+  and an explicit hard ceiling. Bootstrap/ceiling values come from the remote pilot.
 - Remote tuning uses independent FireSim guest checks, not sequential Spike
   preflight. Local small functional controls remain a separate evidence tier.
 - Remote worker owns manager/slots, deployed image, actual cancellation and clock/
@@ -61,7 +62,7 @@ No archive or small high-address probe establishes whole-model capacity.
 5. Validate actual carried state, resets and the entire selected model chain using
    the pinned protocol. Operator/chunk tests do not establish model success.
 
-Do not launch a campaign from this document while compiler scope, timeout policy
-and new delivery identities remain pending. Historical transport/ABI details and
+Before launch, finish per-family proof admission, source-bound model artifacts
+and remote wall-cancellation/correctness qualification. Historical transport/ABI details and
 results are preserved in
 [the source-pinned FireSim guide](https://github.com/grammy117/tvm/blob/42b3c1ef27abe878f930e48b335b24956beb0e56/apps/gemmini/FIRESIM.md).

@@ -2,8 +2,8 @@
 
 The active path is `tune_models.py` with stock extraction, EvolutionarySearch,
 XGBModel, JSONDatabase and MetaScheduleApplyDatabase. The companion Merlin
-OPTIMIZATION_KNOBS.md records the current audit, trial-budget research and pending
-median-timeout proposal. No custom bounded-search controller is used here.
+OPTIMIZATION_KNOBS.md records the current audit, trial-budget research and approved
+median-timeout policy. No custom bounded-search controller is used here.
 
 ## Preparation and schedule choices
 
@@ -60,9 +60,9 @@ conventions or substitute emulator wall throughput for counter frequency.
 
 Stock runner errors have no timing; XGB uses a large failure sentinel rather than
 censoring-aware estimation. Preserve error categories and never report that value
-as measured cycles. Under the proposed timeout-only policy, completed correct slow
-runs must remain training data. That policy is not yet activated; current remote
-observer requirements remain pending the user's decision.
+as measured cycles. The approved median wall-watchdog policy retains completed correct slow runs
+as training data. Timeout samples do not update successful-duration history.
+Remote wall-cancellation/correctness qualification replaces the live-observer gate.
 
 ## Record reuse and verification
 
