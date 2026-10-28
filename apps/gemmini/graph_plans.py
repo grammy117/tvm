@@ -13,7 +13,7 @@
 # limitations under the License.
 """Bounded graph preparation choices recorded using stock Relax tuning traces.
 
-These choices alter fusion and constant packing before inner TensorIR search.
+These choices alter stock fusion and common-subexpression elimination before inner TensorIR search.
 They do not create cross-function SRAM residency. No model name is consulted.
 Measure a complete connected graph to choose between plans; operator minima
 cannot account for the different host boundaries and CPU glue.
@@ -46,8 +46,8 @@ class GraphPlan:
     """Compiler preparation settings, independent of workload labels."""
 
     fusion_level: int = 2
-    prepack_weights: bool = True
-    bias_preload: bool = True
+    prepack_weights: bool = False
+    bias_preload: bool = False
     eliminate_common_subexpr: bool = False
 
     def __post_init__(self):
@@ -55,6 +55,10 @@ class GraphPlan:
             raise ValueError("Graph fusion level must be -1 or an integer from 0 to 3")
         if type(self.prepack_weights) is not bool or type(self.bias_preload) is not bool:
             raise ValueError("Graph packing and bias settings must be booleans")
+        if self.prepack_weights:
+            raise ValueError("Automatic weight prepacking was removed; regenerate the graph plan")
+        if self.bias_preload:
+            raise ValueError("Automatic bias preload was removed; regenerate the graph plan")
         if type(self.eliminate_common_subexpr) is not bool:
             raise ValueError("Graph CSE setting must be a boolean")
 
@@ -78,8 +82,8 @@ class GraphPlan:
     @classmethod
     def from_args(cls, args):
         return cls(fusion_level=getattr(args, "graph_fusion_level", -1),
-                   prepack_weights=getattr(args, "prepack_weights", True),
-                   bias_preload=getattr(args, "bias_preload", True),
+                   prepack_weights=getattr(args, "prepack_weights", False),
+                   bias_preload=getattr(args, "bias_preload", False),
                    eliminate_common_subexpr=getattr(args, "graph_cse", False))
 
     @classmethod
@@ -101,7 +105,7 @@ class GraphPlan:
 
     def trace(self, mod):
         choices = {p.name: p.choice() for p in plans(include_cse=True,
-                   fusion_levels=(0, 1, 2, 3), bias_preload_choices=(True, False))}
+                   fusion_levels=(0, 1, 2, 3), bias_preload_choices=(False,))}
         choices[self.name] = self.choice()
         return Trace(mod, [Knob("GemminiGraphPreparation", choices)], [self.name])
 
@@ -132,9 +136,9 @@ class GraphPlan:
         return extract_inventory(mod, capabilities, **self.preparation_options)
 
 
-def plans(*, include_cse=False, fusion_levels=(2, 0), prepack_choices=(True, False),
-          bias_preload_choices=(True,)):
-    """Generic Cartesian alternatives; the default experiment budget uses four."""
+def plans(*, include_cse=False, fusion_levels=(2, 0), prepack_choices=(False,),
+          bias_preload_choices=(False,)):
+    """Generic Cartesian alternatives; only stock graph choices remain."""
     result = tuple(GraphPlan(level, packed, bias, eliminate_common_subexpr=cse)
                  for cse in ((False, True) if include_cse else (False,))
                  for level in fusion_levels for packed in prepack_choices
@@ -154,7 +158,7 @@ def audit_plans(mod, alternatives=None):
     """
     alternatives = tuple(alternatives) if alternatives is not None else plans(
         include_cse=True, fusion_levels=(0, 1, 2, 3),
-        bias_preload_choices=(True, False))
+        bias_preload_choices=(False,))
     if not alternatives or len({p.name for p in alternatives}) != len(alternatives):
         raise ValueError("Audit requires nonempty, distinct graph plans")
     # Prefer the existing compiler default when several choices are equivalent.

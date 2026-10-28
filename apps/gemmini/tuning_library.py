@@ -419,8 +419,8 @@ def main():
         if (args.graph_fusion_level is not None or args.prepack_weights is not None
                 or args.bias_preload is not None or args.graph_cse):
             selected = [GraphPlan(args.graph_fusion_level if args.graph_fusion_level is not None else 2,
-                                  args.prepack_weights if args.prepack_weights is not None else True,
-                                  bias_preload=args.bias_preload if args.bias_preload is not None else True,
+                                  args.prepack_weights if args.prepack_weights is not None else False,
+                                  bias_preload=args.bias_preload if args.bias_preload is not None else False,
                                   eliminate_common_subexpr=args.graph_cse)]
         _write_immutable(args.output, coverage(args.database, args.programs, graph_plans=selected))
         print(args.output)

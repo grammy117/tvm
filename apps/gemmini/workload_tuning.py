@@ -158,7 +158,7 @@ def main(argv=None):
         run.add_argument("--adapter-receipt", type=Path, required=True)
         run.add_argument("--graph-fusion-level", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
         run.add_argument("--graph-cse", action="store_true")
-        run.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=True)
+        run.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=False)
         run.add_argument("--no-prepack-weights", action="store_true")
         if action == "compile":
             run.add_argument("--variant", choices=("cpu", "default", "current", "tuned"), default="current")

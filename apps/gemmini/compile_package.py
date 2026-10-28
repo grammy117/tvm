@@ -501,12 +501,12 @@ def main():
                         help="Buffer per-call operator cycles; report after inference through the session profiler")
     parser.add_argument("--graph-fusion-level", type=int, choices=(-1, 0, 1, 2, 3), default=-1,
                         help="Relax fusion alternative before inner schedule search; default follows PassContext")
-    parser.add_argument("--no-prepack-weights", action="store_false", dest="prepack_weights",
-                        help="Compare unpacked constant operands without changing model arithmetic")
+    parser.add_argument("--no-prepack-weights", action="store_false", dest="prepack_weights", default=False,
+                        help="Compatibility flag: automatic weight prepacking is disabled")
     parser.add_argument("--graph-cse", action="store_true",
                         help="Use stock Relax common-subexpression elimination before legalization")
-    parser.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=True,
-                        help="Retain the mathematical bias epilogue instead of canonicalizing preload")
+    parser.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=False,
+                        help="Compatibility flag: bias epilogues are always preserved")
     parser.add_argument("--tensor-memory-bytes", type=int, default=64 << 20)
     parser.add_argument("--host-math-policy", default="native",
                         choices=("native", "portable_trig", "portable_exp_trig", "portable_neural_f32"),

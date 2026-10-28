@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Exact scalar readout proofs and specialization of frozen tensor-wide scales."""
+"""Exact scalar readout proofs and TensorIR scheduling helpers."""
 
 import hashlib
 import json
@@ -23,100 +23,8 @@ from functools import lru_cache
 
 import numpy as np
 import tvm
-from tvm import relax, tir
+from tvm import tir
 from tvm.script import tir as T
-
-
-@relax.expr_functor.mutator
-class _ScaleSpecializer(relax.PyExprMutator):
-    def visit_call_(self, call):
-        from .gemmini_tensorir import contraction_block, _normalizable_contractions
-
-        call = super().visit_call_(call)
-        if call.op != tvm.ir.Op.get("relax.call_tir"):
-            return call
-        func = self.builder_.get()[call.args[0]]
-        if not isinstance(func, tir.PrimFunc) or not (
-            contraction_block(func) or _normalizable_contractions(func)
-        ):
-            return call
-        constants = {}
-        for index, argument in enumerate(call.args[1]):
-            if not isinstance(argument, relax.Constant):
-                continue
-            data = argument.data.numpy()
-            if (
-                data.dtype == np.float32
-                and data.size
-                and np.isfinite(data).all()
-                and (data > 0).all()
-                and np.all(data == data.flat[0])
-            ):
-                constants[func.buffer_map[func.params[index]].data] = float(data.flat[0])
-        if not constants:
-            return call
-        written = set()
-        tir.stmt_functor.post_order_visit(
-            func.body,
-            lambda node: written.add(node.buffer.data)
-            if isinstance(node, tir.BufferStore)
-            else None,
-        )
-        constants = {key: value for key, value in constants.items() if key not in written}
-        if not constants:
-            return call
-
-        def replace(node):
-            if isinstance(node, tir.BufferLoad) and node.buffer.data in constants:
-                return tir.const(constants[node.buffer.data], "float32")
-            if isinstance(node, tir.Block):
-                reads = [region for region in node.reads if region.buffer.data not in constants]
-                if len(reads) != len(node.reads):
-                    return tir.Block(
-                        node.iter_vars,
-                        reads,
-                        node.writes,
-                        node.name_hint,
-                        node.body,
-                        node.init,
-                        node.alloc_buffers,
-                        node.match_buffers,
-                        node.annotations,
-                    )
-            return None
-
-        body = tir.stmt_functor.ir_transform(
-            func.body, None, replace, ["tir.BufferLoad", "tir.Block"]
-        )
-        keep = [
-            index
-            for index, param in enumerate(func.params)
-            if func.buffer_map[param].data not in constants
-        ]
-        selected = tir.PrimFunc(
-            [func.params[index] for index in keep],
-            body,
-            func.ret_type,
-            {func.params[index]: func.buffer_map[func.params[index]] for index in keep},
-            func.attrs,
-        )
-        if selected.attrs and "layout_free_buffers" in selected.attrs:
-            selected = selected.without_attr("layout_free_buffers")
-        gv = self.builder_.add_func(selected, call.args[0].name_hint + "_scales")
-        arguments = [argument for index, argument in enumerate(call.args[1]) if index in keep]
-        return relax.Call(
-            call.op, [gv, relax.Tuple(arguments), *call.args[2:]], call.attrs, call.sinfo_args
-        )
-
-
-@tvm.transform.module_pass(opt_level=0, name="SpecializeGemminiReadoutScales")
-class SpecializeGemminiReadoutScales:
-    def transform_module(self, mod, _ctx):
-        mutator = _ScaleSpecializer(mod)
-        for gv, func in mod.functions.items():
-            if isinstance(func, relax.Function):
-                mutator.builder_.update_func(gv, mutator.visit_expr(func))
-        return relax.transform.DeadCodeElimination()(mutator.builder_.get())
 
 
 def _constant_pair(expression, cls):
@@ -249,84 +157,6 @@ def prove_readout(expression, accumulator):
     return dict(_prove_chain(factors, relu))
 
 
-def normalize_readout_layout(func):
-    """Expose a proved INT8 matrix epilogue before scheduling destroys perfect nests."""
-    from .gemmini_tensorir import contraction_block
-    from .gemmini_reduction import reduction_blocks
-
-    matches = contraction_block(func) or reduction_blocks(func)
-    if len(matches) != 1:
-        return func
-    outputs = {buffer.data for buffer in func.buffer_map.values()}
-    candidates = []
-    tir.stmt_functor.post_order_visit(
-        func.body,
-        lambda node: candidates.append(node)
-        if isinstance(node, tir.Block)
-        and isinstance(node.body, tir.BufferStore)
-        and node.body.buffer.dtype == "int8"
-        and node.body.buffer.data in outputs
-        else None,
-    )
-    if len(candidates) != 1:
-        return func
-    sch = tir.Schedule(func, debug_mask="all")
-    epilogue = sch.get_block(candidates[0].name_hint)
-    try:
-        # Ordinary pointwise inlining retains the mathematical expression;
-        # reductions and immutable parameter reads are not replaced by a kernel.
-        while True:
-            producers = sch.get_producers(epilogue)
-            inlineable = [
-                p
-                for p in producers
-                if sch.get(p).init is None
-                and isinstance(sch.get(p).body, tir.BufferStore)
-                and sch.get(p).body.buffer.data not in outputs
-            ]
-            if not inlineable:
-                break
-            sch.compute_inline(inlineable[0])
-        product = sch.get(sch.get_block(matches[0][0].name_hint)).body.buffer
-        node = sch.get(epilogue)
-        loads = []
-        tir.stmt_functor.post_order_visit(
-            node.body.value,
-            lambda value: loads.append(value) if isinstance(value, tir.BufferLoad) else None,
-        )
-        if not loads or any(
-            not load.buffer.same_as(product)
-            or not tvm.ir.structural_equal(load.indices, loads[0].indices)
-            for load in loads
-        ):
-            return func
-        proof = prove_readout(node.body.value, loads[0])
-        if not (
-            tvm.ir.structural_equal(node.body.buffer.shape, product.shape)
-            and tvm.ir.structural_equal(node.body.indices, loads[0].indices)
-        ):
-            sch.transform_block_layout(
-                epilogue,
-                tir.IndexMap([axis.var for axis in node.iter_vars], loads[0].indices, None),
-            )
-            sch.reindex(epilogue, ("write", 0))
-        result = sch.mod["main"].with_attr(
-            "gemmini.readout_proof", json.dumps(proof, sort_keys=True)
-        )
-        return result
-    except (ValueError, tir.schedule.ScheduleError):
-        return func
-
-
-@tvm.transform.module_pass(opt_level=0, name="NormalizeGemminiReadout")
-class NormalizeGemminiReadout:
-    def transform_module(self, mod, _ctx):
-        for gv, func in list(mod.functions.items()):
-            if isinstance(func, tir.PrimFunc):
-                mod.update_func(gv, normalize_readout_layout(func))
-        return mod
-
-
 def _register_readout_intrinsic(expression, accumulator, rows, cols, proof):
     from .gemmini_elementwise import _canonical_description
     from .gemmini_intrin import ACC, register_intrinsic_once
@@ -394,8 +224,6 @@ def _register_readout_intrinsic(expression, accumulator, rows, cols, proof):
 
 def fuse_readout(sch, write, rows, cols):
     """Fold a proved matrix epilogue into the ACC -> INT8 store intrinsic."""
-    if not sch.mod["main"].attrs or "gemmini.readout_proof" not in sch.mod["main"].attrs:
-        return sch, write, None
     candidate = sch.copy()
     selected = candidate.get_block(sch.get(write).name_hint)
     try:
@@ -415,6 +243,8 @@ def fuse_readout(sch, write, rows, cols):
         proof = prove_readout(node.body.value, loads[0])
         intrinsic = _register_readout_intrinsic(node.body.value, loads[0], rows, cols, proof)
         candidate.annotate(candidate.get_block("root"), "gemmini.readout_fused", 1)
+        candidate.annotate(candidate.get_block("root"), "gemmini.readout_proof",
+                           json.dumps(proof, sort_keys=True))
         return candidate, selected, intrinsic
     except (ValueError, tir.schedule.ScheduleError):
         return sch, write, None

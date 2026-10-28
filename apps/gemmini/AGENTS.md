@@ -1,7 +1,8 @@
 # Agent handoff: TVM Gemmini and EL4
 
 Read README.md, OWNERSHIP.md, TUNING.md and FIRESIM.md before making changes.
-The current selection is full ResNet50, TinyLlama **32-token prefill plus 32
+The sole campaign protocol is Merlin 8ec99308 (superseding older protocol links
+below). The current selection is full ResNet50, TinyLlama **32-token prefill plus 32
 teacher-forced decode calls**, and SmolVLA's prefix/ten-denoise/action-decode
 chain. Use the specified EL4 recipes, one selected `visible/v00` per model and
 explicit warm/reset/measured repetitions. Prepare calibration once, then publish
@@ -9,8 +10,9 @@ shared numerical bytes and independent references. A previous capture is needed
 only for exact historical identity. Direct FireSim transport is the current
 workhorse path. This source is a compiler/tooling handoff, not evidence that
 those full-model runs already passed.
-Select `--tuning-preset rtl-v1` for static compilation and inspect actual structural
-coverage; the preset cannot promise measured winners for every new EL4 operation.
+The simplified compiler removes automatic bias/prepacking/scale/readout preparation.
+Re-extract tasks and rebuild packages. Historical presets may seed structurally
+matching traces, but do not promise coverage or measured winners for this source.
 
 The follow-up in `WORKLOAD_TUNING.md` and Merlin `FASED_SWEEPS.md` uses explicit
 latency-pipe Verilator receipts and fixed-warm timing. Keep its fresh databases
