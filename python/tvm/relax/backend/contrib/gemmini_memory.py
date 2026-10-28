@@ -16,10 +16,10 @@
 # under the License.
 """Lower scoped Gemmini buffers to row allocations after TVM compaction.
 
-The fixed lowering after scheduling: software pipelines are expanded before
-rows are assigned, an accumulator zero fill folds into the first reduction
-command, consecutive tile loads coalesce into multi-block DMA, sibling scopes
-reuse rows, and completion waits are inserted only for host-memory hazards.
+The fixed lowering after scheduling expands software pipelines, assigns rows
+with reuse across sibling scopes, and inserts completion waits for host-memory
+hazards. Explicit initialization and DMA commands are preserved: the former
+zero-init elimination and consecutive-load coalescing peepholes were removed.
 Gemmini's reorder buffer orders commands that touch the same SRAM rows, so
 reusing rows across scopes needs no fence; host memory has no such tracking.
 """

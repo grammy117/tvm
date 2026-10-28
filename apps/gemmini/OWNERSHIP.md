@@ -15,6 +15,7 @@ upstream binary. See [README.md](README.md) for status and the selected protocol
 | Search space | Schedule API, trace, sampling, mutations, union of generators | Gemmini contraction/secondary-family rules, capability limits and single-hart CPU settings. |
 | Search/model | ReplayTrace, round-robin task scheduler; no learned model | Bounded traced schedule space and capacity-checked shape/reuse baseline. Evolutionary/XGB is explicit legacy opt-in. |
 | Tensorization | TensorIntrin registration/matching, RewriteTensorize | Mathematical descriptions, implementations and exact legality proofs. |
+| Final placement and host cleanup | MetaScheduleApplyDatabase, Schedule.compute_inline | ScheduleGemminiTensorIR preserves selected schedules, supplies defaults and reports CPU fallbacks; _inline_cpu_producers inlines eligible host temporaries after device placement. |
 | Physical memory | Storage scopes and software-pipeline transformation | SRAM lifetime/address allocation, bounds/alias checks, host-DMA hazard waits and completion. |
 | Machine code | LLVM RV64 | Primitive C command adapter; no hardware matmul/conv loop FSM. |
 | Records | JSONDatabase and MetaScheduleApplyDatabase | Intrinsic registration on load, provenance checks and measured-baseline fallback policy. |
@@ -38,6 +39,35 @@ Preparation still returns its historical three-tuple for caller compatibility;
 its two auxiliary dictionaries are empty. There is no alternate mathematical
 reference or normalization restoration path. Requests for bias preload or
 prepacking refuse explicitly.
+
+## Minimal implementation boundary
+
+This is a target backend using stock TVM extension interfaces, not an intrinsic-only
+plugin or unmodified upstream TVM. The source base is audited at `64bed0cb9`.
+The current campaign uses ReplayTrace with at most 25 candidate trials total per
+chunk/case; the FireSim entry point selects contractions only and disables the CPU
+search space. Generic secondary-family rules are not evidence of their tuning.
+
+Three pieces of custom orchestration also remain: `AnnotateGemminiWorkloads`
+records structural identity, `ScheduleGemminiTensorIR` applies default placement
+and final lowering after database replay, and `_inline_cpu_producers` invokes stock
+`compute_inline` on eligible host pointwise intermediates for the bare-metal
+exporter. The last is a fixed optimization, not just a correctness check. Preserve
+its low-precision rounding exclusions. Scalar match-buffer offset normalization
+is a TVM v0.19 pointer-binding compatibility fix. These are disclosed integration,
+not a claim that the backend has no custom passes.
+
+Automatic bias folding/prepacking stays removed. Schedule-local packing and
+explicit source-IR bias initialization remain legal and their actual work counts.
+Unsupported functions or failed default schedules can fall back to CPU with a
+reason in the placement report. Experimental admission must reject unreported or
+unintended fallback for required accelerator work. Matchers do not enforce every
+software-spec obligation; the strict audit tool is not a production proof gate.
+
+For top-down architecture and paper limitations, use the companion Merlin
+[architecture](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-workload-tuning/examples/gemmini/comparisons/tvm/ARCHITECTURE.md)
+and [operation inventory](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-workload-tuning/examples/gemmini/comparisons/tvm/TENSORIR_OP_AUDIT.md).
+Keep current scopes in those pages; earlier hardware results retain their old pins.
 
 ## Target code that remains necessary
 
