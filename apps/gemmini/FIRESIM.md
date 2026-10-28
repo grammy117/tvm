@@ -2,18 +2,23 @@
 
 The companion Merlin `examples/gemmini/comparisons/tvm/FIRESIM_HANDOFF.md` owns
 model inputs, portable chunk delivery, budgets, complete-chain construction and
-remote qualification. This simplified compiler is not yet a published replacement
-for its frozen delivery. Rebuild packages and re-extract workloads; do not relabel
+remote qualification. The simplified compiler is published; use the companion Merlin handoff for
+current source and campaign pins. Rebuild packages and re-extract workloads; do not relabel
 old ELFs or graph plans with new source identities.
 
 ## Current campaign decisions
 
 - Sole model protocol: Merlin 8ec99308, with approved TinyLlama prefill correction
   to 32; E2E is 32 prefill + 32 decode. Tune published 16/1 probes.
-- Aggregate occupied tuning time: ResNet 4h, TinyLlama 1h, SmolVLA 1h, across chunks
+- Aggregate occupied tuning time: active ResNet 4h; backlogged TinyLlama/SmolVLA
+  retain 1h each for a future reactivation, across chunks
   and graph choices. Stop new admissions at budget; finish active runs under their
   safeguards and report overrun. CPU preparation and final E2E are separate.
-- Final E2E wall timeouts only: ResNet 3600s, TinyLlama/SmolVLA 21600s per run.
+- Final E2E wall timeouts only: ResNet 1800s, TinyLlama/SmolVLA 25200s per run.
+- Next campaign: ResNet plus the 16 kernel cases in the companion Merlin
+  KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA
+  are backlogged. Requested plan: 50 warmup + 5 guided trials per workload,
+  with explicit grouping/budget decisions in the handoff. Report unequal effort.
 - Candidate median-based wall watchdog replaces incumbent-cycle cancellation.
   Use three real baseline timings, a 3x latest-nine median with a 3x baseline floor,
   and an explicit hard ceiling. Bootstrap/ceiling values come from the remote pilot.

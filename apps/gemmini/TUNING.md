@@ -1,3 +1,4 @@
+<!-- Current FireSim policy is in the companion Merlin handoff. -->
 # TensorIR scheduling and MetaSchedule
 
 The active path is `tune_models.py` with stock extraction, EvolutionarySearch,
@@ -81,3 +82,24 @@ Historical presets can have zero or partial structural coverage after this
 cleanup. Re-extract and report misses; new measurements require fresh source-bound
 records. The predecessor experiments and commands remain in
 [the pinned tuning history](https://github.com/grammy117/tvm/blob/42b3c1ef27abe878f930e48b335b24956beb0e56/apps/gemmini/TUNING.md).
+
+## Next FireSim campaign
+
+ResNet plus the 16 separately specified kernel cases are active. Full TinyLlama
+and SmolVLA are backlogged. The requested plan is 50 warmup plus 5 guided
+candidate trials per workload. The companion handoff resolves workload grouping,
+wall caps and complete-call kernel measurement; counts alone do not establish
+five successful guided runs. ResNet's last confirmed caps are 4h DSE and 30min
+per E2E run. No optimizer/hardware result is implied by these settings.
+
+The FireSim caller passes warmup=50, batch=1, eps_greedy=0 and a per-task cap55.
+Each recorded trial includes the XGB sample count and learned-ranking availability
+before its labels update the model. XGB may train during warmup; its predictions
+remain random until the sample threshold and a booster exist. Runner-error labels
+can count. Baseline calibration is separate from search training. Check actual
+unique correct trials and stage counts before writing paper results.
+
+The tuner imports XGBoost before measurement and records its version. A bounded
+local smoke test used xgboost-cpu==2.1.4; install it in the selected TVM environment
+and run the search smoke test before any paid measurements. Preserve cycle units
+and CPU/thread bounds. This does not qualify cost-model prediction quality.

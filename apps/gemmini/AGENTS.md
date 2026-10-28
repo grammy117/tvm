@@ -1,5 +1,9 @@
 # Agent handoff: TVM Gemmini and EL4
 
+Current campaign: ResNet50 plus the 16 cases in the companion Merlin
+KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA
+are backlogged; their full-model recipes below are retained future work.
+
 Read README.md, OWNERSHIP.md, TUNING.md and FIRESIM.md before making changes.
 The sole campaign protocol is Merlin 8ec99308 (superseding older protocol links
 below). The current selection is full ResNet50, TinyLlama **32-token prefill plus 32
@@ -58,7 +62,7 @@ complete TinyLlama numerical failure or qualify a FireSim deployment.
 ## Next-agent execution order
 
 1. Reopen the handoff artifact's refs, file audit, tests and remaining gates.
-2. Read the [selected EL4 contract](https://github.com/ucb-bar/merlin/blob/0cc289de52a10bed256f32c90cfbb54a21b3c81f/examples/gemmini/protocol/experiment.yaml)
+2. Read the [selected EL4 contract](https://github.com/ucb-bar/merlin/blob/8ec99308cb1182b9b896a6075300312266fadf6f/examples/gemmini/protocol/experiment.yaml)
    and companion shared-assets guide. Model revisions, inputs, calibration,
    recurrence and host-math choices are already specified. Finish/publish their
    portable prepared payloads. Older factory recipes and synthetic cutouts do
@@ -82,7 +86,7 @@ complete TinyLlama numerical failure or qualify a FireSim deployment.
    evidence or legacy full-array transport are distinct modes. The supplied
    strict publisher and lightweight mode require compact all-element comparison.
    Keep small positive/wrong-oracle controls on functional engines; paid FPGA
-   runs are complete models. Report every output/state check and timing scope.
+   runs measure the complete selected kernel case or full model, as declared. Report every output/state check and timing scope.
 8. Tune only after correctness and deployment gates pass. Preserve default/CPU
    baselines, failed caps, pure-search minima, record provenance and replayability.
 
