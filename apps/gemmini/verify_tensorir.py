@@ -811,7 +811,8 @@ def fixtures():
             if kind == "widen"
             else a
         )
-        result.append((kind, builder.get(), arrays, expected))
+        result.append((kind, builder.get(), arrays, expected, "gemmini",
+                       {"offload_copies": kind != "add_i32"}))
     for kind in ("permute", "repeat"):
         a = (np.arange(6).reshape(2, 3) * 17 - 128).astype("int8")
         av = relax.Var("a", relax.TensorStructInfo(a.shape, "int8"))
@@ -1263,6 +1264,7 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
         "apps/gemmini/baremetal.py",
         "apps/gemmini/matmul.c",
         "apps/gemmini/matmul.h",
+        "apps/gemmini/verify_device_ops.py",
         "src/tir/schedule/primitive/reduction.cc",
         "src/tir/schedule/state.cc",
         "src/tir/schedule/primitive/decompose_padding.cc",
@@ -1306,8 +1308,11 @@ def prepare(args, *, cases=None, prepared_reports=None, additional_bindings=()):
                 "gemmini_bias",
                 "gemmini_regions",
                 "gemmini_search",
-                "gemmini_layout",
                 "gemmini_epilogue",
+                "gemmini_affine",
+                "gemmini_bytes",
+                "gemmini_pool",
+                "gemmini_sketch",
             )
         ],
     ):

@@ -429,7 +429,7 @@ def lower_tensorir_schedule(
     root = sch.mod["main"].body.block
     if root.annotations.get("gemmini.readout_fused", False):
         metadata["readout_fused"] = True
-        metadata["readout_proof"] = json.loads(str(func.attrs["gemmini.readout_proof"]))
+        metadata["readout_proof"] = json.loads(str(root.annotations["gemmini.readout_proof"]))
     metadata["schedule_parameters"] = {
         str(key)[8:]: int(value) if isinstance(value, tir.IntImm) else str(value)
         for key, value in root.annotations.items()
@@ -476,8 +476,6 @@ class ScheduleGemminiTensorIR:
         order="ij",
         schedule_options=None,
         report=None,
-        references=None,
-        normalizations=None,
         offload_copies=False,
         movement_strategy="rectangular",
     ):
@@ -489,8 +487,6 @@ class ScheduleGemminiTensorIR:
         if set(self.schedule_options) - {"reduction_chunk", "row_tiles", "col_tiles"}:
             raise ValueError("Unknown Gemmini TensorIR schedule option")
         self.report = report if report is not None else []
-        self.references = references if references is not None else {}
-        self.normalizations = normalizations if normalizations is not None else {}
         if type(offload_copies) is not bool:
             raise ValueError("offload_copies must be a boolean")
         self.offload_copies = offload_copies
@@ -590,8 +586,6 @@ class ScheduleGemminiTensorIR:
                     )
                     origin = "default Gemmini contraction sketch"
             except (ValueError, tvm.TVMError) as error:
-                if gv.name_hint in self.references:
-                    mod.update_func(gv, self.references[gv.name_hint])
                 self.report.append(
                     {"function": gv.name_hint, "placement": "cpu", "reason": str(error)}
                 )
@@ -604,14 +598,12 @@ class ScheduleGemminiTensorIR:
                 "trace": result.trace.as_json(),
                 "origin": origin,
             }
-            if gv.name_hint in self.normalizations:
-                record["mathematical_normalization"] = self.normalizations[gv.name_hint]
             self.report.append(record)
         return mod
 
 
 def prepare_gemmini_tensorir_workloads(
-    mod, *, optimize=True, bias_preload=True, prepack_weights=True, fusion_level=-1,
+    mod, *, optimize=True, bias_preload=False, prepack_weights=False, fusion_level=-1,
     eliminate_common_subexpr=False
 ):
     """Expose the same mathematical workloads used by compile and DSE paths."""
@@ -642,30 +634,22 @@ def prepare_gemmini_tensorir_workloads(
             ]
         )
     mod = tvm.transform.Sequential(passes)(mod)
-    from .gemmini_epilogue import SpecializeGemminiReadoutScales
-
-    mod = SpecializeGemminiReadoutScales()(mod)
     if type(prepack_weights) is not bool:
         raise ValueError("prepack_weights must be a boolean")
     if prepack_weights:
-        from .gemmini_layout import prepack_constants
-
-        mod = prepack_constants(mod)
-    from .gemmini_bias import CanonicalizeGemminiBias
-
+        raise ValueError("Automatic weight prepacking was removed; use TensorIR layout schedules")
     if type(bias_preload) is not bool:
         raise ValueError("bias_preload must be a boolean")
-    references, normalizations = {}, {}
     if bias_preload:
-        mod = CanonicalizeGemminiBias(references=references, report=normalizations)(mod)
-    from .gemmini_epilogue import NormalizeGemminiReadout
+        raise ValueError("Automatic bias preload was removed; express accumulator initialization in TensorIR")
     from .gemmini_search import AnnotateGemminiWorkloads
 
-    mod = NormalizeGemminiReadout()(mod)
     # Workload identity for tuning records; extraction and application both
     # see functions prepared by this same pipeline.
     mod = AnnotateGemminiWorkloads()(mod)
-    return mod, references, normalizations
+    # Preserve the preparation API while old callers migrate; no mathematical
+    # rewrites or alternate reference functions are produced.
+    return mod, {}, {}
 
 
 def prepare_gemmini_tensorir_graph(
@@ -676,9 +660,9 @@ def prepare_gemmini_tensorir_graph(
     order="ij",
     schedule_options=None,
     report=None,
-    bias_preload=True,
+    bias_preload=False,
     offload_copies=False,
-    prepack_weights=True,
+    prepack_weights=False,
     movement_strategy="rectangular",
     database=None,
     fusion_level=-1,
@@ -692,7 +676,7 @@ def prepare_gemmini_tensorir_graph(
     from .gemmini import _inline_cpu_producers  # pylint: disable=import-outside-toplevel
     from .gemmini_target import GemminiCapabilities  # pylint: disable=import-outside-toplevel
 
-    mod, references, normalizations = prepare_gemmini_tensorir_workloads(
+    mod, _, _ = prepare_gemmini_tensorir_workloads(
         mod, optimize=optimize, bias_preload=bias_preload, prepack_weights=prepack_weights,
         fusion_level=fusion_level, eliminate_common_subexpr=eliminate_common_subexpr,
     )
@@ -706,8 +690,6 @@ def prepare_gemmini_tensorir_graph(
         order=order,
         schedule_options=schedule_options,
         report=report,
-        references=references,
-        normalizations=normalizations,
         offload_copies=offload_copies,
         movement_strategy=movement_strategy,
     )(mod)

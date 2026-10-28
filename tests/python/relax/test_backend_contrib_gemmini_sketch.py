@@ -123,7 +123,6 @@ class SketchTests(EmulatedCase):
             self.assertLessEqual(fences, 2)
 
     def test_round_even_clip_is_fused_and_numerically_exact(self):
-        from tvm.relax.backend.contrib.gemmini_epilogue import normalize_readout_layout
         a = te.placeholder((3, 5), "int8", "a")
         b = te.placeholder((5, 4), "int8", "b")
         k = te.reduce_axis((0, 5), "k")
@@ -132,8 +131,7 @@ class SketchTests(EmulatedCase):
         output = te.compute((3, 4), lambda i, j: tir.min(tir.max(
             tir.nearbyint(product[i, j].astype("float32") / tir.const(16.0, "float32")),
             tir.const(0.0, "float32")), tir.const(127.0, "float32")).astype("int8"), name="readout")
-        func = normalize_readout_layout(te.create_prim_func([a, b, output]))
-        self.assertIn("gemmini.readout_proof", func.attrs)
+        func = te.create_prim_func([a, b, output])
         lowered = lower_tensorir_schedule(func, default_schedule(func)).scheduled_mod
         self.assertIn("tvm_gemmini_dma_scaled_out", lowered.script())
         path = self.root / "readout.so"
@@ -203,7 +201,7 @@ class SketchTests(EmulatedCase):
         self.assertGreater(metadata["waited_host_buffers"], 0)
         self.assertGreater(fences, 1)
 
-    def test_fixed_lowering_fuses_zero_fill_and_coalesces_tile_loads(self):
+    def test_lowering_preserves_explicit_init_and_individual_dma(self):
         func = matmul(64, 128, 64)
         sch = tir.Schedule(func, debug_mask="all")
         sch = apply_contraction_sketch(
@@ -214,9 +212,11 @@ class SketchTests(EmulatedCase):
             tensorize=True,
         )
         text = lower_tensorir_schedule(func, sch).scheduled_mod.script()
-        self.assertNotIn("tvm_gemmini_zero_acc", text)
-        self.assertIn("tvm_gemmini_dma_a_blocks", text)
-        self.assertIn("tvm_gemmini_dma_b_blocks", text)
+        self.assertIn("tvm_gemmini_zero_acc", text)
+        self.assertIn("tvm_gemmini_dma_a", text)
+        self.assertIn("tvm_gemmini_dma_b", text)
+        self.assertNotIn("tvm_gemmini_dma_a_blocks", text)
+        self.assertNotIn("tvm_gemmini_dma_b_blocks", text)
         self.run_lowered(func, lower_tensorir_schedule(func, sch).scheduled_mod)
 
     def test_traces_replay_from_json(self):
@@ -438,7 +438,8 @@ class DatabaseTests(EmulatedCase):
         texts = [
             func.script() for func in compiled.functions.values() if isinstance(func, tir.PrimFunc)
         ]
-        self.assertTrue(any("tvm_gemmini_dma_a_blocks" in text for text in texts))
+        self.assertTrue(any("tvm_gemmini_dma_a" in text for text in texts))
+        self.assertFalse(any("tvm_gemmini_dma_a_blocks" in text for text in texts))
 
 
 def contraction_names(func):

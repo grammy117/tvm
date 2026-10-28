@@ -55,7 +55,7 @@ from tvm.relax.backend.contrib.gemmini_search import (  # pylint: disable=wrong-
     open_gemmini_database,
     tune_gemmini_tasks,
 )
-from tvm.relax.backend.contrib.gemmini_sketch import default_schedule  # pylint: disable=wrong-import-position
+from tvm.relax.backend.contrib.gemmini_meta_schedule import default_device_schedule  # pylint: disable=wrong-import-position
 from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities  # pylint: disable=wrong-import-position
 from tvm.relax.backend.contrib.gemmini_tensorir import (  # pylint: disable=wrong-import-position
     prepare_gemmini_tensorir_workloads,
@@ -317,7 +317,7 @@ def bind_program(root, program):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def extract_inventory(program, capabilities, *, fusion_level=-1, prepack_weights=True, bias_preload=True,
+def extract_inventory(program, capabilities, *, fusion_level=-1, prepack_weights=False, bias_preload=False,
                       eliminate_common_subexpr=False):
     """Include every extracted task, with explicit placement exclusions."""
     prepared, _, _ = prepare_gemmini_tensorir_workloads(
@@ -416,8 +416,8 @@ def main(argv=None):
     parser.add_argument("--timing-policy", choices=("legacy", "fixed-warm"), default="legacy",
                         help="fixed-warm always measures after one warmup, independent of operator duration")
     parser.add_argument("--graph-fusion-level", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
-    parser.add_argument("--no-prepack-weights", dest="prepack_weights", action="store_false", default=True)
-    parser.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=True)
+    parser.add_argument("--no-prepack-weights", dest="prepack_weights", action="store_false", default=False)
+    parser.add_argument("--no-bias-preload", dest="bias_preload", action="store_false", default=False)
     parser.add_argument("--graph-cse", action="store_true",
                         help="Expose stock Relax common-subexpression elimination as a graph preparation choice")
     parser.add_argument("--baseline-database", type=Path,
@@ -560,7 +560,7 @@ def main(argv=None):
             record = {"status": "deferred", "reason": "matching current trace freshly validated"}
         else:
             try:
-                default_mod = default_schedule(func).mod
+                default_mod = default_device_schedule(func).mod
                 record = baseline(campaign, key, "default", default_mod)
             except (ValueError, tvm.TVMError) as error:
                 record = {"status": "failed", "error": str(error)}
@@ -575,7 +575,7 @@ def main(argv=None):
         with campaign.lock:
             if record.get("status") == "passed":
                 retain_measured_baseline(fallback_database, task.dispatched[0],
-                                         default_schedule(func).trace, record, capabilities.target())
+                                         default_device_schedule(func).trace, record, capabilities.target())
             if item.get("current", {}).get("status") == "passed":
                 retain_measured_baseline(fallback_database, task.dispatched[0], current_traces[key],
                                          item["current"], capabilities.target())
@@ -621,7 +621,7 @@ def main(argv=None):
     for task, item in zip(tasks, inventory):
         record = item["default"]
         if record.get("status") == "passed":
-            sch = default_schedule(task.dispatched[0]["main"])
+            sch = default_device_schedule(task.dispatched[0]["main"])
             retain_measured_baseline(database, task.dispatched[0], sch.trace, record, capabilities.target())
         if item["workload"] in current_traces:
             retain_measured_baseline(database, task.dispatched[0], current_traces[item["workload"]],

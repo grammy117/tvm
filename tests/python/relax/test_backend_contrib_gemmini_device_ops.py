@@ -79,6 +79,21 @@ class DeviceOpsTests(unittest.TestCase):
             )
             tvm.ir.assert_structural_equal(actual.scheduled_mod, result.scheduled_mod)
 
+    def test_default_baselines_cover_secondary_families_and_replay(self):
+        from tvm.relax.backend.contrib.gemmini_meta_schedule import default_device_schedule
+
+        for name in ("subtract", "max_pool_2", "max_pool_3", "dma_int64_rectangular",
+                     "standalone_readout", "window_average_4", "window_average_9"):
+            with self.subTest(case=name):
+                case = next(case for case in fixtures() if case[0] == name)
+                func = next(f for f in case[1].functions.values() if isinstance(f, tir.PrimFunc))
+                schedule = default_device_schedule(func)
+                replay = tir.Schedule(func, debug_mask="all")
+                schedule.trace.apply_to_schedule(replay, remove_postproc=False)
+                tvm.ir.assert_structural_equal(schedule.mod, replay.mod)
+                lowered = lower_tensorir_schedule(func, replay, workload_metadata={"operation": name})
+                self.assertIn("tvm_gemmini_", lowered.scheduled_mod.script())
+
     def test_new_families_are_visible_to_stock_metaschedule(self):
         from tvm import meta_schedule as ms
         from tvm.relax.backend.contrib.gemmini_meta_schedule import gemmini_space_generator

@@ -67,8 +67,8 @@ def test_plan_variants_preserve_connected_numerics_and_change_boundaries():
         document = plan.identity(mod, prepared, trace=trace)
         identities.add(document["prepared_ir_sha256"])
         assert document["cross_function_sram_residency"] is False
-    assert counts["fuse0-pack1"] > counts["fuse2-pack1"]
-    assert len(identities) == 4
+    assert counts["fuse0-pack0-bias0"] > counts["fuse2-pack0-bias0"]
+    assert len(identities) == 2
 
 
 def test_graph_trace_replays_and_binds_the_actual_input_and_preparation():
@@ -103,22 +103,22 @@ def test_existing_default_preparation_is_preserved():
 def test_audit_collapses_inactive_choices_and_prefers_existing_default():
     mod, _, _ = graph()
     result = audit_plans(mod)
-    assert result["configurations"] == 32
-    assert result["distinct_prepared_graphs"] == 4
+    assert result["configurations"] == 8
+    assert result["distinct_prepared_graphs"] == 2
     assert result["groups"][0]["representative"] == GraphPlan().name
-    assert sum(len(group["plans"]) for group in result["groups"]) == 32
-    for field in ("bias_preload", "eliminate_common_subexpr"):
-        assert result["option_effects"][field] == {
-            "compared_pairs": 16, "changed_prepared_graph": 0,
-            "identical_prepared_graph": 16}
-    assert result["option_effects"]["prepack_weights"]["changed_prepared_graph"] == 16
+    assert sum(len(group["plans"]) for group in result["groups"]) == 8
+    assert result["option_effects"]["bias_preload"] == {
+        "compared_pairs": 0, "changed_prepared_graph": 0, "identical_prepared_graph": 0}
+    assert result["option_effects"]["eliminate_common_subexpr"] == {
+        "compared_pairs": 4, "changed_prepared_graph": 0, "identical_prepared_graph": 4}
+    assert result["option_effects"]["prepack_weights"]["compared_pairs"] == 0
     assert result["performance_measured"] is False
 
 
 def test_audit_does_not_merge_different_programs_on_hash_collision(monkeypatch):
     mod, _, _ = graph()
     monkeypatch.setattr(tvm.ir, "structural_hash", lambda _: 0)
-    assert audit_plans(mod, plans())["distinct_prepared_graphs"] == 4
+    assert audit_plans(mod, plans())["distinct_prepared_graphs"] == 2
     with pytest.raises(ValueError, match="distinct"):
         audit_plans(mod, [GraphPlan(), GraphPlan()])
 
@@ -161,7 +161,7 @@ def test_cse_shares_quantization_as_a_replayable_graph_choice():
     ordinary = baseline.prepare(mod)[0]
     prepared = choice.prepare(mod)[0]
     assert call_count(prepared) < call_count(ordinary)
-    assert len(plans()) == 4 and len(plans(include_cse=True)) == 8
+    assert len(plans()) == 2 and len(plans(include_cse=True)) == 4
     document = choice.identity(mod, prepared)
     tvm.ir.assert_structural_equal(replay(mod, document).out_mod, prepared)
     inputs = np.random.default_rng(7).integers(-16, 17, (2, 32)).astype("float32") / 16
@@ -173,19 +173,19 @@ def test_cse_shares_quantization_as_a_replayable_graph_choice():
         np.testing.assert_array_equal(before, after)
 
 
-def test_historical_three_argument_graph_choice_still_replays():
+def test_historical_bias_enabled_trace_is_refused():
     from tvm.relax.transform.tuning_api import Choice, Knob, Trace
     mod, _, _ = graph()
-    old = Trace(mod, [Knob("legacy", {"default": Choice(
-        "relax.ext.gemmini.prepare_graph_plan", [2, 1, 1])})], ["default"])
-    tvm.ir.assert_structural_equal(old.out_mod, GraphPlan().prepare(mod)[0])
+    with pytest.raises(ValueError, match="Automatic bias preload was removed"):
+        Trace(mod, [Knob("legacy", {"default": Choice(
+            "relax.ext.gemmini.prepare_graph_plan", [2, 0, 1])})], ["default"])
 
 
 def test_broad_graph_options_are_generic_and_preserve_integer_chain():
     mod, inputs, expected = graph()
     alternatives = plans(include_cse=True, fusion_levels=(0, 1, 2, 3),
-                         bias_preload_choices=(True, False))
-    assert len(alternatives) == 32
+                         bias_preload_choices=(False,))
+    assert len(alternatives) == 8
     for plan in alternatives:
         assert GraphPlan.from_name(plan.name) == plan
         prepared = plan.prepare(mod)[0]
@@ -194,3 +194,13 @@ def test_broad_graph_options_are_generic_and_preserve_integer_chain():
     for name in ("model-fast", "fuse2-pack2", "fuse2-pack1-cse1-bias0", "fuse2-pack1-cse1-cse1"):
         with pytest.raises(ValueError):
             GraphPlan.from_name(name)
+
+
+def test_old_bias_enabled_graph_plan_is_refused():
+    with pytest.raises(ValueError, match="Automatic bias preload was removed"):
+        GraphPlan.from_name("fuse2-pack0")
+
+
+def test_old_prepacked_graph_plan_is_refused():
+    with pytest.raises(ValueError, match="Automatic weight prepacking was removed"):
+        GraphPlan.from_name("fuse2-pack1-bias0")

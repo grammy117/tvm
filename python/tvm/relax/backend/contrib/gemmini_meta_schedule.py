@@ -60,6 +60,28 @@ def _supported(func):
     return None, []
 
 
+def default_device_schedule(func, *, capabilities=None):
+    """Untuned baseline using the same mathematical family dispatch as search.
+
+    Return an ordinary replayable TensorIR schedule. Physical allocation and
+    DMA hazard handling still happen in the existing memory lowering.
+    """
+    kind, _ = _supported(func)
+    if kind == "contraction":
+        from .gemmini_sketch import default_schedule
+
+        return default_schedule(func, capabilities=capabilities)
+    schedule = {
+        "reduction": schedule_reduction,
+        "pool": schedule_pool,
+        "elementwise": schedule_elementwise,
+    }.get(kind)
+    if schedule is None:
+        raise ValueError("No supported Gemmini mathematical family for default schedule")
+    result, _, _ = schedule(func, tensorize=True)
+    return result
+
+
 def _blocks(func):
     found = []
     tir.stmt_functor.post_order_visit(

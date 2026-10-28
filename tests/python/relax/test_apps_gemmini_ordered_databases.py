@@ -33,7 +33,7 @@ from tvm.relax.backend.contrib.gemmini_target import GemminiCapabilities
 @pytest.fixture
 def tasks():
     program, _ = smoke()
-    prepared = GraphPlan(0, True).prepare(program)[0]
+    prepared = GraphPlan(0, False).prepare(program)[0]
     caps = GemminiCapabilities()
     extracted = ms.relax_integration.extract_tasks(prepared, caps.target())
     assert len(extracted) >= 2

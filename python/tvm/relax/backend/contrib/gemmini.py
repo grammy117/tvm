@@ -263,7 +263,7 @@ def prepare_gemmini_graph_legacy(mod, tile_i=1, tile_j=1, optimize=True, tile_ch
 
 def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=None,
                           *, route="tensorir", capabilities=None, order="ij", schedule_options=None,
-                          report=None, bias_preload=True, offload_copies=False, prepack_weights=True,
+                          report=None, bias_preload=False, offload_copies=False, prepack_weights=False,
                           movement_strategy="rectangular", database=None, fusion_level=-1,
                           eliminate_common_subexpr=False):
     """Prepare Gemmini through mathematical TensorIR; retain explicit legacy mode.
@@ -279,7 +279,7 @@ def prepare_gemmini_graph(mod, tile_i=1, tile_j=1, optimize=True, tile_choices=N
             raise ValueError("Graph fusion choices require route='tensorir'")
         if offload_copies:
             raise ValueError("Copy offload choices require route='tensorir'")
-        if bias_preload is not True:
+        if bias_preload is not False:
             raise ValueError("bias_preload choices require route='tensorir'")
         if schedule_options:
             raise ValueError("TensorIR schedule options require route='tensorir'")

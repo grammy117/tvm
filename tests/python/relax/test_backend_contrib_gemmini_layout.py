@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Compile-time constant packing preserves independent convolution references."""
+"""Convolutions retain source weight layouts and exact bias/scale epilogues."""
 
 import unittest
 import numpy as np
@@ -26,10 +26,10 @@ from tvm.relax.backend.contrib.gemmini_tensorir import prepare_gemmini_tensorir_
 import test_backend_contrib_gemmini_tensorir as reference
 
 
-class GemminiConstantPackingTests(unittest.TestCase):
+class GemminiSourceLayoutTests(unittest.TestCase):
     setUp = reference.GemminiTensorIRTests.setUp
 
-    def test_integral_carrier_bias_and_packed_conv_match_source_quantization(self):
+    def test_integral_carrier_conv_keeps_bias_and_scale_and_matches_source(self):
         import torch
         import torch.ao.quantization.fx._decomposed
         from tvm.relax.frontend.torch import from_exported_program
@@ -66,10 +66,10 @@ class GemminiConstantPackingTests(unittest.TestCase):
         prepared = prepare_gemmini_graph(source, report=report)
         native = [row for row in report if row["placement"] == "gemmini"]
         self.assertEqual(len(native), 1, report)
-        self.assertTrue(native[0]["metadata"]["bias_preloaded"])
-        self.assertTrue(native[0]["metadata"]["readout_fused"])
+        self.assertFalse(native[0]["metadata"].get("bias_preloaded", False))
+        self.assertFalse(native[0]["metadata"].get("readout_fused", False))
         function = next(f for f in prepared.functions.values() if isinstance(f, tir.PrimFunc))
-        self.assertEqual(tuple(map(int, function.buffer_map[function.params[1]].shape)), (48, 4))
+        self.assertEqual(tuple(map(int, function.buffer_map[function.params[1]].shape)), (4, 4, 3, 3))
         path = self.root / "packed-bias.so"
         relax.build(prepared, "llvm").export_library(
             str(path), addons=[str(self.emulator)], cc="cc", options=["-std=c11"]
@@ -78,7 +78,7 @@ class GemminiConstantPackingTests(unittest.TestCase):
         actual = vm["main"](tvm.nd.array(values.numpy())).numpy()
         np.testing.assert_array_equal(actual, model(values).numpy())
 
-    def test_constant_weights_are_folded_once_and_native_results_match_cpu(self):
+    def test_constant_weights_keep_source_layout_and_native_results_match_cpu(self):
         for channels, output_channels, kernel in ((3, 17, 3), (2, 7, 1)):
             shape = (1, channels, 5, 6)
             x = relax.Var("x", relax.TensorStructInfo(shape, "int8"))
@@ -97,21 +97,16 @@ class GemminiConstantPackingTests(unittest.TestCase):
             source = builder.get()
             mathematical, _, _ = prepare_gemmini_tensorir_workloads(source)
             functions = [f for f in mathematical.functions.values() if isinstance(f, tir.PrimFunc)]
-            self.assertEqual(len(functions), 1)  # The preprocessor was folded out.
+            self.assertEqual(len(functions), 1)
             weight_buffer = functions[0].buffer_map[functions[0].params[1]]
             self.assertEqual(
                 tuple(map(int, weight_buffer.shape)),
-                (
-                    ((channels * kernel * kernel + 15) // 16) * 16,
-                    ((output_channels + 15) // 16) * 16
-                    if output_channels > 16
-                    else output_channels,
-                ),
+                weights.shape,
             )
             report = []
             prepared = prepare_gemmini_graph(source, report=report)
             self.assertEqual(sum(row["placement"] == "gemmini" for row in report), 1, report)
-            # No remaining runtime block writes the packed weight parameter.
+            # The immutable source weight parameter is never overwritten.
             function = next(f for f in prepared.functions.values() if isinstance(f, tir.PrimFunc))
             weight_data = function.buffer_map[function.params[1]].data
             stores = []
