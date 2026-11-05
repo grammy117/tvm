@@ -30,9 +30,14 @@ not an E2E result. Capacity, hazards and completion remain correctness lowering.
 
 ## Campaign
 
-Active: ResNet50 plus 16 kernel cases in the companion Merlin
-KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA are
-backlogged. Default 25 total ReplayTrace proposals per chunk/case across internal
+Executed on AWS F2 FireSim on 2026-10-28: ResNet50 plus 16 kernel cases from
+the companion Merlin KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md.
+20 ReplayTrace proposals ran per owner, and the 5 reserved graph-plan trials
+went unused because no alternative plan added a new contraction. The Merlin
+REPRODUCING_F2_RESULTS.md has the setup, recipe and results. Full
+TinyLlama/SmolVLA are backlogged. The policy below is what that campaign used.
+
+Default 25 total ReplayTrace proposals per chunk/case across internal
 tasks and graph choices, not 25 per internal contraction/head. No ML warmup or
 five-guided phase. Baseline/watchdog calibrations and timing repeats are separate
 execution counts charged to the same wall budget. Failed/duplicate proposals count;
@@ -49,8 +54,9 @@ them to seconds at the Runner boundary using the target counter frequency.
 Never mix old cycle-valued databases with seconds-valued records. Wall duration
 is for watchdogs/occupancy, not the optimization label. No timeout becomes cycles.
 
-Current FireSim implementation still measures extracted contractions; grouped
-complete-call builders/checks remain required for the new kernel campaign.
+The FireSim tuner measures extracted contractions. The Merlin complete-call
+builders rebuild every kernel, chunk and the ResNet parent from the selected
+database, and only those complete-unit timings are reported.
 Bind actual source, toolchain, hardware, placement, complete outputs and timing
 scope. ReplayTrace does not remove these requirements. See Merlin's current
 FIRESIM_HANDOFF.md for restore/build commands, receipts and readiness limitations.

@@ -1,15 +1,19 @@
 # Agent handoff: TVM Gemmini and EL4
 
-Current campaign: ResNet50 plus the 16 cases in the companion Merlin
-KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md. Full TinyLlama/SmolVLA
-are backlogged; their full-model recipes below are retained future work.
+The ResNet50 + 16-kernel campaign (cases in the companion Merlin
+KERNEL_BENCHMARK_HANDOFF_IREE_TVM_VOYAGER_AGENTIC.md) ran on AWS F2 FireSim on
+2026-10-28 with this branch at `f3cfd1a7d`. Its numbers bind that source,
+GCC 16.1.0 and the F2 60 MHz image. Do not relabel them with a later commit or
+with the selected U250 target. Full TinyLlama/SmolVLA are backlogged; their
+full-model recipes below are retained future work.
 
 Read README.md, OWNERSHIP.md, TUNING.md and FIRESIM.md before making changes.
-The sole campaign protocol is Merlin 8ec99308. Follow the companion Merlin
-FIRESIM_HANDOFF.md for the active ResNet/kernel scope, exact inputs, budgets and
-remote responsibilities. Full TinyLlama/SmolVLA recipes below are historical or
-future work, not instructions to launch those models. Local diagnostic Spike
-results are separate from selected-model and hardware qualification.
+The sole model protocol is Merlin 8ec99308. The companion Merlin
+`examples/gemmini/comparisons/tvm/` holds USAGE.md, IMPLEMENTATION.md and
+REPRODUCING_F2_RESULTS.md (setup, recipe and results); FIRESIM_HANDOFF.md there
+is the specification the campaign followed. Full TinyLlama/SmolVLA recipes below
+are historical or future work, not instructions to launch those models. Local
+diagnostic Spike results are separate from selected-model and hardware qualification.
 The simplified compiler removes automatic bias/prepacking/scale/readout preparation.
 Re-extract tasks and rebuild packages. Historical presets may seed structurally
 matching traces, but do not promise coverage or measured winners for this source.

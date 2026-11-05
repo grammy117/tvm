@@ -6,7 +6,7 @@ remote qualification. The simplified compiler is published; use the companion Me
 current source and campaign pins. Rebuild packages and re-extract workloads; do not relabel
 old ELFs or graph plans with new source identities.
 
-## Current campaign decisions
+## Campaign decisions (executed on AWS F2, 2026-10-28)
 
 - Sole model protocol: Merlin 8ec99308. Active scope is ResNet50 plus the 16
   complete kernel cases in the companion Merlin handoff. Full TinyLlama/SmolVLA
@@ -61,7 +61,9 @@ No archive or small high-address probe establishes whole-model capacity.
 5. Validate actual carried state, resets and the entire selected model chain using
    the pinned protocol. Operator/chunk tests do not establish model success.
 
-Before launch, finish per-family proof admission, source-bound model artifacts
-and remote wall-cancellation/correctness qualification. Historical transport/ABI details and
+For the F2 campaign the remote runner passed wall-cancellation, slot-reuse and
+wrong-oracle qualification before tuning (Merlin REPRODUCING_F2_RESULTS.md).
+Per-family proof admission and source-bound full-model artifacts are still open.
+Historical transport/ABI details and
 results are preserved in
 [the source-pinned FireSim guide](https://github.com/grammy117/tvm/blob/42b3c1ef27abe878f930e48b335b24956beb0e56/apps/gemmini/FIRESIM.md).

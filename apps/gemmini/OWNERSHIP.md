@@ -65,8 +65,8 @@ unintended fallback for required accelerator work. Matchers do not enforce every
 software-spec obligation; the strict audit tool is not a production proof gate.
 
 For top-down architecture and paper limitations, use the companion Merlin
-[architecture](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-workload-tuning/examples/gemmini/comparisons/tvm/ARCHITECTURE.md)
-and [operation inventory](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-workload-tuning/examples/gemmini/comparisons/tvm/TENSORIR_OP_AUDIT.md).
+[architecture](https://github.com/ucb-bar/merlin/blob/mlsys27/feat-SoTA-tvm/examples/gemmini/comparisons/tvm/ARCHITECTURE.md)
+and [operation inventory](https://github.com/ucb-bar/merlin/blob/mlsys27/feat-SoTA-tvm/examples/gemmini/comparisons/tvm/TENSORIR_OP_AUDIT.md).
 Keep current scopes in those pages; earlier hardware results retain their old pins.
 
 ## Target code that remains necessary

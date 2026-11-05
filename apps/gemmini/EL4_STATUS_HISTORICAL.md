@@ -7,7 +7,7 @@ The review of `1a8e981` was correct: all 842 tests passed, but the original shor
 searches did not establish tuning gains. All performance numbers below are bounded
 RTL-model results or explicitly historical. No FireSim execution or pretrained
 whole-model quality result is claimed. Implementation/evidence is tracked in
-[REVIEW_ACTIONS.md](REVIEW_ACTIONS.md); the offline compiler handoff is in
+[REVIEW_ACTIONS_HISTORICAL.md](REVIEW_ACTIONS_HISTORICAL.md); the offline compiler handoff is in
 [FIRESIM.md](FIRESIM.md).
 
 All retained learned parameters use the diagnostic script’s own `seeded_weights`

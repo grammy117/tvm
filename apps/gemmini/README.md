@@ -2,15 +2,38 @@
 
 The active compiler is branch `gemmini/direct-intrinsics`, derived from TVM
 v0.19.0 with inherited correctness fixes and the Gemmini integration.
-It is a development snapshot, not a hardware-qualified release. The companion
-Merlin `examples/gemmini/comparisons/tvm/FIRESIM_HANDOFF.md` owns the campaign,
-artifact retrieval and readiness status.
+It is a development snapshot, not a hardware-qualified release.
+
+**Status (2026-11-04):** the ResNet50 + 16-kernel campaign ran on AWS F2 FireSim
+(60 MHz DDR3+LLC image) on 2026-10-28 using this branch at `f3cfd1a7d`. The tip
+differs only by moving historical Python into `gemmini_legacy.py`. Inputs,
+builders, the FireSim runner and the results live in the companion Merlin
+directory `examples/gemmini/comparisons/tvm/` on branch `mlsys27/feat-SoTA-tvm`:
+
+| Merlin guide | For |
+| --- | --- |
+| [USAGE.md](https://github.com/ucb-bar/merlin/blob/mlsys27/feat-SoTA-tvm/examples/gemmini/comparisons/tvm/USAGE.md) | Building TVM, the adapter and ELFs; Spike checks; FireSim tuning |
+| [IMPLEMENTATION.md](https://github.com/ucb-bar/merlin/blob/mlsys27/feat-SoTA-tvm/examples/gemmini/comparisons/tvm/IMPLEMENTATION.md) | One-page summary of this backend and the runner |
+| [REPRODUCING_F2_RESULTS.md](https://github.com/ucb-bar/merlin/blob/mlsys27/feat-SoTA-tvm/examples/gemmini/comparisons/tvm/REPRODUCING_F2_RESULTS.md) | Experimental setup, recipe and results |
 
 The selected model protocol is
 [Merlin 8ec99308](https://github.com/ucb-bar/merlin/tree/8ec99308cb1182b9b896a6075300312266fadf6f/examples/gemmini/protocol).
 Keep its numerical recipes, independent references and complete-chain checks.
-The active campaign is ResNet50 plus 16 isolated kernel cases. Full TinyLlama
-and SmolVLA are backlogged. Compiler smoke tests do not establish model quality.
+Full TinyLlama and SmolVLA are backlogged. Compiler smoke tests do not establish
+model quality.
+
+## Documents in this directory
+
+| Document | Status |
+| --- | --- |
+| [OWNERSHIP.md](OWNERSHIP.md) | Current: stock vs supplied code per layer |
+| [TUNING.md](TUNING.md) | Current: default schedule, ReplayTrace search, cost units |
+| [FIRESIM.md](FIRESIM.md) | Current: package interface and FireSim evidence boundary |
+| [LEGACY.md](LEGACY.md) | Current: what historical code remains and why |
+| [AGENTS.md](AGENTS.md) | Current: rules for changing this backend |
+| [TENSORIR.md](TENSORIR.md) | Development notes with historical checkpoints |
+| [WORKLOAD_TUNING.md](WORKLOAD_TUNING.md) | Historical local Verilator chunk workflow |
+| [EL4_STATUS.md](EL4_STATUS.md), `*_HISTORICAL.md` | Frozen earlier status, review and README records |
 
 ## One active compiler path
 
@@ -45,7 +68,7 @@ existing matchers do not establish software-spec admission. No model name or exp
 
 [OWNERSHIP.md](OWNERSHIP.md) defines stock versus supplied code, including the
 remaining placement, memory and host-inlining orchestration. The companion Merlin
-[architecture and paper scope](https://github.com/ucb-bar/merlin/blob/comparisons/tvm-workload-tuning/examples/gemmini/comparisons/tvm/ARCHITECTURE.md)
+[architecture and paper scope](https://github.com/ucb-bar/merlin/blob/mlsys27/feat-SoTA-tvm/examples/gemmini/comparisons/tvm/ARCHITECTURE.md)
 is the top-down overview; its operation inventory separates implemented candidates
 from software-spec and deployed-hardware qualification.
 [TUNING.md](TUNING.md) defines schedule choices and cost-model behavior.
